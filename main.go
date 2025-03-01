@@ -12,13 +12,14 @@ func main() {
 	// Command-line flags to configure gossip & HTTP
 	bindAddr := flag.String("bindAddr", "0.0.0.0", "Gossip bind address")
 	bindPort := flag.Int("bindPort", 7946, "Gossip bind port")
+	httpAddr := flag.String("httpAddr", "0.0.0.0", "HTTP bind address")
 	httpPort := flag.Int("httpPort", 8080, "HTTP server port")
 	seedNodes := flag.String("seeds", "", "Comma-separated list of seed nodes (host:port)")
 
 	flag.Parse()
 
 	// Create node
-	n, err := node.NewNode(*bindAddr, *bindPort, *httpPort)
+	n, err := node.NewNode(*bindAddr, *bindPort, *httpAddr, *httpPort)
 	if err != nil {
 		log.Fatalf("Failed to create node: %v", err)
 	}

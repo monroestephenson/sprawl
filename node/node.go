@@ -1,112 +1,263 @@
 package node
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
+	"sprawl/node/balancer"
+	"sprawl/node/dht"
+	"sprawl/node/metrics"
+	"sprawl/node/router"
 	"sprawl/store"
 
 	"github.com/google/uuid"
 )
 
+var startTime time.Time
+
+func init() {
+	startTime = time.Now()
+}
+
 type Node struct {
 	ID          string
 	Gossip      *GossipManager
 	Store       *store.Store
+	DHT         *dht.DHT
+	Router      *router.Router
+	Balancer    *balancer.LoadBalancer
+	Metrics     *metrics.Metrics
 	BindAddress string
+	HTTPAddress string
 	HTTPPort    int
 }
 
 // NewNode initializes a Node with a gossip manager and an in-memory store
-func NewNode(bindAddr string, bindPort int, httpPort int) (*Node, error) {
-	// Generate a random ID for this node
+func NewNode(bindAddr string, bindPort int, httpAddr string, httpPort int) (*Node, error) {
 	nodeID := uuid.New().String()
 
-	gm, err := NewGossipManager(nodeID, bindAddr, bindPort)
+	dht := dht.NewDHT(nodeID)
+	store := store.NewStore()
+
+	gm, err := NewGossipManager(nodeID, bindAddr, bindPort, dht)
 	if err != nil {
 		return nil, err
 	}
 
+	router := router.NewRouter(nodeID, dht, store)
+	balancer := balancer.NewLoadBalancer(dht)
+	metrics := metrics.NewMetrics()
+
 	return &Node{
 		ID:          nodeID,
 		Gossip:      gm,
-		Store:       store.NewStore(),
+		Store:       store,
+		DHT:         dht,
+		Router:      router,
+		Balancer:    balancer,
+		Metrics:     metrics,
 		BindAddress: bindAddr,
+		HTTPAddress: httpAddr,
 		HTTPPort:    httpPort,
 	}, nil
 }
 
 // StartHTTP starts the HTTP server for publish/subscribe endpoints
 func (n *Node) StartHTTP() {
-	mux := http.NewServeMux()
+	http.HandleFunc("/publish", n.handlePublish)
+	http.HandleFunc("/subscribe", n.handleSubscribe)
+	http.HandleFunc("/metrics", n.handleMetrics)
+	http.HandleFunc("/status", n.handleStatus)
 
-	// Publish endpoint
-	mux.HandleFunc("/publish", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req struct {
-			Topic   string `json:"topic"`
-			Message string `json:"message"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Bad request", http.StatusBadRequest)
-			return
-		}
-
-		// Publish to local store
-		n.Store.Publish(req.Topic, []byte(req.Message))
-
-		// For MVP: We do NOT yet replicate to other nodes
-		// (In a real system, you'd propagate this message to cluster members)
-
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Message published to topic '%s'\n", req.Topic)
-	})
-
-	// Subscribe endpoint (simple example returning 200, you’d want streaming or WebSockets)
-	// We'll store the subscription callback in memory
-	mux.HandleFunc("/subscribe", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req struct {
-			Topic string `json:"topic"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Bad request", http.StatusBadRequest)
-			return
-		}
-
-		// Register a callback for this topic
-		// For demonstration, we simply log the received messages
-		n.Store.Subscribe(req.Topic, func(msg store.Message) {
-			log.Printf("Node %s received message on topic '%s': %s\n",
-				n.ID, msg.Topic, string(msg.Payload))
-		})
-
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Subscribed to topic '%s'\n", req.Topic)
-	})
-
-	// Expose cluster info
-	mux.HandleFunc("/members", func(w http.ResponseWriter, r *http.Request) {
-		members := n.Gossip.GetMembers()
-		enc := json.NewEncoder(w)
-		_ = enc.Encode(members)
-	})
-
-	addr := fmt.Sprintf(":%d", n.HTTPPort)
-	log.Printf("Node %s listening on HTTP %s\n", n.ID, addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatal("HTTP server error:", err)
+	addr := fmt.Sprintf("%s:%d", n.HTTPAddress, n.HTTPPort)
+	log.Printf("Starting HTTP server on %s", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Fatalf("HTTP server failed: %v", err)
 	}
+}
+
+func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Method not allowed",
+		})
+		return
+	}
+
+	var msg struct {
+		Topic   string `json:"topic"`
+		Payload string `json:"payload"`
+		ID      string `json:"id"`
+		TTL     int    `json:"ttl"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Invalid request body",
+		})
+		return
+	}
+
+	// Generate message ID if not provided (new message)
+	if msg.ID == "" {
+		msg.ID = uuid.New().String()
+		msg.TTL = 3 // Default TTL for new messages
+	} else if msg.TTL <= 0 {
+		// Drop forwarded messages that have exceeded their TTL
+		log.Printf("[Node %s] Dropping message %s due to expired TTL", n.ID[:8], msg.ID)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "dropped",
+			"id":     msg.ID,
+		})
+		return
+	}
+
+	log.Printf("[Node %s] Publishing message %s to topic: %s (TTL: %d)",
+		n.ID[:8], msg.ID, msg.Topic, msg.TTL)
+
+	// Check if we have any subscribers for this topic
+	hash := n.DHT.HashTopic(msg.Topic)
+	nodes := n.DHT.GetNodesForTopic(msg.Topic)
+	log.Printf("[Node %s] Found %d nodes for topic %s (hash: %s)", n.ID[:8], len(nodes), msg.Topic, hash[:8])
+
+	// Log all target nodes
+	for _, node := range nodes {
+		log.Printf("[Node %s] Target node for message %s: %s (%s:%d)",
+			n.ID[:8], msg.ID[:8], node.ID[:8], node.Address, node.HTTPPort)
+	}
+
+	routerMsg := router.Message{
+		ID:      msg.ID,
+		Topic:   msg.Topic,
+		Payload: []byte(msg.Payload),
+		TTL:     msg.TTL - 1, // Decrement TTL for forwarding
+	}
+
+	ctx := context.Background()
+	if err := n.Router.RouteMessage(ctx, routerMsg); err != nil {
+		log.Printf("[Node %s] Failed to route message: %v", n.ID[:8], err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	log.Printf("[Node %s] Successfully routed message %s", n.ID[:8], msg.ID)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(map[string]string{
+		"status": "published",
+		"id":     msg.ID,
+	}); err != nil {
+		log.Printf("[Node %s] Failed to encode response: %v", n.ID[:8], err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
+func (n *Node) handleSubscribe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var sub struct {
+		Topic string `json:"topic"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	subID := uuid.New().String()
+	log.Printf("[Node %s] Processing subscription request for topic: %s", n.ID[:8], sub.Topic)
+
+	// Register this node in the DHT for the topic with HTTP port
+	hash := n.DHT.HashTopic(sub.Topic)
+	n.DHT.RegisterNode(sub.Topic, n.ID, n.HTTPPort)
+	log.Printf("[Node %s] Registered in DHT for topic: %s (hash: %s)", n.ID[:8], sub.Topic, hash[:8])
+
+	// Create subscriber function with better logging
+	subscriber := func(msg store.Message) {
+		log.Printf("[Node %s] Received message on topic %s: %s",
+			n.ID[:8], msg.Topic, string(msg.Payload))
+		n.Metrics.RecordMessage(false) // Record received message
+	}
+
+	n.Store.Subscribe(sub.Topic, subscriber)
+	log.Printf("[Node %s] Added subscriber function for topic: %s", n.ID[:8], sub.Topic)
+
+	// Verify registration
+	nodes := n.DHT.GetNodesForTopic(sub.Topic)
+	found := false
+	for _, node := range nodes {
+		if node.ID == n.ID {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		log.Printf("[Node %s] Warning: Node not found in DHT after registration for topic: %s", n.ID[:8], sub.Topic)
+	} else {
+		log.Printf("[Node %s] Successfully verified DHT registration for topic: %s", n.ID[:8], sub.Topic)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "subscribed",
+		"id":     subID,
+		"topic":  sub.Topic,
+	})
+}
+
+func (n *Node) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	metrics := map[string]interface{}{
+		"node_id": n.ID,
+		"router":  n.Router.GetMetrics(),
+		"system":  n.Metrics.GetSnapshot(),
+		"cluster": n.Gossip.GetMembers(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
+}
+
+func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	status := map[string]interface{}{
+		"node_id":         n.ID,
+		"address":         n.BindAddress,
+		"http_port":       n.HTTPPort,
+		"cluster_members": n.Gossip.GetMembers(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
 }
 
 // JoinCluster attempts to join an existing cluster

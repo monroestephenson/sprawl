@@ -1,140 +1,201 @@
-In-Depth Architecture
-Core Components
-1. Node Layer
-Each GEM node is autonomous and contains:
-Gossip Manager: Maintains cluster membership and health metrics
-DHT Manager: Implements distributed hash table for topic routing
-Message Store: Multi-tiered storage for messages
-API Layer: Exposes pub/sub endpoints
-Message Router: Routes messages to appropriate nodes based on topic hash
-Load Monitor: Tracks CPU, memory, queue depth, and network usage
-2. Storage Layer
-In-Memory Queue: Primary storage for hot messages
-Embedded KV Store: Secondary storage using RocksDB/LevelDB
-Cloud Storage: Tertiary storage for cold messages and durability
-3. Routing Mechanism
-Topic Hashing: SHA-256(topic) determines topic ownership
-Consistent Hashing Ring: Places nodes in a virtual ring
-Replica Management: Maintains N replicas for each topic
-Load Balancing: Dynamic topic ownership based on node load
-4. Client API
-Publisher API: Simple REST/gRPC for message production
-Subscriber API: Long-polling/WebSocket for message consumption
-Admin API: Configuration and monitoring
-Data Flow
-Publishing Flow:
-Client sends message to any GEM node
-Node computes topic hash
-DHT determines responsible node(s)
-Message routes to responsible node(s)
-Message stored in memory/disk
-ACK returned to publisher
-Subscription Flow:
-Client registers subscription with any node
-Node registers subscriber in distributed registry
-Topic owner nodes deliver messages to subscriber
-Subscriber sends ACKs for processed messages
-Storage Flow:
-New messages stored in memory queue
-Messages shift to disk when memory threshold reached
-Messages move to cloud storage based on age/access patterns
-Indexes maintained for fast retrieval
+# Sprawl Architecture Design
+
+## Core Components
+
+### 1. Node Layer
+Each Sprawl node consists of:
+- **P2P Overlay**
+  - Gossip Protocol Manager (membership, metrics sharing)
+  - DHT Manager (topic routing, node mapping)
+- **Message Processing**
+  - Message Router (topic-based routing)
+  - ACK Tracker (delivery confirmation)
+  - Retry Manager (failed delivery handling)
+- **Storage Engine**
+  - Memory Queue Manager
+  - Disk Storage Manager (RocksDB)
+  - Cloud Storage Manager (S3/MinIO)
+- **Intelligence Layer**
+  - Load Monitor
+  - AI Prediction Engine
+  - Auto-scaling Controller
+
+### 2. Message Flow
+- **Publishing Pipeline**
+  1. Message receipt and validation
+  2. Topic hash computation
+  3. DHT-based route resolution
+  4. Load-balanced forwarding
+  5. Storage and replication
+  6. Publisher acknowledgment
+
+- **Subscription Pipeline**
+  1. Subscriber registration
+  2. Health monitoring
+  3. Message delivery
+  4. ACK processing
+  5. Retry handling
+  6. Backpressure management
+
+### 3. Storage Architecture
+- **Memory Layer**
+  - Hot message queue
+  - Routing cache
+  - Metric buffers
+- **Disk Layer**
+  - RocksDB for persistence
+  - Message index
+  - Subscriber state
+- **Cloud Layer**
+  - Cold message archive
+  - Backup storage
+  - Cross-region replication
+
+### 4. Intelligence Systems
+- **Load Prediction**
+  - Traffic pattern analysis
+  - Resource usage forecasting
+  - Scaling recommendations
+- **Route Optimization**
+  - Dynamic path selection
+  - Congestion avoidance
+  - Load distribution
+
+### 5. Operational Features
+- **Monitoring**
+  - Performance metrics
+  - Health checks
+  - Alert triggers
+- **Management**
+  - Node administration
+  - Topic management
+  - Subscriber control
+- **Security**
+  - TLS encryption
+  - Authentication
+  - Authorization
+
+## Data Flows
+
+### Publishing Pipeline
+1. Client publishes to any node
+2. Node computes topic hash
+3. DHT resolves owner node(s)
+4. Message routes to owner(s)
+5. Storage confirmation
+6. Publisher receives ACK
+
+### Subscription Pipeline
+1. Client subscribes via any node
+2. Subscription recorded in registry
+3. Owner nodes stream messages
+4. Client confirms processing
+
+### Storage Pipeline
+1. Initial memory queue storage
+2. Disk transition at memory threshold
+3. Cloud archival based on policies
+4. Index maintenance for retrieval
 
 ```mermaid
 flowchart TD
-    subgraph "Client Layer"
-        PUB[Publisher] 
-        SUB[Subscriber]
+    subgraph "Publishers"
+        P1[Publisher 1]
+        P2[Publisher 2]
     end
 
-    subgraph "GEM Node 1" 
+    subgraph "GEM Node 1"
         API1[API Layer]
-        GOS1[Gossip Manager]
         DHT1[DHT Manager]
-        MR1[Message Router]
-        MS1[Message Store]
-        LM1[Load Monitor]
+        GOSSIP1[Gossip Manager]
+        ROUTER1[Message Router]
+        AI1[AI Controller]
         
-        MS1 --- MEM1[In-Memory Queue]
-        MS1 --- DISK1[Disk Store]
-        MS1 --- CLOUD1[Cloud Storage]
+        subgraph "Storage 1"
+            MEM1[Memory Queue]
+            ROCKS1[RocksDB]
+            S31[S3/MinIO]
+        end
     end
-    
+
     subgraph "GEM Node 2"
         API2[API Layer]
-        GOS2[Gossip Manager]
-        DHT2[DHT Manager] 
-        MR2[Message Router]
-        MS2[Message Store]
-        LM2[Load Monitor]
+        DHT2[DHT Manager]
+        GOSSIP2[Gossip Manager]
+        ROUTER2[Message Router]
+        AI2[AI Controller]
         
-        MS2 --- MEM2[In-Memory Queue]
-        MS2 --- DISK2[Disk Store]
-        MS2 --- CLOUD2[Cloud Storage]
+        subgraph "Storage 2"
+            MEM2[Memory Queue]
+            ROCKS2[RocksDB]
+            S32[S3/MinIO]
+        end
     end
-    
-    subgraph "GEM Node 3"
-        API3[API Layer]
-        GOS3[Gossip Manager]
-        DHT3[DHT Manager]
-        MR3[Message Router] 
-        MS3[Message Store]
-        LM3[Load Monitor]
-        
-        MS3 --- MEM3[In-Memory Queue]
-        MS3 --- DISK3[Disk Store]
-        MS3 --- CLOUD3[Cloud Storage]
+
+    subgraph "Subscribers"
+        SUB1[Subscriber Group 1]
+        SUB2[Subscriber Group 2]
     end
-    
-    %% Connections between components
-    PUB -->|"1. Publish"| API1
-    API1 -->|"2. Hash Topic"| DHT1
-    DHT1 -->|"3. Route"| MR1
-    MR1 -->|"4. Forward"| MR2
-    MR2 -->|"5. Store"| MS2
-    
-    SUB -->|"A. Subscribe"| API3
-    DHT3 -->|"B. Register"| DHT2
-    MS2 -->|"C. Deliver"| MR2
-    MR2 -->|"D. Route"| MR3
-    API3 -->|"E. Deliver"| SUB
-    
-    %% Gossip connections
-    GOS1 <-->|"Metrics & Membership"| GOS2
-    GOS2 <-->|"Metrics & Membership"| GOS3
-    GOS3 <-->|"Metrics & Membership"| GOS1
-    
-    %% DHT connections
-    DHT1 <-->|"Topic Routing"| DHT2
-    DHT2 <-->|"Topic Routing"| DHT3
-    DHT3 <-->|"Topic Routing"| DHT1
-    
-    %% Load monitoring
-    LM1 -->|"Report"| GOS1
-    LM2 -->|"Report"| GOS2
-    LM3 -->|"Report"| GOS3
-    
-    %% Add cloud storage
-    CLOUD1 <--> CLOUD2
-    CLOUD2 <--> CLOUD3
-    CLOUD3 <--> CLOUD1
+
+    %% Publisher connections
+    P1 -->|Publish| API1
+    P2 -->|Publish| API2
+
+    %% Internal Node 1 flow
+    API1 --> DHT1
+    DHT1 --> ROUTER1
+    ROUTER1 --> MEM1
+    MEM1 --> ROCKS1
+    ROCKS1 --> S31
+    AI1 -->|Monitor| ROUTER1
+
+    %% Internal Node 2 flow
+    API2 --> DHT2
+    DHT2 --> ROUTER2
+    ROUTER2 --> MEM2
+    MEM2 --> ROCKS2
+    ROCKS2 --> S32
+    AI2 -->|Monitor| ROUTER2
+
+    %% Cross-node communication
+    DHT1 <-->|Topic Routing| DHT2
+    GOSSIP1 <-->|Metrics & Health| GOSSIP2
+    ROUTER1 <-->|Message Forward| ROUTER2
+
+    %% Subscriber connections
+    ROUTER1 -->|Deliver| SUB1
+    ROUTER2 -->|Deliver| SUB2
+    SUB1 -->|ACK| ROUTER1
+    SUB2 -->|ACK| ROUTER2
+
+    %% Cloud storage sync
+    S31 <-->|Replicate| S32
+
+    %% AI monitoring
+    AI1 -->|Load Prediction| GOSSIP1
+    AI2 -->|Load Prediction| GOSSIP2
 ```
-Key Technical Innovations
-Self-Healing Mechanism:
-Nodes detect failures through gossip protocol
-Topic ownership automatically transfers to healthy nodes
-Messages replicated across N nodes for resilience
-Dynamic Load Balancing:
-Nodes share load metrics via gossip
-Overloaded nodes transfer topic ownership
-New nodes gradually take ownership of topics
-Tiered Storage:
-Hot messages stay in memory for fast access
-Warm messages move to local disk
-Cold messages archive to cloud storage
-Message access patterns determine tier placement
-AI-Powered Scaling:
-Collects historical traffic patterns
-Predicts upcoming load spikes
-Triggers proactive scaling of node count
-Rebalances topic ownership before congestion occurs
+
+## Technical Innovations
+
+### Self-Healing
+- Gossip-based failure detection
+- Automatic topic redistribution
+- N-way message replication
+
+### Load Balancing
+- Gossip-propagated metrics
+- Dynamic topic redistribution
+- Gradual new node integration
+
+### Storage Management
+- Memory-first for hot data
+- Disk for warm data
+- Cloud for cold storage
+- Access-pattern-based placement
+
+### AI Operations
+- Traffic pattern analysis
+- Load prediction
+- Proactive scaling
+- Preventive rebalancing
