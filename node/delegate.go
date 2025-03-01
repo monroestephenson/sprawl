@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"log"
 	"sprawl/node/dht"
+	"sync"
 	"time"
 )
 
 type gossipDelegate struct {
+	mu       sync.RWMutex
 	metadata map[string][]byte
 	dht      *dht.DHT
 }
@@ -37,7 +39,9 @@ func (d *gossipDelegate) NotifyMsg(msg []byte) {
 			meta.NodeID[:8], len(meta.DHTPeers))
 
 		// Store the raw message before merging
+		d.mu.Lock()
 		d.metadata[meta.NodeID] = msg
+		d.mu.Unlock()
 
 		// Update node info first
 		if meta.NodeInfo.ID != "" {
@@ -56,6 +60,9 @@ func (d *gossipDelegate) NotifyMsg(msg []byte) {
 
 func (d *gossipDelegate) GetBroadcasts(overhead, limit int) [][]byte {
 	// Return all stored metadata messages that need to be broadcast
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
 	var broadcasts [][]byte
 	for _, msg := range d.metadata {
 		if len(msg) <= limit {

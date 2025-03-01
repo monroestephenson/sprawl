@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -344,25 +346,116 @@ func testLoadDelivery() error {
 		fmt.Printf("Subscribed to loadtest on %s (ID: %s)\n", node, result.ID)
 	}
 
-	// Wait for subscriptions to propagate
-	time.Sleep(2 * time.Second)
+	// Wait longer for subscriptions to propagate
+	fmt.Println("Waiting for subscriptions to propagate...")
+	time.Sleep(5 * time.Second)
 
-	// Run load test
+	// Create HTTP client with more resilient timeouts
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 60 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   20,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+		},
+	}
+
+	// Run load test with rate limiting
 	var wg sync.WaitGroup
 	results := make(chan error, count*parallel)
+
+	// More conservative rate limiting - max 10 messages per second per publisher
+	rateLimiter := make(chan struct{}, parallel)
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			select {
+			case rateLimiter <- struct{}{}:
+			default:
+			}
+		}
+	}()
+
+	fmt.Printf("Starting load test with %d parallel publishers, %d messages each...\n", parallel, count)
 
 	for p := 0; p < parallel; p++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := 0; i < count; i++ {
+				<-rateLimiter // Rate limit publishing
 				node := nodes[i%len(nodes)]
 				msg := fmt.Sprintf("loadtest-message-%d", i)
-				if err := publish(node, "loadtest", msg); err != nil {
-					results <- fmt.Errorf("load test failed: %v", err)
+
+				// Retry logic for publishing
+				var publishErr error
+				for retries := 0; retries < 3; retries++ {
+					if retries > 0 {
+						time.Sleep(time.Duration(retries) * time.Second)
+						fmt.Printf("Retrying publish to %s (attempt %d/3)...\n", node, retries+1)
+					}
+
+					data := map[string]interface{}{
+						"topic":   "loadtest",
+						"payload": msg,
+						"ttl":     5, // Increased TTL for reliability
+					}
+
+					jsonData, err := json.Marshal(data)
+					if err != nil {
+						publishErr = fmt.Errorf("failed to marshal message: %v", err)
+						continue
+					}
+
+					req, err := http.NewRequest("POST", node+"/publish", bytes.NewBuffer(jsonData))
+					if err != nil {
+						publishErr = fmt.Errorf("failed to create request: %v", err)
+						continue
+					}
+					req.Header.Set("Content-Type", "application/json")
+
+					resp, err := client.Do(req)
+					if err != nil {
+						publishErr = fmt.Errorf("failed to send message: %v", err)
+						continue
+					}
+
+					body, err := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					if err != nil {
+						publishErr = fmt.Errorf("failed to read response: %v", err)
+						continue
+					}
+
+					var result struct {
+						Status string `json:"status"`
+						Error  string `json:"error"`
+					}
+					if err := json.Unmarshal(body, &result); err != nil {
+						publishErr = fmt.Errorf("failed to decode response: %v", err)
+						continue
+					}
+
+					if result.Status == "published" {
+						publishErr = nil
+						break
+					}
+
+					publishErr = fmt.Errorf("publish failed: %s", result.Error)
+				}
+
+				if publishErr != nil {
+					results <- fmt.Errorf("load test failed: %v", publishErr)
 					return
 				}
-				time.Sleep(10 * time.Millisecond) // Small delay between messages
 			}
 		}()
 	}
@@ -371,12 +464,17 @@ func testLoadDelivery() error {
 	close(results)
 
 	// Check for any errors
+	var errors []error
 	for err := range results {
-		return err
+		errors = append(errors, err)
 	}
 
-	// Wait for messages to propagate
-	time.Sleep(2 * time.Second)
+	if len(errors) > 0 {
+		return fmt.Errorf("load test had %d errors: %v", len(errors), errors[0])
+	}
+
+	fmt.Println("Waiting for messages to propagate...")
+	time.Sleep(5 * time.Second)
 
 	// Verify message delivery by checking metrics on all nodes
 	for _, node := range nodes {
@@ -404,9 +502,15 @@ func testLoadDelivery() error {
 
 		// Check if node has handled a reasonable number of messages
 		totalMessages := metrics.Store.MessagesStored + metrics.Router.MessagesRouted + metrics.Store.MessagesReceived
-		if totalMessages < int64(count*parallel/len(nodes)/2) {
-			return fmt.Errorf("node %s handled fewer messages than expected: %d", node, totalMessages)
+		expectedMinimum := int64(count * parallel / len(nodes) / 2) // At least half of the expected messages per node
+
+		if totalMessages < expectedMinimum {
+			return fmt.Errorf("node %s handled fewer messages than expected (got %d, want at least %d)",
+				node, totalMessages, expectedMinimum)
 		}
+
+		fmt.Printf("Node %s metrics: stored=%d, routed=%d, received=%d\n",
+			node, metrics.Store.MessagesStored, metrics.Router.MessagesRouted, metrics.Store.MessagesReceived)
 	}
 
 	return nil

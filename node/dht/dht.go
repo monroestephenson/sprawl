@@ -131,6 +131,9 @@ func (d *DHT) GetNodesForTopic(topic string) []NodeInfo {
 
 // findClosestNodes finds the N closest nodes to a hash
 func (d *DHT) findClosestNodes(hash string, n int) []NodeInfo {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
 	// Simple implementation - in practice, you'd use XOR distance
 	var nodes []NodeInfo
 	for nodeID := range d.nodes {
@@ -144,6 +147,8 @@ func (d *DHT) findClosestNodes(hash string, n int) []NodeInfo {
 
 // updateFingerTable updates the Kademlia-style finger table
 func (d *DHT) updateFingerTable() {
+	// Already under write lock from caller
+
 	// Simplified finger table update
 	// In practice, you'd implement proper Kademlia finger table logic
 	for nodeID := range d.nodes {
@@ -244,6 +249,7 @@ func (d *DHT) RegisterNode(topic string, nodeID string, httpPort int) {
 	}
 }
 
+// GetTopicMap returns a copy of the topic map
 func (d *DHT) GetTopicMap() map[string][]string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -259,6 +265,7 @@ func (d *DHT) GetTopicMap() map[string][]string {
 	return topicMapCopy
 }
 
+// MergeTopicMap merges a peer's topic map with the local one
 func (d *DHT) MergeTopicMap(peerMap map[string][]string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

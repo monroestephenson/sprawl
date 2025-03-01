@@ -27,11 +27,17 @@ type Metrics struct {
 	// Timing metrics
 	AverageLatency time.Duration
 	lastUpdate     time.Time
+
+	// Control
+	stopCh chan struct{}
+	done   chan struct{}
 }
 
 func NewMetrics() *Metrics {
 	m := &Metrics{
 		lastUpdate: time.Now(),
+		stopCh:     make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 	go m.collectSystemMetrics()
 	return m
@@ -39,17 +45,29 @@ func NewMetrics() *Metrics {
 
 func (m *Metrics) collectSystemMetrics() {
 	ticker := time.NewTicker(time.Second)
-	for range ticker.C {
-		m.mu.Lock()
+	defer ticker.Stop()
+	defer close(m.done)
 
-		var memStats runtime.MemStats
-		runtime.ReadMemStats(&memStats)
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-ticker.C:
+			m.mu.Lock()
+			var memStats runtime.MemStats
+			runtime.ReadMemStats(&memStats)
 
-		m.MemoryUsage = float64(memStats.Alloc) / float64(memStats.Sys)
-		m.GoroutineCount = runtime.NumGoroutine()
-
-		m.mu.Unlock()
+			m.MemoryUsage = float64(memStats.Alloc) / float64(memStats.Sys)
+			m.GoroutineCount = runtime.NumGoroutine()
+			m.mu.Unlock()
+		}
 	}
+}
+
+// Stop gracefully stops the metrics collection
+func (m *Metrics) Stop() {
+	close(m.stopCh)
+	<-m.done // Wait for collection to stop
 }
 
 func (m *Metrics) RecordMessage(sent bool) {

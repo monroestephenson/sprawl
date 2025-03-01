@@ -35,6 +35,8 @@ type Node struct {
 	BindAddress string
 	HTTPAddress string
 	HTTPPort    int
+	semaphore   chan struct{} // Limit concurrent requests
+	server      interface{}   // Added to store the HTTP server
 }
 
 // NewNode initializes a Node with a gossip manager and an in-memory store
@@ -64,24 +66,57 @@ func NewNode(bindAddr string, bindPort int, httpAddr string, httpPort int) (*Nod
 		BindAddress: bindAddr,
 		HTTPAddress: httpAddr,
 		HTTPPort:    httpPort,
+		semaphore:   make(chan struct{}, 100), // Limit to 100 concurrent requests
 	}, nil
 }
 
 // StartHTTP starts the HTTP server for publish/subscribe endpoints
 func (n *Node) StartHTTP() {
-	http.HandleFunc("/publish", n.handlePublish)
-	http.HandleFunc("/subscribe", n.handleSubscribe)
-	http.HandleFunc("/metrics", n.handleMetrics)
-	http.HandleFunc("/status", n.handleStatus)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/publish", n.handlePublish)
+	mux.HandleFunc("/subscribe", n.handleSubscribe)
+	mux.HandleFunc("/metrics", n.handleMetrics)
+	mux.HandleFunc("/status", n.handleStatus)
 
-	addr := fmt.Sprintf("%s:%d", n.HTTPAddress, n.HTTPPort)
-	log.Printf("Starting HTTP server on %s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	server := &http.Server{
+		Addr:    fmt.Sprintf("%s:%d", n.HTTPAddress, n.HTTPPort),
+		Handler: mux,
+		// Configure timeouts
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 2 * time.Second,
+		// Configure connection settings
+		MaxHeaderBytes: 1 << 20, // 1MB
+	}
+
+	n.server = server
+
+	log.Printf("Starting HTTP server on %s:%d", n.HTTPAddress, n.HTTPPort)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("HTTP server failed: %v", err)
 	}
 }
 
 func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
+	// Apply back pressure by using a semaphore
+	select {
+	case n.semaphore <- struct{}{}:
+		defer func() { <-n.semaphore }()
+	default:
+		// If we can't acquire the semaphore immediately, return 503
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Server is too busy",
+		})
+		return
+	}
+
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
 	if r.Method != http.MethodPost {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -135,9 +170,19 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 		TTL:     msg.TTL,
 	}
 
-	ctx := context.Background()
+	// Use the context with timeout for routing
 	if err := n.Router.RouteMessage(ctx, routerMsg); err != nil {
 		log.Printf("[Node %s] Failed to route message: %v", n.ID[:8], err)
+
+		// Check if the error was due to context timeout
+		if ctx.Err() == context.DeadlineExceeded {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGatewayTimeout)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "Request timed out",
+			})
+			return
+		}
 
 		// Only return error if it's not a routing failure to other nodes
 		if !strings.Contains(err.Error(), "failed to deliver message") {
@@ -255,7 +300,25 @@ func (n *Node) JoinCluster(seeds []string) error {
 	return n.Gossip.JoinCluster(seeds)
 }
 
-// Shutdown leaves the gossip network
+// Shutdown gracefully shuts down the node
 func (n *Node) Shutdown() {
+	// Stop the HTTP server
+	if server, ok := n.server.(*http.Server); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Error shutting down HTTP server: %v", err)
+		}
+	}
+
+	// Stop metrics collection
+	n.Metrics.Stop()
+
+	// Stop gossip manager
 	n.Gossip.Shutdown()
+
+	// Close semaphore
+	close(n.semaphore)
+
+	log.Printf("[Node %s] Gracefully shut down", n.ID[:8])
 }

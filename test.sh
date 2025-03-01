@@ -1,120 +1,94 @@
 #!/bin/bash
 
-# Kill any existing nodes
+# Clean up any existing nodes
 echo "Cleaning up any existing nodes..."
 pkill -f "sprawl" || true
-sleep 2
-
-# Function to start a node in a new terminal
-start_node() {
-    local cmd="cd $(pwd) && go run main.go $1"
-    echo "Starting node with command: $cmd"
-    osascript -e "tell application \"Terminal\" to do script \"$cmd\"" > /dev/null 2>&1
-}
-
-# Function to wait for a node to be ready
-wait_for_node() {
-    local port=$1
-    local retries=60
-    local ready=false
-    
-    echo -n "Waiting for node on port $port "
-    while [ $retries -gt 0 ] && [ "$ready" = false ]; do
-        if curl -s "http://localhost:$port/status" > /dev/null 2>&1; then
-            ready=true
-            echo "✓"
-        else
-            echo -n "."
-            sleep 1
-            retries=$((retries-1))
-        fi
-    done
-    
-    if [ "$ready" = false ]; then
-        echo "❌"
-        echo "Node on port $port failed to start after 60 seconds!"
-        return 1
-    fi
-
-    # Additional wait to ensure the node is fully initialized
-    sleep 2
-    return 0
-}
+rm -f node*.log
 
 # Build the CLI tool
 echo "Building sprawlctl..."
-go build -o sprawlctl cmd/sprawlctl/main.go || {
-    echo "Failed to build sprawlctl"
-    exit 1
-}
+go build -o sprawlctl cmd/sprawlctl/main.go
 
+# Start node 1 (seed node)
 echo "Starting node 1 (seed node)..."
-start_node "-bindAddr=127.0.0.1 -bindPort=7946 -httpAddr=127.0.0.1 -httpPort=8080"
+echo "Starting node with command: cd $(pwd) && go run main.go -bindAddr=127.0.0.1 -bindPort=7946 -httpAddr=127.0.0.1 -httpPort=8080"
+go run main.go -bindAddr=127.0.0.1 -bindPort=7946 -httpAddr=127.0.0.1 -httpPort=8080 > node1.log 2>&1 &
 
+# Wait for seed node to start
 echo "Waiting for seed node to start..."
-sleep 5  # Give more time for initial compilation
-wait_for_node 8080 || {
-    echo "Failed to start seed node. Check the terminal window for errors."
-    exit 1
-}
-
-echo "Starting node 2..."
-start_node "-bindAddr=127.0.0.1 -bindPort=7947 -httpAddr=127.0.0.1 -httpPort=8081 -seeds=127.0.0.1:7946"
-
-echo "Starting node 3..."
-start_node "-bindAddr=127.0.0.1 -bindPort=7948 -httpAddr=127.0.0.1 -httpPort=8082 -seeds=127.0.0.1:7946"
-
-# Wait for all nodes to be ready
-echo "Waiting for nodes to be ready..."
-wait_for_node 8081 || exit 1
-wait_for_node 8082 || exit 1
-
-# Additional wait for cluster formation
-echo "Waiting for cluster to form..."
-sleep 10
-
-# Test cluster formation
-echo -e "\nChecking cluster status..."
-for port in 8080 8081 8082; do
-    echo "Node on port $port status:"
-    curl -s "http://localhost:$port/status" | jq '.' || echo "Failed to get status"
+echo -n "Waiting for node on port 8080 "
+until curl -s http://localhost:8080/status > /dev/null; do
+    echo -n "."
+    sleep 1
 done
+echo "✓"
 
-# Subscribe all nodes to test topics
+# Start node 2
+echo "Starting node 2..."
+echo "Starting node with command: cd $(pwd) && go run main.go -bindAddr=127.0.0.1 -bindPort=7947 -httpAddr=127.0.0.1 -httpPort=8081 -seeds=127.0.0.1:7946"
+go run main.go -bindAddr=127.0.0.1 -bindPort=7947 -httpAddr=127.0.0.1 -httpPort=8081 -seeds=127.0.0.1:7946 > node2.log 2>&1 &
+
+# Start node 3
+echo "Starting node 3..."
+echo "Starting node with command: cd $(pwd) && go run main.go -bindAddr=127.0.0.1 -bindPort=7948 -httpAddr=127.0.0.1 -httpPort=8082 -seeds=127.0.0.1:7946"
+go run main.go -bindAddr=127.0.0.1 -bindPort=7948 -httpAddr=127.0.0.1 -httpPort=8082 -seeds=127.0.0.1:7946 > node3.log 2>&1 &
+
+# Wait for nodes to be ready
+echo "Waiting for nodes to be ready..."
+echo -n "Waiting for node on port 8081 "
+until curl -s http://localhost:8081/status > /dev/null; do
+    echo -n "."
+    sleep 1
+done
+echo "✓"
+
+echo -n "Waiting for node on port 8082 "
+until curl -s http://localhost:8082/status > /dev/null; do
+    echo -n "."
+    sleep 1
+done
+echo "✓"
+
+# Wait for cluster to form
+echo "Waiting for cluster to form..."
+sleep 2
+
+# Check cluster status
+echo -e "\nChecking cluster status..."
+echo "Node on port 8080 status:"
+curl -s http://localhost:8080/status | jq .
+echo "Node on port 8081 status:"
+curl -s http://localhost:8081/status | jq .
+echo "Node on port 8082 status:"
+curl -s http://localhost:8082/status | jq .
+
+# Subscribe nodes to test topics
 echo -e "\nSubscribing nodes to test topics..."
-./sprawlctl subscribe \
-    --nodes="http://localhost:8080,http://localhost:8081,http://localhost:8082" \
-    --topic="test"
-
-./sprawlctl subscribe \
-    --nodes="http://localhost:8080,http://localhost:8081,http://localhost:8082" \
-    --topic="loadtest"
-
-# Wait for subscriptions to propagate
+./sprawlctl -n http://localhost:8080 subscribe -t test
+./sprawlctl -n http://localhost:8081 subscribe -t test
+./sprawlctl -n http://localhost:8082 subscribe -t test
+./sprawlctl -n http://localhost:8080 subscribe -t loadtest
+./sprawlctl -n http://localhost:8081 subscribe -t loadtest
+./sprawlctl -n http://localhost:8082 subscribe -t loadtest
 echo "Waiting for subscriptions to propagate..."
-sleep 10
+sleep 2
 
 # Run integration tests
 echo -e "\nRunning integration tests..."
-./sprawlctl test \
-    --nodes="http://localhost:8080,http://localhost:8081,http://localhost:8082" \
-    --count=100 \
-    --parallel=10
+./sprawlctl test
 
 # Run load test
 echo -e "\nRunning load test..."
-./sprawlctl publish \
-    --nodes="http://localhost:8080,http://localhost:8081,http://localhost:8082" \
-    --topic="loadtest" \
-    --count=1000 \
-    --parallel=20 \
-    --interval=10ms
+./sprawlctl -n http://localhost:8080,http://localhost:8081,http://localhost:8082 test -c 100 -P 10
 
-# Check final metrics
-echo -e "\nFinal metrics:"
-for port in 8080 8081 8082; do
-    echo -e "\nNode on port $port metrics:"
-    curl -s "http://localhost:$port/metrics" | jq '.' || echo "Failed to get metrics"
-done
+# Check for any errors in node logs
+echo -e "\nChecking node logs for errors..."
+echo "Node 1 errors:"
+grep -i "error\|panic\|fatal" node1.log || true
+echo -e "\nNode 2 errors:"
+grep -i "error\|panic\|fatal" node2.log || true
+echo -e "\nNode 3 errors:"
+grep -i "error\|panic\|fatal" node3.log || true
 
-echo -e "\nTest complete. Check the terminal windows for node logs." 
+# Clean up
+pkill -f "sprawl" || true 

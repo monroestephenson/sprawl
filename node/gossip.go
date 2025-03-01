@@ -16,6 +16,8 @@ type GossipManager struct {
 	config   *memberlist.Config
 	dht      *dht.DHT
 	metadata map[string]interface{}
+	stopCh   chan struct{}
+	done     chan struct{}
 }
 
 // GossipMetadata represents the metadata shared between nodes
@@ -54,6 +56,8 @@ func NewGossipManager(nodeID, bindAddr string, bindPort int, dhtInstance *dht.DH
 		config:   cfg,
 		dht:      dhtInstance,
 		metadata: make(map[string]interface{}),
+		stopCh:   make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 
 	// Start periodic metadata broadcast
@@ -65,8 +69,16 @@ func NewGossipManager(nodeID, bindAddr string, bindPort int, dhtInstance *dht.DH
 // startMetadataBroadcast periodically broadcasts node metadata
 func (g *GossipManager) startMetadataBroadcast() {
 	ticker := time.NewTicker(5 * time.Second)
-	for range ticker.C {
-		g.broadcastMetadata()
+	defer ticker.Stop()
+	defer close(g.done)
+
+	for {
+		select {
+		case <-g.stopCh:
+			return
+		case <-ticker.C:
+			g.broadcastMetadata()
+		}
 	}
 }
 
@@ -158,5 +170,7 @@ func (g *GossipManager) GetMembers() []string {
 
 // Shutdown gracefully leaves the cluster
 func (g *GossipManager) Shutdown() {
+	close(g.stopCh)
+	<-g.done // Wait for broadcast to stop
 	g.list.Shutdown()
 }

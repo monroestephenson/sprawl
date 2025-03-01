@@ -1,0 +1,3 @@
+2025/03/01 12:11:10 [DEBUG] memberlist: Got bind error: Failed to start TCP listener on "127.0.0.1" port 7946: listen tcp 127.0.0.1:7946: bind: address already in use
+2025/03/01 12:11:10 Failed to create node: Could not set up network transport: failed to obtain an address: Failed to start TCP listener on "127.0.0.1" port 7946: listen tcp 127.0.0.1:7946: bind: address already in use
+exit status 1

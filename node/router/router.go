@@ -5,9 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,7 @@ type Router struct {
 	routeCache sync.Map
 	metrics    *RouterMetrics
 	ackTracker *AckTracker
+	semaphore  chan struct{} // Limit concurrent goroutines
 }
 
 type RouterMetrics struct {
@@ -81,6 +83,7 @@ func NewRouter(nodeID string, dht *dht.DHT, store *store.Store) *Router {
 			pending:  make(map[string]*MessageState),
 			maxRetry: 3,
 		},
+		semaphore: make(chan struct{}, 50), // Limit to 50 concurrent goroutines
 	}
 }
 
@@ -220,45 +223,88 @@ func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeI
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	// Send to each node
+	// Create HTTP client with timeouts
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   2 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 20,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+
+	// Send to each node with limited concurrency
 	var wg sync.WaitGroup
 	nodeErrors := make(map[string]error)
 	var nodeErrorsMu sync.Mutex
 	successCount := atomic.Int64{}
 
+	// Create error channel to collect errors
+	errChan := make(chan error, len(sendNodes))
+	defer close(errChan)
+
 	for _, node := range sendNodes {
+		// Try to acquire semaphore with context
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case r.semaphore <- struct{}{}:
+		}
+
 		wg.Add(1)
 		go func(targetNode dht.NodeInfo) {
 			defer wg.Done()
+			defer func() { <-r.semaphore }()
+
+			// Create context with timeout
+			sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
 
 			url := fmt.Sprintf("http://%s:%d/publish", targetNode.Address, targetNode.HTTPPort)
-			req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+			req, err := http.NewRequestWithContext(sendCtx, "POST", url, bytes.NewBuffer(jsonData))
 			if err != nil {
 				nodeErrorsMu.Lock()
 				nodeErrors[targetNode.ID] = fmt.Errorf("failed to create request: %w", err)
 				nodeErrorsMu.Unlock()
+				errChan <- err
 				return
 			}
 
 			req.Header.Set("Content-Type", "application/json")
 
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := client.Do(req)
 			if err != nil {
 				nodeErrorsMu.Lock()
 				nodeErrors[targetNode.ID] = fmt.Errorf("failed to send message: %w", err)
 				nodeErrorsMu.Unlock()
+				errChan <- err
 				return
 			}
 			defer resp.Body.Close()
+
+			// Read response body with timeout
+			bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			if err != nil {
+				nodeErrorsMu.Lock()
+				nodeErrors[targetNode.ID] = fmt.Errorf("failed to read response: %w", err)
+				nodeErrorsMu.Unlock()
+				errChan <- err
+				return
+			}
 
 			var result struct {
 				Status string `json:"status"`
 				Error  string `json:"error"`
 			}
-			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			if err := json.Unmarshal(bodyBytes, &result); err != nil {
 				nodeErrorsMu.Lock()
 				nodeErrors[targetNode.ID] = fmt.Errorf("failed to decode response: %w", err)
 				nodeErrorsMu.Unlock()
+				errChan <- err
 				return
 			}
 
@@ -274,26 +320,37 @@ func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeI
 				nodeErrorsMu.Lock()
 				nodeErrors[targetNode.ID] = fmt.Errorf("message dropped by node")
 				nodeErrorsMu.Unlock()
+				errChan <- fmt.Errorf("message dropped by node %s", targetNode.ID[:8])
 			} else {
-				nodeErrorsMu.Lock()
-				nodeErrors[targetNode.ID] = fmt.Errorf("unexpected status: %s (%s)", result.Status, result.Error)
-				nodeErrorsMu.Unlock()
+				errChan <- fmt.Errorf("unexpected response status: %s", result.Status)
 			}
 		}(node)
 	}
 
-	wg.Wait()
+	// Wait for all goroutines to finish
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
 
-	// If no successful deliveries, return error with details
-	if successCount.Load() == 0 && len(nodeErrors) > 0 {
-		errMsgs := make([]string, 0, len(nodeErrors))
-		for nodeID, err := range nodeErrors {
-			errMsgs = append(errMsgs, fmt.Sprintf("node %s: %v", nodeID[:8], err))
+	// Wait for either completion or context cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		// Check if we have enough successful deliveries
+		if successCount.Load() > 0 {
+			return nil
 		}
-		return fmt.Errorf("all nodes failed: [%s]", strings.Join(errMsgs, " "))
+		// Return first error if no successes
+		select {
+		case err := <-errChan:
+			return err
+		default:
+			return fmt.Errorf("no successful deliveries")
+		}
 	}
-
-	return nil
 }
 
 // GetMetrics returns the current router metrics

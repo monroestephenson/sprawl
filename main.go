@@ -3,7 +3,10 @@ package main
 import (
 	"flag"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"sprawl/node"
 )
@@ -36,9 +39,17 @@ func main() {
 	// Print out the node's ID
 	log.Printf("Node started with ID: %s\n", n.ID)
 
-	// Start the HTTP server (blocking call)
-	n.StartHTTP()
+	// Set up signal handling for graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// Optionally, on shutdown or signal:
-	// n.Shutdown()
+	// Start HTTP server in a goroutine
+	go n.StartHTTP()
+
+	// Wait for shutdown signal
+	sig := <-sigCh
+	log.Printf("Received signal %v, initiating graceful shutdown...", sig)
+
+	// Perform graceful shutdown
+	n.Shutdown()
 }
