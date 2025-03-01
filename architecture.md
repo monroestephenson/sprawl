@@ -97,6 +97,77 @@ Each Sprawl node consists of:
 3. Cloud archival based on policies
 4. Index maintenance for retrieval
 
+## Stream Processing Architecture
+
+### 1. Processing Engine
+- **Stream Processor Core**
+  - Event-time processing
+  - Watermark tracking
+  - State management
+  - Checkpoint/savepoint system
+- **Window Manager**
+  - Time-based windows
+  - Count-based windows
+  - Session windows
+  - Custom windowing
+- **Operator Framework**
+  - Map/Filter/Reduce
+  - Joins (stream-stream, stream-table)
+  - Aggregations
+  - Custom operators
+- **State Backend**
+  - RocksDB state storage
+  - Checkpoint coordination
+  - State recovery
+  - State migration
+
+### 2. Enterprise Integration
+- **Kafka Compatibility Layer**
+  - Protocol translation
+  - Consumer group protocol
+  - Transaction protocol
+  - Offset management
+- **Schema Management**
+  - Schema registry
+  - Schema evolution
+  - Compatibility checking
+  - Format support (Avro, Protobuf, JSON)
+- **Connect Framework**
+  - Source connectors
+  - Sink connectors
+  - Transformation operators
+  - Connector lifecycle management
+
+### 3. Multi-DC Operations
+- **Cross-DC Replication**
+  - Active-active replication
+  - Conflict resolution
+  - Metadata synchronization
+  - Network optimization
+- **Disaster Recovery**
+  - Backup coordination
+  - Recovery orchestration
+  - Data consistency validation
+  - Failover automation
+
+## Enhanced Data Flows
+
+### Stream Processing Pipeline
+1. Source operator reads from topic
+2. Window computation
+3. State management
+4. Operator chain execution
+5. Sink operator writes results
+6. Checkpoint coordination
+
+### Enterprise Integration Flow
+1. Protocol detection
+2. Schema validation
+3. Format translation
+4. Processing pipeline
+5. Delivery confirmation
+6. Offset commitment
+
 ```mermaid
 flowchart TD
     subgraph "Publishers"
@@ -174,28 +245,53 @@ flowchart TD
     %% AI monitoring
     AI1 -->|Load Prediction| GOSSIP1
     AI2 -->|Load Prediction| GOSSIP2
+
+    %% New Stream Processing components
+    subgraph "Stream Processing"
+        SP[Stream Processor]
+        WM[Window Manager]
+        OP[Operator Chain]
+        SB[State Backend]
+    end
+
+    %% New Enterprise components
+    subgraph "Enterprise Features"
+        KP[Kafka Protocol]
+        SR[Schema Registry]
+        CF[Connect Framework]
+        DR[DR Manager]
+    end
+
+    %% Connect new components
+    ROUTER1 --> SP
+    SP --> WM
+    WM --> OP
+    OP --> SB
+    SB --> ROCKS1
+
+    API1 --> KP
+    KP --> ROUTER1
+    SR --> API1
+    CF --> ROUTER1
+    DR --> S31
 ```
 
-## Technical Innovations
+## Advanced Technical Innovations
 
-### Self-Healing
-- Gossip-based failure detection
-- Automatic topic redistribution
-- N-way message replication
+### Stream Processing
+- Exactly-once processing semantics
+- Distributed state management
+- Dynamic scaling of processing jobs
+- Fault-tolerant checkpointing
 
-### Load Balancing
-- Gossip-propagated metrics
-- Dynamic topic redistribution
-- Gradual new node integration
+### Enterprise Features
+- Zero-downtime schema evolution
+- Multi-tenancy support
+- Resource isolation
+- Audit logging and compliance
 
-### Storage Management
-- Memory-first for hot data
-- Disk for warm data
-- Cloud for cold storage
-- Access-pattern-based placement
-
-### AI Operations
-- Traffic pattern analysis
-- Load prediction
-- Proactive scaling
-- Preventive rebalancing
+### Operational Excellence
+- Visual topology management
+- Interactive query capabilities
+- Dead letter queue handling
+- Time travel debugging
