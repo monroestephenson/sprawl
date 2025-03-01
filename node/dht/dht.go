@@ -46,7 +46,27 @@ func (d *DHT) AddNode(info NodeInfo) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.nodes[info.ID] = info
+	// Validate node info
+	if info.HTTPPort <= 0 {
+		log.Printf("[DHT] Warning: Attempted to add node %s with invalid HTTP port %d",
+			info.ID[:8], info.HTTPPort)
+		return
+	}
+
+	// Update existing node or add new one
+	if existing, ok := d.nodes[info.ID]; ok {
+		// Only update if new info has valid HTTP port
+		if info.HTTPPort > 0 {
+			existing.HTTPPort = info.HTTPPort
+			existing.Address = info.Address
+			d.nodes[info.ID] = existing
+			log.Printf("[DHT] Updated node %s info (HTTP port: %d)", info.ID[:8], info.HTTPPort)
+		}
+	} else {
+		d.nodes[info.ID] = info
+		log.Printf("[DHT] Added new node %s (HTTP port: %d)", info.ID[:8], info.HTTPPort)
+	}
+
 	d.updateFingerTable()
 }
 
@@ -169,6 +189,8 @@ func (d *DHT) RegisterNode(topic string, nodeID string, httpPort int) {
 	defer d.mu.Unlock()
 
 	hash := d.HashTopic(topic)
+	log.Printf("[DHT] Registering node %s for topic %s (hash: %s) with HTTP port %d",
+		nodeID[:8], topic, hash[:8], httpPort)
 
 	// Update or create node info with complete information
 	if existingNode, ok := d.nodes[nodeID]; ok {
@@ -211,6 +233,14 @@ func (d *DHT) RegisterNode(topic string, nodeID string, httpPort int) {
 		d.topicMap[hash] = nodes
 		log.Printf("[DHT] Registered node %s for topic %s (hash: %s)", nodeID[:8], topic, hash[:8])
 		log.Printf("[DHT] Topic %s now has %d registered nodes", topic, len(nodes))
+
+		// Log all nodes for this topic
+		log.Printf("[DHT] Current nodes for topic %s:", topic)
+		for _, n := range nodes {
+			if info, ok := d.nodes[n]; ok {
+				log.Printf("[DHT] - Node %s (HTTP port: %d)", n[:8], info.HTTPPort)
+			}
+		}
 	}
 }
 
@@ -245,26 +275,26 @@ func (d *DHT) MergeTopicMap(peerMap map[string][]string) {
 		// Add existing nodes first
 		for _, node := range existing {
 			if !nodeSet[node] {
-				nodeSet[node] = true
-				merged = append(merged, node)
+				// Only keep nodes that have valid info
+				if info, ok := d.nodes[node]; ok && info.HTTPPort > 0 {
+					nodeSet[node] = true
+					merged = append(merged, node)
+				}
 			}
 		}
 
 		// Add new nodes
 		for _, node := range nodes {
 			if !nodeSet[node] {
-				nodeSet[node] = true
-				merged = append(merged, node)
-
-				// Ensure we have node info
-				if _, ok := d.nodes[node]; !ok {
-					// Create default node info if missing
-					// Note: The actual HTTP port will be updated when the node registers
-					d.nodes[node] = NodeInfo{
-						ID:       node,
-						Address:  "127.0.0.1", // Default for local testing
-						HTTPPort: 0,           // Will be updated when node registers
-					}
+				// Only add nodes that have valid info
+				if info, ok := d.nodes[node]; ok && info.HTTPPort > 0 {
+					nodeSet[node] = true
+					merged = append(merged, node)
+					log.Printf("[DHT] Added node %s with HTTP port %d to topic %s",
+						node[:8], info.HTTPPort, topic)
+				} else {
+					log.Printf("[DHT] Skipping node %s for topic %s: missing or invalid HTTP port",
+						node[:8], topic)
 				}
 			}
 		}

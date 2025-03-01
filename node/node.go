@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"sprawl/node/balancer"
@@ -110,8 +111,10 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 	if msg.ID == "" {
 		msg.ID = uuid.New().String()
 		msg.TTL = 3 // Default TTL for new messages
-	} else if msg.TTL <= 0 {
-		// Drop forwarded messages that have exceeded their TTL
+	}
+
+	// Check TTL before processing
+	if msg.TTL <= 0 {
 		log.Printf("[Node %s] Dropping message %s due to expired TTL", n.ID[:8], msg.ID)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -125,47 +128,34 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Node %s] Publishing message %s to topic: %s (TTL: %d)",
 		n.ID[:8], msg.ID, msg.Topic, msg.TTL)
 
-	// Check if we have any subscribers for this topic
-	hash := n.DHT.HashTopic(msg.Topic)
-	nodes := n.DHT.GetNodesForTopic(msg.Topic)
-	log.Printf("[Node %s] Found %d nodes for topic %s (hash: %s)", n.ID[:8], len(nodes), msg.Topic, hash[:8])
-
-	// Log all target nodes
-	for _, node := range nodes {
-		log.Printf("[Node %s] Target node for message %s: %s (%s:%d)",
-			n.ID[:8], msg.ID[:8], node.ID[:8], node.Address, node.HTTPPort)
-	}
-
 	routerMsg := router.Message{
 		ID:      msg.ID,
 		Topic:   msg.Topic,
 		Payload: []byte(msg.Payload),
-		TTL:     msg.TTL - 1, // Decrement TTL for forwarding
+		TTL:     msg.TTL,
 	}
 
 	ctx := context.Background()
 	if err := n.Router.RouteMessage(ctx, routerMsg); err != nil {
 		log.Printf("[Node %s] Failed to route message: %v", n.ID[:8], err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": err.Error(),
-		})
-		return
-	}
 
-	log.Printf("[Node %s] Successfully routed message %s", n.ID[:8], msg.ID)
+		// Only return error if it's not a routing failure to other nodes
+		if !strings.Contains(err.Error(), "failed to deliver message") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": err.Error(),
+			})
+			return
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(map[string]string{
+	json.NewEncoder(w).Encode(map[string]string{
 		"status": "published",
 		"id":     msg.ID,
-	}); err != nil {
-		log.Printf("[Node %s] Failed to encode response: %v", n.ID[:8], err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
+	})
 }
 
 func (n *Node) handleSubscribe(w http.ResponseWriter, r *http.Request) {

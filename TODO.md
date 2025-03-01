@@ -12,13 +12,17 @@
 - [x] Implement core message routing
   - [x] Message ID generation
   - [x] TTL handling
-  - [ ] Basic ACK mechanism
-  - [ ] Simple retry logic
+  - [x] Basic ACK mechanism
+  - [x] Simple retry logic
 - [x] Add basic metrics collection
   - [x] Message routing stats
   - [x] Cache hit tracking
   - [x] Latency monitoring
-- [ ] Create testing CLI tool
+- [x] Create testing CLI tool
+  - [x] Basic pub/sub commands
+  - [x] Integration tests
+  - [x] Load testing
+  - [x] Metrics reporting
 
 ## Phase 2: Storage & Distribution
 - [ ] Implement tiered storage

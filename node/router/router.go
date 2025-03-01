@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ type Router struct {
 	nodeID     string
 	routeCache sync.Map
 	metrics    *RouterMetrics
+	ackTracker *AckTracker
 }
 
 type RouterMetrics struct {
@@ -29,6 +31,20 @@ type RouterMetrics struct {
 	routeCacheHits atomic.Int64
 	latencySum     atomic.Int64
 	latencyCount   atomic.Int64
+}
+
+type AckTracker struct {
+	mu       sync.RWMutex
+	pending  map[string]*MessageState
+	maxRetry int
+}
+
+type MessageState struct {
+	Message      Message
+	Attempts     int
+	LastAttempt  time.Time
+	Destinations map[string]bool // nodeID -> acked
+	Done         chan struct{}
 }
 
 func (m *RouterMetrics) RecordCacheHit() {
@@ -61,6 +77,10 @@ func NewRouter(nodeID string, dht *dht.DHT, store *store.Store) *Router {
 		store:   store,
 		nodeID:  nodeID,
 		metrics: &RouterMetrics{},
+		ackTracker: &AckTracker{
+			pending:  make(map[string]*MessageState),
+			maxRetry: 3,
+		},
 	}
 }
 
@@ -68,22 +88,50 @@ func NewRouter(nodeID string, dht *dht.DHT, store *store.Store) *Router {
 func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 	start := time.Now()
 
-	// Record DHT lookup in metrics
-	r.metrics.messagesRouted.Add(1)
+	// Check if we've already processed this message
+	r.ackTracker.mu.RLock()
+	if _, exists := r.ackTracker.pending[msg.ID]; exists {
+		r.ackTracker.mu.RUnlock()
+		log.Printf("[Router] Skipping duplicate message %s", msg.ID[:8])
+		return nil
+	}
+	r.ackTracker.mu.RUnlock()
+
+	// Create message state for tracking
+	msgState := &MessageState{
+		Message:      msg,
+		Attempts:     1,
+		LastAttempt:  time.Now(),
+		Destinations: make(map[string]bool),
+		Done:         make(chan struct{}),
+	}
+
+	r.ackTracker.mu.Lock()
+	r.ackTracker.pending[msg.ID] = msgState
+	r.ackTracker.mu.Unlock()
+
+	// Ensure cleanup of message state
+	defer func() {
+		r.ackTracker.mu.Lock()
+		delete(r.ackTracker.pending, msg.ID)
+		r.ackTracker.mu.Unlock()
+		close(msgState.Done)
+	}()
 
 	// Check route cache first
 	var nodes []dht.NodeInfo
 	if cachedNodes, ok := r.routeCache.Load(msg.Topic); ok {
 		r.metrics.RecordCacheHit()
-		log.Printf("[Router] Cache hit for topic %s", msg.Topic)
 		nodes = cachedNodes.([]dht.NodeInfo)
 	} else {
-		// Get nodes from DHT and store in cache
 		nodes = r.dht.GetNodesForTopic(msg.Topic)
 		if len(nodes) > 0 {
-			log.Printf("[Router] Found %d nodes for topic %s", len(nodes), msg.Topic)
 			r.routeCache.Store(msg.Topic, nodes)
 		}
+	}
+
+	if len(nodes) == 0 {
+		return fmt.Errorf("no nodes found for topic %s", msg.Topic)
 	}
 
 	// Store message locally if we are one of the target nodes
@@ -96,133 +144,153 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 	}
 
 	if shouldStoreLocally {
-		log.Printf("[Router] Storing message locally for topic %s", msg.Topic)
+		log.Printf("[Router] Storing message %s locally for topic %s", msg.ID[:8], msg.Topic)
 		r.store.Publish(msg.Topic, msg.Payload)
-	} else {
-		log.Printf("[Router] Not storing message locally for topic %s (not a target node)", msg.Topic)
+		msgState.Destinations[r.nodeID] = true
+		r.metrics.messagesRouted.Add(1)
 	}
 
-	// Send to other nodes if any exist
-	if len(nodes) > 0 {
-		err := r.sendToNodes(ctx, msg, nodes)
-		r.metrics.RecordLatency(time.Since(start))
-		return err
+	// Send to other nodes with retry logic
+	var lastErr error
+	for attempt := 1; attempt <= r.ackTracker.maxRetry; attempt++ {
+		if attempt > 1 {
+			log.Printf("[Router] Retry attempt %d for message %s", attempt, msg.ID[:8])
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+		}
+
+		err := r.sendToNodes(ctx, msg, nodes, msgState)
+		if err == nil {
+			// Check if we have enough successful deliveries
+			r.ackTracker.mu.RLock()
+			successCount := len(msgState.Destinations)
+			r.ackTracker.mu.RUnlock()
+
+			// Consider message delivered if at least one node (besides ourselves) received it
+			targetCount := 1
+			if shouldStoreLocally {
+				targetCount = 2 // Need at least one other node if we're storing locally
+			}
+
+			if successCount >= targetCount {
+				log.Printf("[Router] Message %s delivered to %d nodes", msg.ID[:8], successCount)
+				r.metrics.messagesRouted.Add(1)
+				r.metrics.RecordLatency(time.Since(start))
+				return nil
+			}
+		}
+		lastErr = err
 	}
 
-	// If no nodes found and we didn't store locally, this is an error
-	if !shouldStoreLocally {
-		return fmt.Errorf("no nodes found for topic %s and not storing locally", msg.Topic)
+	if lastErr != nil {
+		log.Printf("[Router] Max retries reached for message %s: %v", msg.ID[:8], lastErr)
+		return fmt.Errorf("failed to deliver message after %d attempts: %v", r.ackTracker.maxRetry, lastErr)
 	}
 
-	r.metrics.RecordLatency(time.Since(start))
-	return nil
+	return fmt.Errorf("failed to deliver message to enough nodes")
 }
 
-func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeInfo) error {
-	// Don't send to self
+func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeInfo, msgState *MessageState) error {
+	// Don't send to self or already acked nodes
 	var sendNodes []dht.NodeInfo
+	r.ackTracker.mu.RLock()
 	for _, node := range nodes {
-		if node.ID != r.nodeID {
+		if node.ID != r.nodeID && !msgState.Destinations[node.ID] {
 			sendNodes = append(sendNodes, node)
 		}
 	}
+	r.ackTracker.mu.RUnlock()
 
-	log.Printf("[Router] Sending message %s to %d nodes for topic %s", msg.ID[:8], len(sendNodes), msg.Topic)
+	if len(sendNodes) == 0 {
+		return nil
+	}
 
-	if len(sendNodes) > 0 {
-		r.metrics.messagesSent.Add(int64(len(sendNodes)))
+	log.Printf("[Router] Sending message %s to %d nodes for topic %s (TTL: %d)",
+		msg.ID[:8], len(sendNodes), msg.Topic, msg.TTL)
 
-		// Create message payload that matches the expected format
-		payload := map[string]interface{}{
-			"topic":   msg.Topic,
-			"payload": string(msg.Payload),
-			"id":      msg.ID,
-			"ttl":     msg.TTL,
+	// Create message payload
+	payload := map[string]interface{}{
+		"topic":   msg.Topic,
+		"payload": string(msg.Payload),
+		"id":      msg.ID,
+		"ttl":     msg.TTL - 1, // Decrement TTL before forwarding
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal message: %w", err)
+	}
+
+	// Send to each node
+	var wg sync.WaitGroup
+	nodeErrors := make(map[string]error)
+	var nodeErrorsMu sync.Mutex
+	successCount := atomic.Int64{}
+
+	for _, node := range sendNodes {
+		wg.Add(1)
+		go func(targetNode dht.NodeInfo) {
+			defer wg.Done()
+
+			url := fmt.Sprintf("http://%s:%d/publish", targetNode.Address, targetNode.HTTPPort)
+			req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+			if err != nil {
+				nodeErrorsMu.Lock()
+				nodeErrors[targetNode.ID] = fmt.Errorf("failed to create request: %w", err)
+				nodeErrorsMu.Unlock()
+				return
+			}
+
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				nodeErrorsMu.Lock()
+				nodeErrors[targetNode.ID] = fmt.Errorf("failed to send message: %w", err)
+				nodeErrorsMu.Unlock()
+				return
+			}
+			defer resp.Body.Close()
+
+			var result struct {
+				Status string `json:"status"`
+				Error  string `json:"error"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				nodeErrorsMu.Lock()
+				nodeErrors[targetNode.ID] = fmt.Errorf("failed to decode response: %w", err)
+				nodeErrorsMu.Unlock()
+				return
+			}
+
+			if result.Status == "published" {
+				r.ackTracker.mu.Lock()
+				msgState.Destinations[targetNode.ID] = true
+				r.ackTracker.mu.Unlock()
+				successCount.Add(1)
+				r.metrics.messagesSent.Add(1)
+				log.Printf("[Router] Node %s acknowledged message %s", targetNode.ID[:8], msg.ID[:8])
+			} else if result.Status == "dropped" {
+				log.Printf("[Router] Message %s dropped by node %s (TTL: %d)", msg.ID[:8], targetNode.ID[:8], msg.TTL)
+				nodeErrorsMu.Lock()
+				nodeErrors[targetNode.ID] = fmt.Errorf("message dropped by node")
+				nodeErrorsMu.Unlock()
+			} else {
+				nodeErrorsMu.Lock()
+				nodeErrors[targetNode.ID] = fmt.Errorf("unexpected status: %s (%s)", result.Status, result.Error)
+				nodeErrorsMu.Unlock()
+			}
+		}(node)
+	}
+
+	wg.Wait()
+
+	// If no successful deliveries, return error with details
+	if successCount.Load() == 0 && len(nodeErrors) > 0 {
+		errMsgs := make([]string, 0, len(nodeErrors))
+		for nodeID, err := range nodeErrors {
+			errMsgs = append(errMsgs, fmt.Sprintf("node %s: %v", nodeID[:8], err))
 		}
-
-		jsonData, err := json.Marshal(payload)
-		if err != nil {
-			return fmt.Errorf("failed to marshal message: %w", err)
-		}
-
-		// Send to each node
-		var wg sync.WaitGroup
-		errors := make(chan error, len(sendNodes))
-		successCount := atomic.Int32{}
-
-		for _, node := range sendNodes {
-			wg.Add(1)
-			go func(targetNode dht.NodeInfo) {
-				defer wg.Done()
-
-				url := fmt.Sprintf("http://%s:%d/publish", targetNode.Address, targetNode.HTTPPort)
-				log.Printf("[Router] Sending message %s to node %s at %s", msg.ID[:8], targetNode.ID[:8], url)
-
-				req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
-				if err != nil {
-					errors <- fmt.Errorf("failed to create request for node %s: %w", targetNode.ID, err)
-					return
-				}
-
-				req.Header.Set("Content-Type", "application/json")
-
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
-					errors <- fmt.Errorf("failed to send message to node %s: %w", targetNode.ID, err)
-					return
-				}
-				defer resp.Body.Close()
-
-				if resp.StatusCode != http.StatusOK {
-					errors <- fmt.Errorf("node %s responded with status %d", targetNode.ID, resp.StatusCode)
-					return
-				}
-
-				// Parse response to check status
-				var result struct {
-					Status string `json:"status"`
-					Error  string `json:"error"`
-				}
-				if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-					errors <- fmt.Errorf("failed to decode response from node %s: %w", targetNode.ID, err)
-					return
-				}
-
-				if result.Status == "published" {
-					successCount.Add(1)
-					log.Printf("[Router] Successfully delivered message %s to node %s", msg.ID[:8], targetNode.ID[:8])
-				} else if result.Status == "dropped" {
-					log.Printf("[Router] Message %s dropped by node %s", msg.ID[:8], targetNode.ID[:8])
-				} else {
-					errors <- fmt.Errorf("node %s returned unexpected status: %s (%s)", targetNode.ID, result.Status, result.Error)
-				}
-			}(node)
-		}
-
-		// Wait for all goroutines to finish
-		wg.Wait()
-		close(errors)
-
-		// Collect any errors
-		var errs []error
-		for err := range errors {
-			errs = append(errs, err)
-		}
-
-		successes := successCount.Load()
-		if successes == 0 && len(errs) > 0 {
-			return fmt.Errorf("failed to deliver message to any nodes: %v", errs)
-		}
-
-		if len(errs) > 0 {
-			log.Printf("[Router] Warning: Message %s delivered to %d/%d nodes with %d errors",
-				msg.ID[:8], successes, len(sendNodes), len(errs))
-		} else {
-			log.Printf("[Router] Successfully delivered message %s to all %d nodes",
-				msg.ID[:8], len(sendNodes))
-		}
-	} else {
-		log.Printf("[Router] No remote nodes to send to for topic %s", msg.Topic)
+		return fmt.Errorf("all nodes failed: [%s]", strings.Join(errMsgs, " "))
 	}
 
 	return nil
