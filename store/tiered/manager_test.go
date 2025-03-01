@@ -25,7 +25,7 @@ func TestManager_BasicOperations(t *testing.T) {
 		ArchiveInterval: time.Minute,
 	}
 
-	manager, err := NewManager(1000, 1024*1024, filepath.Join(tmpDir, "test.db"), policy)
+	manager, err := NewManager(1000, 1024*1024, filepath.Join(tmpDir, "test.db"), nil, policy)
 	if err != nil {
 		t.Fatalf("Failed to create manager: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestManager_TieredStorage(t *testing.T) {
 		ArchiveInterval: time.Minute,
 	}
 
-	manager, err := NewManager(5, 100, filepath.Join(tmpDir, "test.db"), policy)
+	manager, err := NewManager(5, 100, filepath.Join(tmpDir, "test.db"), nil, policy)
 	if err != nil {
 		t.Fatalf("Failed to create manager: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestManager_MessageRetention(t *testing.T) {
 		ArchiveInterval: 5 * time.Millisecond, // Faster archival interval
 	}
 
-	manager, err := NewManager(100, 1024*1024, filepath.Join(tmpDir, "test.db"), policy)
+	manager, err := NewManager(100, 1024*1024, filepath.Join(tmpDir, "test.db"), nil, policy)
 	if err != nil {
 		t.Fatalf("Failed to create manager: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestManager_Concurrent(t *testing.T) {
 		ArchiveInterval: time.Minute,
 	}
 
-	manager, err := NewManager(1000, 1024*1024, filepath.Join(tmpDir, "test.db"), policy)
+	manager, err := NewManager(1000, 1024*1024, filepath.Join(tmpDir, "test.db"), nil, policy)
 	if err != nil {
 		t.Fatalf("Failed to create manager: %v", err)
 	}

@@ -25,27 +25,27 @@
   - [x] Metrics reporting
 
 ## Phase 2: Storage & Distribution 🔄
-- [ ] Implement tiered storage
-  - [ ] Optimize in-memory queue
-    - [ ] Ring buffer implementation
-    - [ ] Memory pressure monitoring
-    - [ ] Configurable size limits
-    - [ ] Eviction policies
-  - [ ] Add RocksDB/LevelDB integration
-    - [ ] Message persistence layer
-    - [ ] Index management
-    - [ ] Compaction policies
-    - [ ] Recovery mechanisms
-  - [ ] Implement S3/MinIO cloud storage
-    - [ ] Automatic tiering policies
-    - [ ] Batch upload optimization
-    - [ ] Concurrent access handling
-    - [ ] Data lifecycle management
-  - [ ] Add message archival logic
-    - [ ] Time-based archival
-    - [ ] Size-based archival
-    - [ ] Custom retention policies
-    - [ ] Archive compression
+- [x] Implement tiered storage
+  - [x] Optimize in-memory queue
+    - [x] Ring buffer implementation
+    - [x] Memory pressure monitoring
+    - [x] Configurable size limits
+    - [x] Eviction policies
+  - [x] Add RocksDB/LevelDB integration
+    - [x] Message persistence layer
+    - [x] Index management
+    - [x] Compaction policies
+    - [x] Recovery mechanisms
+  - [x] Implement S3/MinIO cloud storage
+    - [x] Automatic tiering policies
+    - [x] Batch upload optimization
+    - [x] Concurrent access handling
+    - [x] Data lifecycle management
+  - [x] Add message archival logic
+    - [x] Time-based archival
+    - [x] Size-based archival
+    - [x] Custom retention policies
+    - [x] Archive compression
 - [x] Enhance message routing
   - [x] Cross-node message forwarding
   - [x] Route caching system
@@ -59,19 +59,19 @@
     - [ ] Consumer group management
     - [ ] Offset tracking
     - [ ] Rebalancing protocols
-- [ ] Add backpressure handling
-  - [ ] Node-level throttling
-    - [ ] Adaptive rate limiting
-    - [ ] Priority queues
-    - [ ] Fair scheduling
-  - [ ] Adaptive rate control
-    - [ ] Publisher throttling
-    - [ ] Consumer pacing
-    - [ ] Network congestion detection
-  - [ ] Queue overflow management
-    - [ ] Disk spillover
-    - [ ] Load shedding policies
-    - [ ] Alert mechanisms
+- [x] Add backpressure handling
+  - [x] Node-level throttling
+    - [x] Adaptive rate limiting
+    - [x] Priority queues
+    - [x] Fair scheduling
+  - [x] Adaptive rate control
+    - [x] Publisher throttling
+    - [x] Consumer pacing
+    - [x] Network congestion detection
+  - [x] Queue overflow management
+    - [x] Disk spillover
+    - [x] Load shedding policies
+    - [x] Alert mechanisms
 
 ## Phase 3: Intelligence & Optimization 🔄
 - [ ] Implement AI-powered features

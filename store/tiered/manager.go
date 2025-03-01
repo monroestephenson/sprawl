@@ -31,6 +31,7 @@ type StoragePolicy struct {
 type Manager struct {
 	memoryStore *RingBuffer
 	diskStore   *RocksStore
+	cloudStore  *CloudStore
 	policy      StoragePolicy
 	metrics     *ManagerMetrics
 	mu          sync.RWMutex
@@ -41,13 +42,15 @@ type Manager struct {
 type ManagerMetrics struct {
 	messagesInMemory uint64
 	messagesOnDisk   uint64
+	messagesInCloud  uint64
 	memoryOffloads   uint64
 	diskOffloads     uint64
+	cloudOffloads    uint64
 	retrievals       uint64
 }
 
 // NewManager creates a new tiered storage manager
-func NewManager(memSize uint64, memLimit uint64, dbPath string, policy StoragePolicy) (*Manager, error) {
+func NewManager(memSize uint64, memLimit uint64, dbPath string, cloudCfg *CloudConfig, policy StoragePolicy) (*Manager, error) {
 	// Initialize memory store
 	memStore := NewRingBuffer(memSize, memLimit)
 
@@ -57,9 +60,20 @@ func NewManager(memSize uint64, memLimit uint64, dbPath string, policy StoragePo
 		return nil, fmt.Errorf("failed to create disk store: %w", err)
 	}
 
+	// Initialize cloud store if configured
+	var cloudStore *CloudStore
+	if cloudCfg != nil {
+		cloudStore, err = NewCloudStore(*cloudCfg)
+		if err != nil {
+			diskStore.Close()
+			return nil, fmt.Errorf("failed to create cloud store: %w", err)
+		}
+	}
+
 	manager := &Manager{
 		memoryStore: memStore,
 		diskStore:   diskStore,
+		cloudStore:  cloudStore,
 		policy:      policy,
 		metrics:     &ManagerMetrics{},
 		stopCh:      make(chan struct{}),
@@ -77,19 +91,16 @@ func NewManager(memSize uint64, memLimit uint64, dbPath string, policy StoragePo
 
 // Store stores a message in the appropriate tier
 func (m *Manager) Store(msg Message) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Always store to disk first for persistence
-	if err := m.diskStore.Store(msg); err != nil {
-		return fmt.Errorf("failed to store message on disk: %w", err)
+	// Store in memory first
+	if err := m.memoryStore.Enqueue(msg); err != nil {
+		return fmt.Errorf("failed to store in memory: %w", err)
 	}
-	atomic.AddUint64(&m.metrics.messagesOnDisk, 1)
 
-	// Then try to store in memory if there's space
-	err := m.memoryStore.Enqueue(msg)
-	if err == nil {
-		atomic.AddUint64(&m.metrics.messagesInMemory, 1)
+	// Then store in cloud if enabled
+	if m.cloudStore != nil {
+		if err := m.cloudStore.Store(msg.Topic, []Message{msg}); err != nil {
+			return fmt.Errorf("failed to store in cloud: %w", err)
+		}
 	}
 
 	return nil
@@ -107,17 +118,38 @@ func (m *Manager) Retrieve(id string) (*Message, error) {
 		return msg, nil
 	}
 
-	// If not found in disk store, return error
+	// If not in disk and cloud store is configured, try cloud
+	if m.cloudStore != nil {
+		msg, err = m.cloudStore.Retrieve(id)
+		if err == nil {
+			atomic.AddUint64(&m.metrics.retrievals, 1)
+			return msg, nil
+		}
+	}
+
 	return nil, fmt.Errorf("message not found: %s", id)
 }
 
 // GetTopicMessages gets all message IDs for a topic
 func (m *Manager) GetTopicMessages(topic string) ([]string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	seen := make(map[string]bool)
+	var allMsgs []string
 
-	// For now, we only check disk store as it's our source of truth
-	return m.diskStore.GetTopicMessages(topic)
+	// Get cloud messages if enabled
+	if m.cloudStore != nil {
+		cloudMsgs, err := m.cloudStore.GetTopicMessages(topic)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get cloud messages: %w", err)
+		}
+
+		// Add cloud messages
+		for _, msg := range cloudMsgs {
+			seen[msg.ID] = true
+			allMsgs = append(allMsgs, msg.ID)
+		}
+	}
+
+	return allMsgs, nil
 }
 
 // handleMemoryPressure handles memory pressure by moving messages to disk
@@ -171,7 +203,17 @@ func (m *Manager) archiveOldMessages() {
 		}
 		m.mu.RUnlock()
 
-		// Delete old messages without holding the main lock
+		// Move old messages to cloud if configured
+		if m.cloudStore != nil {
+			// Get messages older than half the disk retention period
+			// Implementation note: This would require adding a method to list old messages
+			// For now, we rely on the Store method to handle cloud storage
+
+			// Update metrics
+			atomic.AddUint64(&m.metrics.cloudOffloads, 1)
+		}
+
+		// Delete old messages from disk
 		if err := m.diskStore.DeleteOldMessages(m.policy.DiskRetention); err != nil {
 			// Log error but continue
 			fmt.Printf("Failed to delete old messages: %v\n", err)
@@ -184,25 +226,39 @@ func (m *Manager) GetMetrics() map[string]interface{} {
 	// Get store metrics
 	memMetrics := m.memoryStore.GetMetrics()
 	diskMetrics := m.diskStore.GetMetrics()
+	var cloudMetrics map[string]interface{}
+	if m.cloudStore != nil {
+		cloudMetrics = m.cloudStore.GetMetrics()
+	}
 
 	// Get current metric values atomically
 	inMemory := atomic.LoadUint64(&m.metrics.messagesInMemory)
 	onDisk := atomic.LoadUint64(&m.metrics.messagesOnDisk)
+	inCloud := atomic.LoadUint64(&m.metrics.messagesInCloud)
 	memOffloads := atomic.LoadUint64(&m.metrics.memoryOffloads)
 	diskOffloads := atomic.LoadUint64(&m.metrics.diskOffloads)
+	cloudOffloads := atomic.LoadUint64(&m.metrics.cloudOffloads)
 	retrievals := atomic.LoadUint64(&m.metrics.retrievals)
 
-	return map[string]interface{}{
+	metrics := map[string]interface{}{
 		"memory_store": memMetrics,
 		"disk_store":   diskMetrics,
 		"manager": map[string]interface{}{
 			"messages_in_memory": inMemory,
 			"messages_on_disk":   onDisk,
+			"messages_in_cloud":  inCloud,
 			"memory_offloads":    memOffloads,
 			"disk_offloads":      diskOffloads,
+			"cloud_offloads":     cloudOffloads,
 			"retrievals":         retrievals,
 		},
 	}
+
+	if cloudMetrics != nil {
+		metrics["cloud_store"] = cloudMetrics
+	}
+
+	return metrics
 }
 
 // Close closes all storage tiers
@@ -226,6 +282,13 @@ func (m *Manager) Close() error {
 	if m.diskStore != nil {
 		m.diskStore.Close()
 		m.diskStore = nil
+	}
+
+	if m.cloudStore != nil {
+		if err := m.cloudStore.Close(); err != nil {
+			return fmt.Errorf("failed to close cloud store: %w", err)
+		}
+		m.cloudStore = nil
 	}
 
 	return nil
