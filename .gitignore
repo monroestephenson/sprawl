@@ -30,3 +30,5 @@ minio_data/
 # OS specific
 .DS_Store
 Thumbs.db
+
+overview.md
