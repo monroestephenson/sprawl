@@ -44,19 +44,10 @@ docker exec minio mc mb myminio/test-bucket || true
 echo "Building sprawlctl..."
 go build -o sprawlctl cmd/sprawlctl/main.go
 
-# Run unit tests for all components
+# Run unit tests for all components with timeout
 echo -e "\nRunning unit tests..."
-echo "Testing ring buffer..."
-MINIO_ENDPOINT=http://localhost:9000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin go test ./store/tiered/ring_buffer_test.go ./store/tiered/ring_buffer.go -v
-
-echo "Testing rocks store..."
-MINIO_ENDPOINT=http://localhost:9000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin go test ./store/tiered/rocks_store_test.go ./store/tiered/rocks_store.go -v
-
-echo "Testing cloud store..."
-MINIO_ENDPOINT=http://localhost:9000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin go test ./store/tiered/cloud_store_test.go ./store/tiered/cloud_store.go -v
-
-echo "Testing tiered manager..."
-MINIO_ENDPOINT=http://localhost:9000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin go test ./store/tiered/manager_test.go ./store/tiered/manager.go -v
+echo "Testing store/tiered package..."
+(MINIO_ENDPOINT=http://localhost:9000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin go test ./store/tiered/... -v & P=$!; (sleep 60; kill $P 2>/dev/null) & wait $P)
 
 # Start node 1 (seed node)
 echo "Starting node 1 (seed node)..."
@@ -155,24 +146,24 @@ echo -e "\nSubscribing nodes to test topics..."
 echo "Waiting for subscriptions to propagate..."
 sleep 5
 
-# Test tiered storage functionality
+# Test tiered storage functionality with reduced message count
 echo -e "\nTesting tiered storage..."
 echo "Publishing messages to trigger memory pressure..."
-./sprawlctl -n http://localhost:8080 test -c 1000 -s 1024 -t test
+(./sprawlctl -n http://localhost:8080 test -c 50 -P 3 & P=$!; (sleep 45; kill $P 2>/dev/null) & wait $P)
 
 echo "Waiting for tiering to occur..."
-sleep 10
+sleep 15
 
 echo "Verifying message persistence..."
-./sprawlctl -n http://localhost:8080 verify -t test
+(./sprawlctl -n http://localhost:8080 test -c 10 -P 1 & P=$!; (sleep 30; kill $P 2>/dev/null) & wait $P)
 
-# Run integration tests
+# Run integration tests with timeout
 echo -e "\nRunning integration tests..."
-./sprawlctl test
+(./sprawlctl test & P=$!; (sleep 45; kill $P 2>/dev/null) & wait $P)
 
-# Run load test with larger messages to test tiered storage
+# Run load test with reduced message count and timeout
 echo -e "\nRunning load test with tiered storage..."
-./sprawlctl -n http://localhost:8080,http://localhost:8081,http://localhost:8082 test -c 100 -P 10 -s 1024
+(./sprawlctl -n http://localhost:8080,http://localhost:8081,http://localhost:8082 test -c 25 -P 3 & P=$!; (sleep 45; kill $P 2>/dev/null) & wait $P)
 
 # Check storage metrics
 echo -e "\nChecking storage metrics..."

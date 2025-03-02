@@ -49,7 +49,7 @@ func (d *DHT) AddNode(info NodeInfo) {
 	// Validate node info
 	if info.HTTPPort <= 0 {
 		log.Printf("[DHT] Warning: Attempted to add node %s with invalid HTTP port %d",
-			info.ID[:8], info.HTTPPort)
+			truncateID(info.ID), info.HTTPPort)
 		return
 	}
 
@@ -60,14 +60,22 @@ func (d *DHT) AddNode(info NodeInfo) {
 			existing.HTTPPort = info.HTTPPort
 			existing.Address = info.Address
 			d.nodes[info.ID] = existing
-			log.Printf("[DHT] Updated node %s info (HTTP port: %d)", info.ID[:8], info.HTTPPort)
+			log.Printf("[DHT] Updated node %s info (HTTP port: %d)", truncateID(info.ID), info.HTTPPort)
 		}
 	} else {
 		d.nodes[info.ID] = info
-		log.Printf("[DHT] Added new node %s (HTTP port: %d)", info.ID[:8], info.HTTPPort)
+		log.Printf("[DHT] Added new node %s (HTTP port: %d)", truncateID(info.ID), info.HTTPPort)
 	}
 
 	d.updateFingerTable()
+}
+
+// truncateID safely truncates a node ID to 8 characters for logging
+func truncateID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 // RemoveNode removes a node from the DHT
@@ -98,7 +106,7 @@ func (d *DHT) GetNodesForTopic(topic string) []NodeInfo {
 	defer d.mu.RUnlock()
 
 	hash := d.HashTopic(topic)
-	log.Printf("[DHT] Looking up nodes for topic %s (hash: %s)", topic, hash[:8])
+	log.Printf("[DHT] Looking up nodes for topic %s (hash: %s)", topic, truncateID(hash))
 
 	// Log current DHT state
 	log.Printf("[DHT] Current topic map has %d entries", len(d.topicMap))
@@ -112,9 +120,9 @@ func (d *DHT) GetNodesForTopic(topic string) []NodeInfo {
 			if info, ok := d.nodes[nodeID]; ok {
 				nodeInfos = append(nodeInfos, info)
 				log.Printf("[DHT] Including node %s (%s:%d) for topic %s",
-					nodeID[:8], info.Address, info.HTTPPort, topic)
+					truncateID(nodeID), info.Address, info.HTTPPort, topic)
 			} else {
-				log.Printf("[DHT] Warning: Found nodeID %s in topic map but no node info", nodeID[:8])
+				log.Printf("[DHT] Warning: Found nodeID %s in topic map but no node info", truncateID(nodeID))
 			}
 		}
 
@@ -195,7 +203,7 @@ func (d *DHT) RegisterNode(topic string, nodeID string, httpPort int) {
 
 	hash := d.HashTopic(topic)
 	log.Printf("[DHT] Registering node %s for topic %s (hash: %s) with HTTP port %d",
-		nodeID[:8], topic, hash[:8], httpPort)
+		truncateID(nodeID), topic, truncateID(hash), httpPort)
 
 	// Update or create node info with complete information
 	if existingNode, ok := d.nodes[nodeID]; ok {
@@ -206,7 +214,7 @@ func (d *DHT) RegisterNode(topic string, nodeID string, httpPort int) {
 			existingNode.Address = "127.0.0.1" // Default for local testing
 		}
 		d.nodes[nodeID] = existingNode
-		log.Printf("[DHT] Updated node info for %s (HTTP port: %d)", nodeID[:8], httpPort)
+		log.Printf("[DHT] Updated node info for %s (HTTP port: %d)", truncateID(nodeID), httpPort)
 	} else {
 		// Create new node info
 		nodeInfo := NodeInfo{
@@ -215,7 +223,7 @@ func (d *DHT) RegisterNode(topic string, nodeID string, httpPort int) {
 			HTTPPort: httpPort,
 		}
 		d.nodes[nodeID] = nodeInfo
-		log.Printf("[DHT] Created new node info for %s (HTTP port: %d)", nodeID[:8], httpPort)
+		log.Printf("[DHT] Created new node info for %s (HTTP port: %d)", truncateID(nodeID), httpPort)
 	}
 
 	// Create or update the node list for this topic
@@ -236,14 +244,14 @@ func (d *DHT) RegisterNode(topic string, nodeID string, httpPort int) {
 	if !found {
 		nodes = append(nodes, nodeID)
 		d.topicMap[hash] = nodes
-		log.Printf("[DHT] Registered node %s for topic %s (hash: %s)", nodeID[:8], topic, hash[:8])
+		log.Printf("[DHT] Registered node %s for topic %s (hash: %s)", truncateID(nodeID), topic, truncateID(hash))
 		log.Printf("[DHT] Topic %s now has %d registered nodes", topic, len(nodes))
 
 		// Log all nodes for this topic
 		log.Printf("[DHT] Current nodes for topic %s:", topic)
 		for _, n := range nodes {
 			if info, ok := d.nodes[n]; ok {
-				log.Printf("[DHT] - Node %s (HTTP port: %d)", n[:8], info.HTTPPort)
+				log.Printf("[DHT] - Node %s (HTTP port: %d)", truncateID(n), info.HTTPPort)
 			}
 		}
 	}

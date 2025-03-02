@@ -2,6 +2,7 @@ package dht
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 )
 
@@ -24,11 +25,11 @@ func TestDistance(t *testing.T) {
 func TestClosestNodes(t *testing.T) {
 	dht := NewDHT("test")
 
-	// Add some test nodes
+	// Add some test nodes with valid HTTP ports
 	nodes := []NodeInfo{
-		{ID: "node1", Address: "127.0.0.1", Port: 8001},
-		{ID: "node2", Address: "127.0.0.1", Port: 8002},
-		{ID: "node3", Address: "127.0.0.1", Port: 8003},
+		{ID: "node1", Address: "127.0.0.1", Port: 8001, HTTPPort: 8081},
+		{ID: "node2", Address: "127.0.0.1", Port: 8002, HTTPPort: 8082},
+		{ID: "node3", Address: "127.0.0.1", Port: 8003, HTTPPort: 8083},
 	}
 
 	for _, node := range nodes {
@@ -36,7 +37,8 @@ func TestClosestNodes(t *testing.T) {
 	}
 
 	target := sha256.Sum256([]byte("test-target"))
-	closest := dht.closestNodes(target[:], 2)
+	targetStr := hex.EncodeToString(target[:])
+	closest := dht.findClosestNodes(targetStr, 2)
 
 	if len(closest) != 2 {
 		t.Errorf("Expected 2 closest nodes, got %d", len(closest))

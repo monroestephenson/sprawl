@@ -91,16 +91,24 @@ func NewManager(memSize uint64, memLimit uint64, dbPath string, cloudCfg *CloudC
 
 // Store stores a message in the appropriate tier
 func (m *Manager) Store(msg Message) error {
-	// Store in memory first
-	if err := m.memoryStore.Enqueue(msg); err != nil {
-		return fmt.Errorf("failed to store in memory: %w", err)
+	// Try to store in memory first, but don't fail if memory is full
+	err := m.memoryStore.Enqueue(msg)
+	if err == nil {
+		atomic.AddUint64(&m.metrics.messagesInMemory, 1)
 	}
+
+	// Store in disk
+	if err := m.diskStore.Store(msg); err != nil {
+		return fmt.Errorf("failed to store in disk: %w", err)
+	}
+	atomic.AddUint64(&m.metrics.messagesOnDisk, 1)
 
 	// Then store in cloud if enabled
 	if m.cloudStore != nil {
 		if err := m.cloudStore.Store(msg.Topic, []Message{msg}); err != nil {
 			return fmt.Errorf("failed to store in cloud: %w", err)
 		}
+		atomic.AddUint64(&m.metrics.messagesInCloud, 1)
 	}
 
 	return nil
@@ -135,6 +143,20 @@ func (m *Manager) GetTopicMessages(topic string) ([]string, error) {
 	seen := make(map[string]bool)
 	var allMsgs []string
 
+	// Get disk messages first as they are our source of truth
+	diskMsgs, err := m.diskStore.GetTopicMessages(topic)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get disk messages: %w", err)
+	}
+
+	// Add disk messages
+	for _, msgID := range diskMsgs {
+		if !seen[msgID] {
+			seen[msgID] = true
+			allMsgs = append(allMsgs, msgID)
+		}
+	}
+
 	// Get cloud messages if enabled
 	if m.cloudStore != nil {
 		cloudMsgs, err := m.cloudStore.GetTopicMessages(topic)
@@ -144,8 +166,10 @@ func (m *Manager) GetTopicMessages(topic string) ([]string, error) {
 
 		// Add cloud messages
 		for _, msg := range cloudMsgs {
-			seen[msg.ID] = true
-			allMsgs = append(allMsgs, msg.ID)
+			if !seen[msg.ID] {
+				seen[msg.ID] = true
+				allMsgs = append(allMsgs, msg.ID)
+			}
 		}
 	}
 

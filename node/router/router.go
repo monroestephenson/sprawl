@@ -95,7 +95,7 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 	r.ackTracker.mu.RLock()
 	if _, exists := r.ackTracker.pending[msg.ID]; exists {
 		r.ackTracker.mu.RUnlock()
-		log.Printf("[Router] Skipping duplicate message %s", msg.ID[:8])
+		log.Printf("[Router] Skipping duplicate message %s", truncateID(msg.ID))
 		return nil
 	}
 	r.ackTracker.mu.RUnlock()
@@ -147,17 +147,23 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 	}
 
 	if shouldStoreLocally {
-		log.Printf("[Router] Storing message %s locally for topic %s", msg.ID[:8], msg.Topic)
+		log.Printf("[Router] Storing message %s locally for topic %s", truncateID(msg.ID), msg.Topic)
 		r.store.Publish(msg.Topic, msg.Payload)
 		msgState.Destinations[r.nodeID] = true
 		r.metrics.messagesRouted.Add(1)
+
+		// If we're the only target node, consider the message delivered
+		if len(nodes) == 1 {
+			r.metrics.RecordLatency(time.Since(start))
+			return nil
+		}
 	}
 
 	// Send to other nodes with retry logic
 	var lastErr error
 	for attempt := 1; attempt <= r.ackTracker.maxRetry; attempt++ {
 		if attempt > 1 {
-			log.Printf("[Router] Retry attempt %d for message %s", attempt, msg.ID[:8])
+			log.Printf("[Router] Retry attempt %d for message %s", attempt, truncateID(msg.ID))
 			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 		}
 
@@ -168,14 +174,9 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 			successCount := len(msgState.Destinations)
 			r.ackTracker.mu.RUnlock()
 
-			// Consider message delivered if at least one node (besides ourselves) received it
-			targetCount := 1
-			if shouldStoreLocally {
-				targetCount = 2 // Need at least one other node if we're storing locally
-			}
-
-			if successCount >= targetCount {
-				log.Printf("[Router] Message %s delivered to %d nodes", msg.ID[:8], successCount)
+			// Consider message delivered if at least one node received it
+			if successCount > 0 {
+				log.Printf("[Router] Message %s delivered to %d nodes", truncateID(msg.ID), successCount)
 				r.metrics.messagesRouted.Add(1)
 				r.metrics.RecordLatency(time.Since(start))
 				return nil
@@ -185,11 +186,19 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 	}
 
 	if lastErr != nil {
-		log.Printf("[Router] Max retries reached for message %s: %v", msg.ID[:8], lastErr)
+		log.Printf("[Router] Max retries reached for message %s: %v", truncateID(msg.ID), lastErr)
 		return fmt.Errorf("failed to deliver message after %d attempts: %v", r.ackTracker.maxRetry, lastErr)
 	}
 
 	return fmt.Errorf("failed to deliver message to enough nodes")
+}
+
+// truncateID safely truncates a message ID for logging
+func truncateID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeInfo, msgState *MessageState) error {
@@ -245,7 +254,6 @@ func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeI
 
 	// Create error channel to collect errors
 	errChan := make(chan error, len(sendNodes))
-	defer close(errChan)
 
 	for _, node := range sendNodes {
 		// Try to acquire semaphore with context
@@ -270,7 +278,10 @@ func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeI
 				nodeErrorsMu.Lock()
 				nodeErrors[targetNode.ID] = fmt.Errorf("failed to create request: %w", err)
 				nodeErrorsMu.Unlock()
-				errChan <- err
+				select {
+				case errChan <- err:
+				default:
+				}
 				return
 			}
 
@@ -281,7 +292,10 @@ func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeI
 				nodeErrorsMu.Lock()
 				nodeErrors[targetNode.ID] = fmt.Errorf("failed to send message: %w", err)
 				nodeErrorsMu.Unlock()
-				errChan <- err
+				select {
+				case errChan <- err:
+				default:
+				}
 				return
 			}
 			defer resp.Body.Close()
@@ -292,7 +306,10 @@ func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeI
 				nodeErrorsMu.Lock()
 				nodeErrors[targetNode.ID] = fmt.Errorf("failed to read response: %w", err)
 				nodeErrorsMu.Unlock()
-				errChan <- err
+				select {
+				case errChan <- err:
+				default:
+				}
 				return
 			}
 
@@ -304,7 +321,10 @@ func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeI
 				nodeErrorsMu.Lock()
 				nodeErrors[targetNode.ID] = fmt.Errorf("failed to decode response: %w", err)
 				nodeErrorsMu.Unlock()
-				errChan <- err
+				select {
+				case errChan <- err:
+				default:
+				}
 				return
 			}
 
@@ -320,9 +340,15 @@ func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeI
 				nodeErrorsMu.Lock()
 				nodeErrors[targetNode.ID] = fmt.Errorf("message dropped by node")
 				nodeErrorsMu.Unlock()
-				errChan <- fmt.Errorf("message dropped by node %s", targetNode.ID[:8])
+				select {
+				case errChan <- fmt.Errorf("message dropped by node %s", targetNode.ID[:8]):
+				default:
+				}
 			} else {
-				errChan <- fmt.Errorf("unexpected response status: %s", result.Status)
+				select {
+				case errChan <- fmt.Errorf("unexpected response status: %s", result.Status):
+				default:
+				}
 			}
 		}(node)
 	}
@@ -332,6 +358,7 @@ func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeI
 	go func() {
 		wg.Wait()
 		close(done)
+		close(errChan)
 	}()
 
 	// Wait for either completion or context cancellation
@@ -344,12 +371,10 @@ func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeI
 			return nil
 		}
 		// Return first error if no successes
-		select {
-		case err := <-errChan:
+		if err, ok := <-errChan; ok {
 			return err
-		default:
-			return fmt.Errorf("no successful deliveries")
 		}
+		return fmt.Errorf("no successful deliveries")
 	}
 }
 

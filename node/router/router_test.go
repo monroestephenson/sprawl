@@ -14,6 +14,9 @@ func TestRouteMessage(t *testing.T) {
 	store := store.NewStore()
 	router := NewRouter("test-node", dht, store)
 
+	// Register ourselves as a node for the test topic
+	dht.RegisterNode("test-topic", "test-node", 8080)
+
 	msg := Message{
 		ID:      "test-msg",
 		Topic:   "test-topic",
