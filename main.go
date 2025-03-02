@@ -12,12 +12,23 @@ import (
 )
 
 func main() {
-	// Command-line flags to configure gossip & HTTP
-	bindAddr := flag.String("bindAddr", "0.0.0.0", "Gossip bind address")
+	// Get bind addresses from environment variables with fallbacks
+	envBindAddr := os.Getenv("BIND_ADDR")
+	if envBindAddr == "" {
+		envBindAddr = "0.0.0.0"
+	}
+	envHttpAddr := os.Getenv("HTTP_ADDR")
+	if envHttpAddr == "" {
+		envHttpAddr = "0.0.0.0"
+	}
+	envSeeds := os.Getenv("SEEDS")
+
+	// Command-line flags to configure gossip & HTTP (environment variables take precedence)
+	bindAddr := flag.String("bindAddr", envBindAddr, "Gossip bind address")
 	bindPort := flag.Int("bindPort", 7946, "Gossip bind port")
-	httpAddr := flag.String("httpAddr", "0.0.0.0", "HTTP bind address")
+	httpAddr := flag.String("httpAddr", envHttpAddr, "HTTP bind address")
 	httpPort := flag.Int("httpPort", 8080, "HTTP server port")
-	seedNodes := flag.String("seeds", "", "Comma-separated list of seed nodes (host:port)")
+	seedNodes := flag.String("seeds", envSeeds, "Comma-separated list of seed nodes (host:port)")
 
 	flag.Parse()
 
@@ -31,6 +42,7 @@ func main() {
 	var seedsArr []string
 	if *seedNodes != "" {
 		seedsArr = strings.Split(*seedNodes, ",")
+		log.Printf("Attempting to join cluster with seeds: %v", seedsArr)
 	}
 	if err := n.JoinCluster(seedsArr); err != nil {
 		log.Printf("Failed to join cluster: %v", err)

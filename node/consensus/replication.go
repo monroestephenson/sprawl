@@ -105,10 +105,12 @@ func (rm *ReplicationManager) handleNewEntry(entry ReplicationEntry) {
 	rm.lastIndex = entry.Index
 	rm.lastTerm = entry.Term
 
-	log.Printf("[Replication] New entry %d for topic %s", entry.Index, entry.Topic)
+	log.Printf("[Replication] Node %s: New entry %d for topic %s (term: %d)",
+		truncateID(rm.nodeID), entry.Index, entry.Topic, entry.Term)
 
 	// Call commit callback immediately for the leader
 	if rm.onEntryCommitted != nil {
+		log.Printf("[Replication] Node %s: Committing entry %d locally", truncateID(rm.nodeID), entry.Index)
 		rm.onEntryCommitted(entry)
 	}
 
@@ -118,9 +120,17 @@ func (rm *ReplicationManager) handleNewEntry(entry ReplicationEntry) {
 
 func (rm *ReplicationManager) replicateEntries() {
 	rm.mu.RLock()
-	defer rm.mu.RUnlock()
-
+	peers := make([]string, len(rm.nextIndex))
+	i := 0
 	for peer := range rm.nextIndex {
+		peers[i] = peer
+		i++
+	}
+	rm.mu.RUnlock()
+
+	log.Printf("[Replication] Node %s: Starting replication to %d peers", truncateID(rm.nodeID), len(peers))
+
+	for _, peer := range peers {
 		go rm.syncWithPeer(peer)
 	}
 }
@@ -136,6 +146,12 @@ func (rm *ReplicationManager) syncWithPeer(peerID string) {
 			entries = append(entries, entry)
 		}
 	}
+
+	if len(entries) > 0 {
+		log.Printf("[Replication] Node %s: Syncing %d entries (index %d to %d) to peer %s",
+			truncateID(rm.nodeID), len(entries), nextIdx, rm.lastIndex, truncateID(peerID))
+	}
+
 	rm.mu.RUnlock()
 
 	if len(entries) == 0 {
@@ -147,8 +163,12 @@ func (rm *ReplicationManager) syncWithPeer(peerID string) {
 
 	if success {
 		rm.mu.Lock()
+		oldNext := rm.nextIndex[peerID]
+		oldMatch := rm.matchIndex[peerID]
 		rm.nextIndex[peerID] = rm.lastIndex + 1
 		rm.matchIndex[peerID] = rm.lastIndex
+		log.Printf("[Replication] Node %s: Successfully replicated to peer %s (nextIndex: %d→%d, matchIndex: %d→%d)",
+			truncateID(rm.nodeID), truncateID(peerID), oldNext, rm.nextIndex[peerID], oldMatch, rm.matchIndex[peerID])
 		rm.mu.Unlock()
 
 		// Check if we can commit any entries
@@ -156,8 +176,11 @@ func (rm *ReplicationManager) syncWithPeer(peerID string) {
 	} else {
 		// If failed, decrement nextIndex and try again
 		rm.mu.Lock()
+		oldNext := rm.nextIndex[peerID]
 		if rm.nextIndex[peerID] > 1 {
 			rm.nextIndex[peerID]--
+			log.Printf("[Replication] Node %s: Failed to replicate to peer %s, decreasing nextIndex %d→%d",
+				truncateID(rm.nodeID), truncateID(peerID), oldNext, rm.nextIndex[peerID])
 		}
 		rm.mu.Unlock()
 	}
@@ -199,24 +222,39 @@ func (rm *ReplicationManager) updateCommitIndex() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
+	oldCommitIndex := rm.commitIndex
 	// Find the highest index that has been replicated to a majority of nodes
 	for i := rm.commitIndex + 1; i <= rm.lastIndex; i++ {
 		count := 1 // Count self
-		for _, matchIdx := range rm.matchIndex {
+		replicatedTo := []string{rm.nodeID}
+
+		for peerID, matchIdx := range rm.matchIndex {
 			if matchIdx >= i {
 				count++
+				replicatedTo = append(replicatedTo, peerID)
 			}
 		}
 
 		if count >= rm.replicationFactor {
 			rm.commitIndex = i
 			if entry, ok := rm.entries[i]; ok && rm.onEntryCommitted != nil {
+				log.Printf("[Replication] Node %s: Entry %d replicated to %d nodes %v, committing (moved commit index %d→%d)",
+					truncateID(rm.nodeID), i, count, truncateIDList(replicatedTo), oldCommitIndex, rm.commitIndex)
 				rm.onEntryCommitted(entry)
 			}
 		} else {
 			break
 		}
 	}
+}
+
+// Helper function to truncate a list of node IDs for logging
+func truncateIDList(ids []string) []string {
+	truncated := make([]string, len(ids))
+	for i, id := range ids {
+		truncated[i] = truncateID(id)
+	}
+	return truncated
 }
 
 func (rm *ReplicationManager) handleStateChange(oldState, newState NodeState) {

@@ -1,3 +1,32 @@
-overview.md
-.log 
-.env
+# Binaries
+sprawl
+sprawlctl
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Log files
+*.log
+
+# MinIO data
+minio_data/
+
+# OS specific
+.DS_Store
+Thumbs.db

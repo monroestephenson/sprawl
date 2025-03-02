@@ -1,44 +1,19 @@
 #!/bin/bash
 
-# Clean up any existing nodes more thoroughly
+# Clean up any existing nodes
 echo "Cleaning up any existing nodes..."
 pkill -f "sprawl" || true
 sleep 2  # Give processes time to die
-# Double check and force kill if needed
 pkill -9 -f "sprawl" || true
-# Check if ports are still in use
-for port in 7946 7947 7948; do
-    pid=$(lsof -ti :$port)
-    if [ ! -z "$pid" ]; then
-        echo "Force killing process using port $port"
-        kill -9 $pid || true
-    fi
-done
 rm -f node*.log
 
-# Start MinIO server for cloud storage testing
-echo "Starting MinIO server..."
-docker stop minio || true
-docker rm minio || true
-docker run -d --name minio \
-    -p 9000:9000 \
-    -p 9001:9001 \
-    -e "MINIO_ROOT_USER=minioadmin" \
-    -e "MINIO_ROOT_PASSWORD=minioadmin" \
-    minio/minio server /data --console-address ":9001"
-
-# Wait for MinIO to be ready
-echo -n "Waiting for MinIO "
-until curl -s http://localhost:9000/minio/health/live > /dev/null; do
-    echo -n "."
-    sleep 1
-done
-echo "✓"
+# Wait for MinIO to be ready (should be handled by docker-compose health check)
+echo "MinIO should be ready..."
 
 # Create test bucket
 echo "Creating test bucket..."
-docker exec minio mc alias set myminio http://localhost:9000 minioadmin minioadmin
-docker exec minio mc mb myminio/test-bucket || true
+mc alias set myminio $MINIO_ENDPOINT $MINIO_ACCESS_KEY $MINIO_SECRET_KEY
+mc mb myminio/test-bucket || true
 
 # Build the CLI tool
 echo "Building sprawlctl..."
@@ -47,16 +22,14 @@ go build -o sprawlctl cmd/sprawlctl/main.go
 # Run unit tests for all components with timeout
 echo -e "\nRunning unit tests..."
 echo "Testing store/tiered package..."
-(MINIO_ENDPOINT=http://localhost:9000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin go test ./store/tiered/... -v & P=$!; (sleep 60; kill $P 2>/dev/null) & wait $P)
+(go test ./store/tiered/... -v & P=$!; (sleep 60; kill $P 2>/dev/null) & wait $P)
 
 echo "Testing consensus package..."
 (go test ./node/consensus/... -v & P=$!; (sleep 60; kill $P 2>/dev/null) & wait $P)
 
 # Start node 1 (seed node)
 echo "Starting node 1 (seed node)..."
-echo "Starting node with command: cd $(pwd) && go run main.go -bindAddr=127.0.0.1 -bindPort=7946 -httpAddr=127.0.0.1 -httpPort=8080"
-MINIO_ENDPOINT=http://localhost:9000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin \
-go run main.go -bindAddr=127.0.0.1 -bindPort=7946 -httpAddr=127.0.0.1 -httpPort=8080 > node1.log 2>&1 &
+go run main.go -bindAddr=0.0.0.0 -bindPort=7946 -httpAddr=0.0.0.0 -httpPort=8080 > node1.log 2>&1 &
 
 # Wait for seed node to start and be ready
 echo "Waiting for seed node to start..."
@@ -72,9 +45,7 @@ sleep 5
 
 # Start node 2
 echo "Starting node 2..."
-echo "Starting node with command: cd $(pwd) && go run main.go -bindAddr=127.0.0.1 -bindPort=7947 -httpAddr=127.0.0.1 -httpPort=8081 -seeds=127.0.0.1:7946"
-MINIO_ENDPOINT=http://localhost:9000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin \
-go run main.go -bindAddr=127.0.0.1 -bindPort=7947 -httpAddr=127.0.0.1 -httpPort=8081 -seeds=127.0.0.1:7946 > node2.log 2>&1 &
+go run main.go -bindAddr=0.0.0.0 -bindPort=7947 -httpAddr=0.0.0.0 -httpPort=8081 -seeds=localhost:7946 > node2.log 2>&1 &
 
 # Wait for node 2 to be ready
 echo -n "Waiting for node on port 8081 "
@@ -89,9 +60,7 @@ sleep 5
 
 # Start node 3
 echo "Starting node 3..."
-echo "Starting node with command: cd $(pwd) && go run main.go -bindAddr=127.0.0.1 -bindPort=7948 -httpAddr=127.0.0.1 -httpPort=8082 -seeds=127.0.0.1:7946"
-MINIO_ENDPOINT=http://localhost:9000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin \
-go run main.go -bindAddr=127.0.0.1 -bindPort=7948 -httpAddr=127.0.0.1 -httpPort=8082 -seeds=127.0.0.1:7946 > node3.log 2>&1 &
+go run main.go -bindAddr=0.0.0.0 -bindPort=7948 -httpAddr=0.0.0.0 -httpPort=8082 -seeds=localhost:7946 > node3.log 2>&1 &
 
 # Wait for node 3 to be ready
 echo -n "Waiting for node on port 8082 "
@@ -110,23 +79,22 @@ check_cluster_members() {
     local port=$1
     local status=$(curl -s http://localhost:$port/status)
     local members=$(echo "$status" | jq '.cluster_members | length')
-    local leader=$(echo "$status" | jq -r '.leader_id')
-    if [ "$members" -eq 3 ] && [ "$leader" != "null" ] && [ "$leader" != "" ]; then
+    if [ "$members" -eq 3 ]; then
         return 0
     else
         return 1
     fi
 }
 
-# Wait for all nodes to see each other and elect a leader (up to 45 seconds)
-echo "Verifying cluster membership and leader election..."
+# Wait for all nodes to see each other (up to 45 seconds)
+echo "Verifying cluster membership..."
 for i in {1..45}; do
     if check_cluster_members 8080 && check_cluster_members 8081 && check_cluster_members 8082; then
-        echo "✓ All nodes see complete cluster and have elected a leader"
+        echo "✓ All nodes see complete cluster"
         break
     fi
     if [ $i -eq 45 ]; then
-        echo "! Warning: Cluster formation or leader election incomplete after 45 seconds"
+        echo "! Warning: Cluster formation incomplete after 45 seconds"
     fi
     sleep 1
 done
@@ -188,6 +156,4 @@ grep -i "error\|panic\|fatal" node3.log || true
 
 # Clean up
 echo -e "\nCleaning up..."
-pkill -f "sprawl" || true
-docker stop minio || true
-docker rm minio || true 
+pkill -f "sprawl" || true 

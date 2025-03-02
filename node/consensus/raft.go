@@ -76,15 +76,18 @@ func NewRaftNode(id string, peers []string) *RaftNode {
 		id:              id,
 		state:           Follower,
 		peers:           peers,
-		electionTimeout: time.Duration(300+rand.Intn(150)) * time.Millisecond,
+		term:            0,
+		votedFor:        "",
+		leaderId:        "",
+		electionTimeout: time.Duration(150+rand.Intn(150)) * time.Millisecond,
 		voteCh:          make(chan VoteRequest, 100),
 		appendCh:        make(chan AppendEntriesRequest, 100),
 		stopCh:          make(chan struct{}),
 		done:            make(chan struct{}),
 	}
 
-	// Initialize timers
-	r.heartbeatTicker = time.NewTicker(150 * time.Millisecond)
+	// Initialize timers with faster heartbeat
+	r.heartbeatTicker = time.NewTicker(75 * time.Millisecond)
 	r.electionTimer = time.NewTimer(r.electionTimeout)
 
 	// Start Raft loop
@@ -94,33 +97,22 @@ func NewRaftNode(id string, peers []string) *RaftNode {
 }
 
 func (r *RaftNode) run() {
-	defer func() {
-		r.heartbeatTicker.Stop()
-		r.electionTimer.Stop()
-		select {
-		case <-r.done:
-			// Channel already closed
-		default:
-			close(r.done)
-		}
-	}()
+	defer close(r.done)
+	defer r.heartbeatTicker.Stop()
+	defer r.electionTimer.Stop()
 
 	for {
 		select {
 		case <-r.stopCh:
 			return
-
 		case <-r.electionTimer.C:
 			r.startElection()
-
 		case voteReq := <-r.voteCh:
 			r.handleVoteRequest(voteReq)
-
 		case appendReq := <-r.appendCh:
 			r.handleAppendEntries(appendReq)
-
 		case <-r.heartbeatTicker.C:
-			if r.getState() == Leader {
+			if r.state == Leader {
 				r.sendHeartbeats()
 			}
 		}
@@ -144,85 +136,70 @@ func (r *RaftNode) startElection() {
 
 	// Increment term and become candidate
 	r.term++
-	oldState := r.state
 	r.state = Candidate
 	r.votedFor = r.id
 	currentTerm := r.term
 	r.mu.Unlock()
 
-	if r.onStateChange != nil {
-		r.onStateChange(oldState, Candidate)
-	}
+	log.Printf("[Node %s] Starting election for term %d with %d peers", truncateID(r.id), currentTerm, len(r.peers))
 
-	log.Printf("[Raft] Node %s starting election for term %d", truncateID(r.id), currentTerm)
-
-	// Reset election timer with random timeout
-	r.electionTimeout = time.Duration(300+rand.Intn(150)) * time.Millisecond
-	r.resetElectionTimer()
-
-	// Request votes from all peers
-	votes := 1 // Vote for self
+	// Vote for self
+	votes := 1
 	voteCh := make(chan bool, len(r.peers))
 
+	// Request votes from all peers
 	for _, peer := range r.peers {
-		go func(peerId string) {
+		go func(peer string) {
 			req := VoteRequest{
 				Term:         currentTerm,
 				CandidateId:  r.id,
 				ResponseChan: make(chan VoteResponse, 1),
 			}
 
-			var resp VoteResponse
 			if r.sendVoteRequest != nil {
-				// Use direct method call for testing
-				resp = r.sendVoteRequest(peerId, req)
-			} else {
-				// Use channel-based communication
-				select {
-				case r.voteCh <- req:
-					resp = <-req.ResponseChan
-				case <-time.After(time.Second):
-					voteCh <- false
-					return
-				}
-			}
-
-			if resp.Term > currentTerm {
-				r.mu.Lock()
-				if resp.Term > r.term {
-					r.term = resp.Term
-					r.state = Follower
-					r.votedFor = ""
-					r.leaderId = ""
-				}
-				r.mu.Unlock()
-				voteCh <- false
-			} else {
+				resp := r.sendVoteRequest(peer, req)
 				voteCh <- resp.VoteGranted
+			} else {
+				// In production, implement actual RPC call here
+				voteCh <- false
 			}
 		}(peer)
 	}
 
-	// Wait for votes
-	timeout := time.After(r.electionTimeout)
+	// Wait for votes with timeout
+	timer := time.NewTimer(r.electionTimeout)
+	defer timer.Stop()
+
 	for i := 0; i < len(r.peers); i++ {
 		select {
 		case granted := <-voteCh:
 			if granted {
 				votes++
-				if votes > len(r.peers)/2 {
-					r.becomeLeader()
+				// Check if we have a majority
+				if votes > (len(r.peers)+1)/2 {
+					r.mu.Lock()
+					if r.state == Candidate && r.term == currentTerm {
+						r.becomeLeader()
+					}
+					r.mu.Unlock()
 					return
 				}
 			}
-		case <-timeout:
+		case <-timer.C:
+			// Election timeout, start new election
+			r.mu.Lock()
+			if r.state == Candidate {
+				r.state = Follower
+				r.votedFor = ""
+			}
+			r.mu.Unlock()
 			return
 		case <-r.stopCh:
 			return
 		}
 	}
 
-	// If we get here, we didn't win the election
+	// If we get here without winning the election, revert to follower
 	r.mu.Lock()
 	if r.state == Candidate {
 		r.state = Follower
@@ -232,26 +209,19 @@ func (r *RaftNode) startElection() {
 }
 
 func (r *RaftNode) becomeLeader() {
-	r.mu.Lock()
-	if r.state != Candidate {
-		r.mu.Unlock()
-		return
-	}
-
-	oldState := r.state
 	r.state = Leader
 	r.leaderId = r.id
-	r.mu.Unlock()
+	log.Printf("[Node %s] Became leader for term %d", truncateID(r.id), r.term)
 
-	if r.onStateChange != nil {
-		r.onStateChange(oldState, Leader)
-	}
+	// Reset election timer
+	r.resetElectionTimer()
 
+	// Notify callback if registered
 	if r.onLeaderElected != nil {
 		r.onLeaderElected(r.id)
 	}
 
-	log.Printf("[Raft] Node %s became leader for term %d", truncateID(r.id), r.term)
+	// Start sending heartbeats immediately
 	r.sendHeartbeats()
 }
 
@@ -259,7 +229,10 @@ func (r *RaftNode) handleVoteRequest(req VoteRequest) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	resp := VoteResponse{Term: r.term, VoteGranted: false}
+	resp := VoteResponse{
+		Term:        r.term,
+		VoteGranted: false,
+	}
 
 	if req.Term < r.term {
 		req.ResponseChan <- resp
@@ -273,9 +246,7 @@ func (r *RaftNode) handleVoteRequest(req VoteRequest) {
 		r.leaderId = ""
 	}
 
-	// Grant vote if we haven't voted for anyone else in this term
-	// or if we've already voted for this candidate
-	if (r.votedFor == "" || r.votedFor == req.CandidateId) && r.state != Leader {
+	if r.votedFor == "" || r.votedFor == req.CandidateId {
 		r.votedFor = req.CandidateId
 		resp.VoteGranted = true
 		r.resetElectionTimer()
@@ -288,70 +259,72 @@ func (r *RaftNode) handleAppendEntries(req AppendEntriesRequest) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	resp := AppendEntriesResponse{Term: r.term, Success: false}
+	resp := AppendEntriesResponse{
+		Term:    r.term,
+		Success: false,
+	}
 
 	if req.Term < r.term {
 		req.ResponseChan <- resp
 		return
 	}
 
-	// Valid heartbeat from leader
-	if req.Term >= r.term {
-		r.leaderId = req.LeaderId
+	// Valid AppendEntries, reset election timer
+	r.resetElectionTimer()
+
+	if req.Term > r.term {
 		r.term = req.Term
-		if r.state != Follower {
-			r.state = Follower
-			r.votedFor = ""
-		}
-		r.resetElectionTimer()
-		resp.Success = true
+		r.state = Follower
+		r.votedFor = ""
 	}
 
+	r.leaderId = req.LeaderId
+	resp.Success = true
 	req.ResponseChan <- resp
 }
 
 func (r *RaftNode) sendHeartbeats() {
 	r.mu.RLock()
+	if r.state != Leader {
+		r.mu.RUnlock()
+		return
+	}
 	currentTerm := r.term
 	r.mu.RUnlock()
 
 	for _, peer := range r.peers {
-		go func(peerId string) {
+		go func(peer string) {
 			req := AppendEntriesRequest{
 				Term:         currentTerm,
 				LeaderId:     r.id,
 				ResponseChan: make(chan AppendEntriesResponse, 1),
 			}
 
-			var resp AppendEntriesResponse
 			if r.sendAppendEntries != nil {
-				// Use direct method call for testing
-				resp = r.sendAppendEntries(peerId, req)
-			} else {
-				// Use channel-based communication
-				select {
-				case r.appendCh <- req:
-					resp = <-req.ResponseChan
-				case <-time.After(time.Second):
-					return
+				resp := r.sendAppendEntries(peer, req)
+				if resp.Term > currentTerm {
+					r.mu.Lock()
+					if resp.Term > r.term {
+						r.term = resp.Term
+						r.state = Follower
+						r.votedFor = ""
+						r.leaderId = ""
+					}
+					r.mu.Unlock()
 				}
-			}
-
-			if resp.Term > currentTerm {
-				r.mu.Lock()
-				if resp.Term > r.term {
-					r.term = resp.Term
-					r.state = Follower
-					r.votedFor = ""
-					r.leaderId = ""
-				}
-				r.mu.Unlock()
 			}
 		}(peer)
 	}
 }
 
 func (r *RaftNode) resetElectionTimer() {
+	r.electionTimeout = time.Duration(150+rand.Intn(150)) * time.Millisecond
+	if !r.electionTimer.Stop() {
+		select {
+		case <-r.electionTimer.C:
+		default:
+		}
+	}
 	r.electionTimer.Reset(r.electionTimeout)
 }
 
@@ -384,22 +357,14 @@ func (r *RaftNode) SetLeaderElectedCallback(cb func(leaderId string)) {
 }
 
 func (r *RaftNode) Stop() {
-	r.mu.Lock()
-	select {
-	case <-r.stopCh:
-		// Channel already closed
-		r.mu.Unlock()
-		return
-	default:
-		close(r.stopCh)
-	}
-	r.mu.Unlock()
+	close(r.stopCh)
 	<-r.done
 }
 
-// UpdatePeers updates the list of peers in the Raft cluster
+// UpdatePeers updates the list of peers in the cluster
 func (r *RaftNode) UpdatePeers(peers []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.peers = peers
+	log.Printf("[Node %s] Updated peers: %v", truncateID(r.id), peers)
 }

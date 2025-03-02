@@ -285,11 +285,22 @@ func (n *Node) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	storeMetrics := n.Store.GetMetrics()
+	routerMetrics := n.Router.GetMetrics()
+	systemMetrics := n.Metrics.GetSnapshot()
+
 	metrics := map[string]interface{}{
 		"node_id": n.ID,
-		"router":  n.Router.GetMetrics(),
-		"system":  n.Metrics.GetSnapshot(),
+		"router":  routerMetrics,
+		"system":  systemMetrics,
 		"cluster": n.Gossip.GetMembers(),
+		"storage": map[string]interface{}{
+			"messages_stored": storeMetrics.MessagesStored,
+			"bytes_stored":    storeMetrics.BytesStored,
+			"topics":          storeMetrics.Topics,
+			"last_write_time": storeMetrics.LastWriteTime,
+			"storage_type":    storeMetrics.StorageType,
+		},
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -320,19 +331,40 @@ func (n *Node) JoinCluster(seeds []string) error {
 		return err
 	}
 
+	// Wait for gossip to stabilize
+	time.Sleep(2 * time.Second)
+
 	// Get the current cluster members from gossip
 	members := n.Gossip.GetMembers()
 	var peers []string
 	for _, member := range members {
-		if member != n.ID {
-			peers = append(peers, member)
+		// Extract just the node ID from the member string
+		// Format is "nodeID (address:port)"
+		if id := strings.Split(member, " ")[0]; id != n.ID {
+			peers = append(peers, id)
 		}
 	}
 
 	// Update Raft peers
 	n.Consensus.UpdatePeers(peers)
 
-	return nil
+	// Wait for leader election to complete
+	electionTimeout := time.NewTimer(10 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	defer electionTimeout.Stop()
+
+	for {
+		select {
+		case <-electionTimeout.C:
+			return fmt.Errorf("timeout waiting for leader election")
+		case <-ticker.C:
+			if leader := n.Consensus.GetLeader(); leader != "" {
+				log.Printf("[Node %s] Cluster joined successfully, leader is %s", n.ID[:8], leader)
+				return nil
+			}
+		}
+	}
 }
 
 // Shutdown gracefully shuts down the node

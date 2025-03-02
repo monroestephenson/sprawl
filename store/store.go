@@ -3,6 +3,7 @@ package store
 import (
 	"log"
 	"sync"
+	"time"
 )
 
 type Message struct {
@@ -87,4 +88,32 @@ func (s *Store) Subscribe(topic string, subFn SubscriberFunc) {
 	}
 
 	log.Printf("[Store] Topic %s now has %d subscribers", topic, len(s.subscribers[topic]))
+}
+
+// StoreMetrics represents metrics for the store
+type StoreMetrics struct {
+	MessagesStored int64     `json:"messages_stored"`
+	BytesStored    int64     `json:"bytes_stored"`
+	Topics         []string  `json:"topics"`
+	LastWriteTime  time.Time `json:"last_write_time"`
+	StorageType    string    `json:"storage_type"`
+}
+
+// GetMetrics returns the current metrics for the store
+func (s *Store) GetMetrics() StoreMetrics {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	topics := make([]string, 0, len(s.subscribers))
+	for topic := range s.subscribers {
+		topics = append(topics, topic)
+	}
+
+	return StoreMetrics{
+		MessagesStored: s.metrics.messagesReceived.Load(),
+		BytesStored:    0, // We don't track bytes in memory store
+		Topics:         topics,
+		LastWriteTime:  time.Now(),
+		StorageType:    "memory",
+	}
 }

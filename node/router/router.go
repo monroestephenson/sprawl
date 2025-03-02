@@ -30,11 +30,13 @@ type Router struct {
 }
 
 type RouterMetrics struct {
-	messagesSent   atomic.Int64
-	messagesRouted atomic.Int64
-	routeCacheHits atomic.Int64
-	latencySum     atomic.Int64
-	latencyCount   atomic.Int64
+	messagesSent     atomic.Int64
+	messagesRouted   atomic.Int64
+	routeCacheHits   atomic.Int64
+	latencySum       atomic.Int64
+	latencyCount     atomic.Int64
+	messagesStored   atomic.Int64
+	messagesReceived atomic.Int64
 }
 
 type AckTracker struct {
@@ -152,6 +154,7 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 		if err == nil {
 			// Message will be stored locally via replication commit callback
 			r.metrics.messagesRouted.Add(1)
+			r.metrics.messagesStored.Add(1)
 			r.metrics.RecordLatency(time.Since(start))
 			return nil
 		}
@@ -169,6 +172,7 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 
 			if leaderNode != nil {
 				// Forward to leader
+				r.metrics.messagesRouted.Add(1)
 				return r.forwardToNode(ctx, *leaderNode, msg)
 			}
 		}
@@ -178,6 +182,7 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 		r.store.Publish(msg.Topic, msg.Payload)
 		msgState.Destinations[r.nodeID] = true
 		r.metrics.messagesRouted.Add(1)
+		r.metrics.messagesStored.Add(1)
 
 		// If we're the only target node, consider the message delivered
 		if len(nodes) == 1 {
@@ -218,6 +223,7 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 				return
 			}
 
+			r.metrics.messagesReceived.Add(1)
 			r.ackTracker.mu.Lock()
 			msgState.Destinations[targetNode.ID] = true
 			r.ackTracker.mu.Unlock()

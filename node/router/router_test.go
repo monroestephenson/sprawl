@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"sprawl/node/consensus"
 	"sprawl/node/dht"
 	"sprawl/store"
 )
@@ -12,7 +13,9 @@ import (
 func TestRouteMessage(t *testing.T) {
 	dht := dht.NewDHT("test-node")
 	store := store.NewStore()
-	router := NewRouter("test-node", dht, store)
+	raft := consensus.NewRaftNode("test-node", nil)
+	replication := consensus.NewReplicationManager("test-node", raft, 1)
+	router := NewRouter("test-node", dht, store, replication)
 
 	// Register ourselves as a node for the test topic
 	dht.RegisterNode("test-topic", "test-node", 8080)
@@ -57,7 +60,11 @@ func TestRouteMessage(t *testing.T) {
 }
 
 func TestRouterMetrics(t *testing.T) {
-	router := NewRouter("test-node", dht.NewDHT("test-node"), store.NewStore())
+	dht := dht.NewDHT("test-node")
+	store := store.NewStore()
+	raft := consensus.NewRaftNode("test-node", nil)
+	replication := consensus.NewReplicationManager("test-node", raft, 1)
+	router := NewRouter("test-node", dht, store, replication)
 
 	// Record some test metrics
 	router.metrics.RecordCacheHit()
