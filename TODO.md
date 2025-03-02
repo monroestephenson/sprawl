@@ -52,8 +52,8 @@
   - [x] Message replication system
     - [x] Configurable replication factor
     - [x] Basic consistency protocols
-    - [ ] Advanced replica synchronization
-    - [ ] Leader election
+    - [x] Advanced replica synchronization
+    - [x] Leader election
   - [ ] Distributed subscriber registry
     - [ ] Subscriber state replication
     - [ ] Consumer group management

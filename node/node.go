@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"sprawl/node/balancer"
+	"sprawl/node/consensus"
 	"sprawl/node/dht"
 	"sprawl/node/metrics"
 	"sprawl/node/router"
@@ -32,6 +33,8 @@ type Node struct {
 	Router      *router.Router
 	Balancer    *balancer.LoadBalancer
 	Metrics     *metrics.Metrics
+	Consensus   *consensus.RaftNode
+	Replication *consensus.ReplicationManager
 	BindAddress string
 	HTTPAddress string
 	HTTPPort    int
@@ -51,11 +54,16 @@ func NewNode(bindAddr string, bindPort int, httpAddr string, httpPort int) (*Nod
 		return nil, err
 	}
 
-	router := router.NewRouter(nodeID, dht, store)
+	// Initialize Raft consensus
+	raftNode := consensus.NewRaftNode(nodeID, []string{})               // Peers will be added when joining cluster
+	replication := consensus.NewReplicationManager(nodeID, raftNode, 3) // Default replication factor of 3
+
+	// Create router with replication manager
+	router := router.NewRouter(nodeID, dht, store, replication)
 	balancer := balancer.NewLoadBalancer(dht)
 	metrics := metrics.NewMetrics()
 
-	return &Node{
+	node := &Node{
 		ID:          nodeID,
 		Gossip:      gm,
 		Store:       store,
@@ -63,11 +71,21 @@ func NewNode(bindAddr string, bindPort int, httpAddr string, httpPort int) (*Nod
 		Router:      router,
 		Balancer:    balancer,
 		Metrics:     metrics,
+		Consensus:   raftNode,
+		Replication: replication,
 		BindAddress: bindAddr,
 		HTTPAddress: httpAddr,
 		HTTPPort:    httpPort,
 		semaphore:   make(chan struct{}, 100), // Limit to 100 concurrent requests
-	}, nil
+	}
+
+	// Set up replication commit callback
+	replication.SetCommitCallback(func(entry consensus.ReplicationEntry) {
+		// When an entry is committed, store it locally
+		store.Publish(entry.Topic, entry.Payload)
+	})
+
+	return node, nil
 }
 
 // StartHTTP starts the HTTP server for publish/subscribe endpoints
@@ -297,7 +315,24 @@ func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // JoinCluster attempts to join an existing cluster
 func (n *Node) JoinCluster(seeds []string) error {
-	return n.Gossip.JoinCluster(seeds)
+	// First join the gossip cluster
+	if err := n.Gossip.JoinCluster(seeds); err != nil {
+		return err
+	}
+
+	// Get the current cluster members from gossip
+	members := n.Gossip.GetMembers()
+	var peers []string
+	for _, member := range members {
+		if member != n.ID {
+			peers = append(peers, member)
+		}
+	}
+
+	// Update Raft peers
+	n.Consensus.UpdatePeers(peers)
+
+	return nil
 }
 
 // Shutdown gracefully shuts down the node
@@ -310,6 +345,10 @@ func (n *Node) Shutdown() {
 			log.Printf("Error shutting down HTTP server: %v", err)
 		}
 	}
+
+	// Stop consensus and replication
+	n.Consensus.Stop()
+	n.Replication.Stop()
 
 	// Stop metrics collection
 	n.Metrics.Stop()

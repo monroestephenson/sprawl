@@ -49,6 +49,9 @@ echo -e "\nRunning unit tests..."
 echo "Testing store/tiered package..."
 (MINIO_ENDPOINT=http://localhost:9000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin go test ./store/tiered/... -v & P=$!; (sleep 60; kill $P 2>/dev/null) & wait $P)
 
+echo "Testing consensus package..."
+(go test ./node/consensus/... -v & P=$!; (sleep 60; kill $P 2>/dev/null) & wait $P)
+
 # Start node 1 (seed node)
 echo "Starting node 1 (seed node)..."
 echo "Starting node with command: cd $(pwd) && go run main.go -bindAddr=127.0.0.1 -bindPort=7946 -httpAddr=127.0.0.1 -httpPort=8080"
@@ -102,26 +105,28 @@ echo "✓"
 echo "Waiting for cluster to form..."
 sleep 10
 
-# Function to check if a node sees all members
+# Function to check if a node sees all members and has a leader
 check_cluster_members() {
     local port=$1
-    local members=$(curl -s http://localhost:$port/status | jq '.cluster_members | length')
-    if [ "$members" -eq 3 ]; then
+    local status=$(curl -s http://localhost:$port/status)
+    local members=$(echo "$status" | jq '.cluster_members | length')
+    local leader=$(echo "$status" | jq -r '.leader_id')
+    if [ "$members" -eq 3 ] && [ "$leader" != "null" ] && [ "$leader" != "" ]; then
         return 0
     else
         return 1
     fi
 }
 
-# Wait for all nodes to see each other (up to 30 seconds)
-echo "Verifying cluster membership..."
-for i in {1..30}; do
+# Wait for all nodes to see each other and elect a leader (up to 45 seconds)
+echo "Verifying cluster membership and leader election..."
+for i in {1..45}; do
     if check_cluster_members 8080 && check_cluster_members 8081 && check_cluster_members 8082; then
-        echo "✓ All nodes see complete cluster"
+        echo "✓ All nodes see complete cluster and have elected a leader"
         break
     fi
-    if [ $i -eq 30 ]; then
-        echo "! Warning: Cluster formation incomplete after 30 seconds"
+    if [ $i -eq 45 ]; then
+        echo "! Warning: Cluster formation or leader election incomplete after 45 seconds"
     fi
     sleep 1
 done
@@ -151,7 +156,7 @@ echo -e "\nTesting tiered storage..."
 echo "Publishing messages to trigger memory pressure..."
 (./sprawlctl -n http://localhost:8080 test -c 50 -P 3 & P=$!; (sleep 45; kill $P 2>/dev/null) & wait $P)
 
-echo "Waiting for tiering to occur..."
+echo "Waiting for tiering and replication..."
 sleep 15
 
 echo "Verifying message persistence..."
@@ -162,7 +167,7 @@ echo -e "\nRunning integration tests..."
 (./sprawlctl test & P=$!; (sleep 45; kill $P 2>/dev/null) & wait $P)
 
 # Run load test with reduced message count and timeout
-echo -e "\nRunning load test with tiered storage..."
+echo -e "\nRunning load test with tiered storage and replication..."
 (./sprawlctl -n http://localhost:8080,http://localhost:8081,http://localhost:8082 test -c 25 -P 3 & P=$!; (sleep 45; kill $P 2>/dev/null) & wait $P)
 
 # Check storage metrics

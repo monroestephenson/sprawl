@@ -13,18 +13,20 @@ import (
 	"sync/atomic"
 	"time"
 
+	"sprawl/node/consensus"
 	"sprawl/node/dht"
 	"sprawl/store"
 )
 
 type Router struct {
-	dht        *dht.DHT
-	store      *store.Store
-	nodeID     string
-	routeCache sync.Map
-	metrics    *RouterMetrics
-	ackTracker *AckTracker
-	semaphore  chan struct{} // Limit concurrent goroutines
+	dht         *dht.DHT
+	store       *store.Store
+	nodeID      string
+	routeCache  sync.Map
+	metrics     *RouterMetrics
+	ackTracker  *AckTracker
+	semaphore   chan struct{}
+	replication *consensus.ReplicationManager
 }
 
 type RouterMetrics struct {
@@ -73,17 +75,15 @@ type Message struct {
 	TTL     int
 }
 
-func NewRouter(nodeID string, dht *dht.DHT, store *store.Store) *Router {
+func NewRouter(nodeID string, dht *dht.DHT, store *store.Store, replication *consensus.ReplicationManager) *Router {
 	return &Router{
-		dht:     dht,
-		store:   store,
-		nodeID:  nodeID,
-		metrics: &RouterMetrics{},
-		ackTracker: &AckTracker{
-			pending:  make(map[string]*MessageState),
-			maxRetry: 3,
-		},
-		semaphore: make(chan struct{}, 50), // Limit to 50 concurrent goroutines
+		dht:         dht,
+		store:       store,
+		nodeID:      nodeID,
+		metrics:     &RouterMetrics{},
+		ackTracker:  &AckTracker{pending: make(map[string]*MessageState), maxRetry: 3},
+		semaphore:   make(chan struct{}, 50),
+		replication: replication,
 	}
 }
 
@@ -137,17 +137,44 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 		return fmt.Errorf("no nodes found for topic %s", msg.Topic)
 	}
 
-	// Store message locally if we are one of the target nodes
-	shouldStoreLocally := false
+	// If we are one of the target nodes and we're the leader, handle replication
+	isTargetNode := false
 	for _, node := range nodes {
 		if node.ID == r.nodeID {
-			shouldStoreLocally = true
+			isTargetNode = true
 			break
 		}
 	}
 
-	if shouldStoreLocally {
-		log.Printf("[Router] Storing message %s locally for topic %s", truncateID(msg.ID), msg.Topic)
+	if isTargetNode {
+		// Try to replicate through the consensus system first
+		err := r.replication.ProposeEntry(msg.Topic, msg.Payload)
+		if err == nil {
+			// Message will be stored locally via replication commit callback
+			r.metrics.messagesRouted.Add(1)
+			r.metrics.RecordLatency(time.Since(start))
+			return nil
+		}
+
+		// If replication fails (e.g., we're not the leader), fall back to direct storage
+		if err.Error() == "not the leader" {
+			// Find the leader node
+			var leaderNode *dht.NodeInfo
+			for _, node := range nodes {
+				if node.ID == r.replication.GetLeader() {
+					leaderNode = &node
+					break
+				}
+			}
+
+			if leaderNode != nil {
+				// Forward to leader
+				return r.forwardToNode(ctx, *leaderNode, msg)
+			}
+		}
+
+		// If no leader found or other error, store locally as fallback
+		log.Printf("[Router] Falling back to local storage for message %s", truncateID(msg.ID))
 		r.store.Publish(msg.Topic, msg.Payload)
 		msgState.Destinations[r.nodeID] = true
 		r.metrics.messagesRouted.Add(1)
@@ -159,38 +186,70 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 		}
 	}
 
-	// Send to other nodes with retry logic
-	var lastErr error
-	for attempt := 1; attempt <= r.ackTracker.maxRetry; attempt++ {
-		if attempt > 1 {
-			log.Printf("[Router] Retry attempt %d for message %s", attempt, truncateID(msg.ID))
-			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+	// Send to other nodes
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(nodes))
+	successCount := atomic.Int32{}
+	nodeErrorsMu := sync.Mutex{}
+	nodeErrors := make(map[string]error)
+
+	for _, node := range nodes {
+		if node.ID == r.nodeID {
+			continue
 		}
 
-		err := r.sendToNodes(ctx, msg, nodes, msgState)
-		if err == nil {
-			// Check if we have enough successful deliveries
-			r.ackTracker.mu.RLock()
-			successCount := len(msgState.Destinations)
-			r.ackTracker.mu.RUnlock()
+		wg.Add(1)
+		go func(targetNode dht.NodeInfo) {
+			defer wg.Done()
 
-			// Consider message delivered if at least one node received it
-			if successCount > 0 {
-				log.Printf("[Router] Message %s delivered to %d nodes", truncateID(msg.ID), successCount)
-				r.metrics.messagesRouted.Add(1)
-				r.metrics.RecordLatency(time.Since(start))
-				return nil
+			// Acquire semaphore
+			r.semaphore <- struct{}{}
+			defer func() { <-r.semaphore }()
+
+			err := r.forwardToNode(ctx, targetNode, msg)
+			if err != nil {
+				nodeErrorsMu.Lock()
+				nodeErrors[targetNode.ID] = err
+				nodeErrorsMu.Unlock()
+				select {
+				case errChan <- fmt.Errorf("failed to send to %s: %v", targetNode.ID, err):
+				default:
+				}
+				return
 			}
+
+			r.ackTracker.mu.Lock()
+			msgState.Destinations[targetNode.ID] = true
+			r.ackTracker.mu.Unlock()
+			successCount.Add(1)
+			r.metrics.messagesSent.Add(1)
+		}(node)
+	}
+
+	// Wait for all goroutines to finish
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+		close(errChan)
+	}()
+
+	// Wait for either completion or context cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		// Check if we have enough successful deliveries
+		if successCount.Load() > 0 {
+			r.metrics.RecordLatency(time.Since(start))
+			return nil
 		}
-		lastErr = err
+		// Return first error if no successes
+		if err, ok := <-errChan; ok {
+			return err
+		}
+		return fmt.Errorf("no successful deliveries")
 	}
-
-	if lastErr != nil {
-		log.Printf("[Router] Max retries reached for message %s: %v", truncateID(msg.ID), lastErr)
-		return fmt.Errorf("failed to deliver message after %d attempts: %v", r.ackTracker.maxRetry, lastErr)
-	}
-
-	return fmt.Errorf("failed to deliver message to enough nodes")
 }
 
 // truncateID safely truncates a message ID for logging
@@ -201,24 +260,7 @@ func truncateID(id string) string {
 	return id
 }
 
-func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeInfo, msgState *MessageState) error {
-	// Don't send to self or already acked nodes
-	var sendNodes []dht.NodeInfo
-	r.ackTracker.mu.RLock()
-	for _, node := range nodes {
-		if node.ID != r.nodeID && !msgState.Destinations[node.ID] {
-			sendNodes = append(sendNodes, node)
-		}
-	}
-	r.ackTracker.mu.RUnlock()
-
-	if len(sendNodes) == 0 {
-		return nil
-	}
-
-	log.Printf("[Router] Sending message %s to %d nodes for topic %s (TTL: %d)",
-		msg.ID[:8], len(sendNodes), msg.Topic, msg.TTL)
-
+func (r *Router) forwardToNode(ctx context.Context, targetNode dht.NodeInfo, msg Message) error {
 	// Create message payload
 	payload := map[string]interface{}{
 		"topic":   msg.Topic,
@@ -246,135 +288,46 @@ func (r *Router) sendToNodes(ctx context.Context, msg Message, nodes []dht.NodeI
 		},
 	}
 
-	// Send to each node with limited concurrency
-	var wg sync.WaitGroup
-	nodeErrors := make(map[string]error)
-	var nodeErrorsMu sync.Mutex
-	successCount := atomic.Int64{}
+	// Create context with timeout
+	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 
-	// Create error channel to collect errors
-	errChan := make(chan error, len(sendNodes))
-
-	for _, node := range sendNodes {
-		// Try to acquire semaphore with context
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case r.semaphore <- struct{}{}:
-		}
-
-		wg.Add(1)
-		go func(targetNode dht.NodeInfo) {
-			defer wg.Done()
-			defer func() { <-r.semaphore }()
-
-			// Create context with timeout
-			sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			defer cancel()
-
-			url := fmt.Sprintf("http://%s:%d/publish", targetNode.Address, targetNode.HTTPPort)
-			req, err := http.NewRequestWithContext(sendCtx, "POST", url, bytes.NewBuffer(jsonData))
-			if err != nil {
-				nodeErrorsMu.Lock()
-				nodeErrors[targetNode.ID] = fmt.Errorf("failed to create request: %w", err)
-				nodeErrorsMu.Unlock()
-				select {
-				case errChan <- err:
-				default:
-				}
-				return
-			}
-
-			req.Header.Set("Content-Type", "application/json")
-
-			resp, err := client.Do(req)
-			if err != nil {
-				nodeErrorsMu.Lock()
-				nodeErrors[targetNode.ID] = fmt.Errorf("failed to send message: %w", err)
-				nodeErrorsMu.Unlock()
-				select {
-				case errChan <- err:
-				default:
-				}
-				return
-			}
-			defer resp.Body.Close()
-
-			// Read response body with timeout
-			bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
-			if err != nil {
-				nodeErrorsMu.Lock()
-				nodeErrors[targetNode.ID] = fmt.Errorf("failed to read response: %w", err)
-				nodeErrorsMu.Unlock()
-				select {
-				case errChan <- err:
-				default:
-				}
-				return
-			}
-
-			var result struct {
-				Status string `json:"status"`
-				Error  string `json:"error"`
-			}
-			if err := json.Unmarshal(bodyBytes, &result); err != nil {
-				nodeErrorsMu.Lock()
-				nodeErrors[targetNode.ID] = fmt.Errorf("failed to decode response: %w", err)
-				nodeErrorsMu.Unlock()
-				select {
-				case errChan <- err:
-				default:
-				}
-				return
-			}
-
-			if result.Status == "published" {
-				r.ackTracker.mu.Lock()
-				msgState.Destinations[targetNode.ID] = true
-				r.ackTracker.mu.Unlock()
-				successCount.Add(1)
-				r.metrics.messagesSent.Add(1)
-				log.Printf("[Router] Node %s acknowledged message %s", targetNode.ID[:8], msg.ID[:8])
-			} else if result.Status == "dropped" {
-				log.Printf("[Router] Message %s dropped by node %s (TTL: %d)", msg.ID[:8], targetNode.ID[:8], msg.TTL)
-				nodeErrorsMu.Lock()
-				nodeErrors[targetNode.ID] = fmt.Errorf("message dropped by node")
-				nodeErrorsMu.Unlock()
-				select {
-				case errChan <- fmt.Errorf("message dropped by node %s", targetNode.ID[:8]):
-				default:
-				}
-			} else {
-				select {
-				case errChan <- fmt.Errorf("unexpected response status: %s", result.Status):
-				default:
-				}
-			}
-		}(node)
+	url := fmt.Sprintf("http://%s:%d/publish", targetNode.Address, targetNode.HTTPPort)
+	req, err := http.NewRequestWithContext(sendCtx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Wait for all goroutines to finish
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-		close(errChan)
-	}()
+	req.Header.Set("Content-Type", "application/json")
 
-	// Wait for either completion or context cancellation
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-done:
-		// Check if we have enough successful deliveries
-		if successCount.Load() > 0 {
-			return nil
-		}
-		// Return first error if no successes
-		if err, ok := <-errChan; ok {
-			return err
-		}
-		return fmt.Errorf("no successful deliveries")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send message: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body with timeout
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var result struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if result.Status == "published" {
+		log.Printf("[Router] Node %s acknowledged message %s", targetNode.ID[:8], msg.ID[:8])
+		return nil
+	} else if result.Status == "dropped" {
+		log.Printf("[Router] Message %s dropped by node %s (TTL: %d)", msg.ID[:8], targetNode.ID[:8], msg.TTL)
+		return fmt.Errorf("message dropped by node %s", targetNode.ID[:8])
+	} else {
+		return fmt.Errorf("unexpected response status: %s", result.Status)
 	}
 }
 
