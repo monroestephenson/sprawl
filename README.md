@@ -127,6 +127,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 We use [SemVer](http://semver.org/) for versioning. For the versions available, see the [tags on this repository](https://github.com/yourusername/sprawl/tags).
 
 ## Acknowledgments
-
-- Thanks to all contributors who have helped shape Sprawl
 - Built with Go's excellent standard library and community packages
