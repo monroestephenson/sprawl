@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sprawl-config
+data:
+  config.yaml: |
+    # Registry configuration
+    registry:
+      # Raft configuration
+      raft:
+        heartbeat_timeout: 1000ms
+        election_timeout: 1500ms
+        snapshot_interval: 30s
+        snapshot_threshold: 8192
+        trailing_logs: 10240
+
+      # Consumer group configuration
+      consumer_groups:
+        rebalance_timeout: 30s
+        session_timeout: 10s
+        heartbeat_interval: 3s
+        max_rebalance_retries: 3
+
+      # Storage configuration
+      storage:
+        memory:
+          max_size: 1GB
+          eviction_policy: lru
+        rocksdb:
+          max_open_files: 1000
+          write_buffer_size: 64MB
+          max_write_buffer_number: 3
+          target_file_size_base: 64MB
+        s3:
+          bucket: sprawl-archive
+          region: us-west-2
+          endpoint: http://minio:9000
+          archive_after: 24h
+          compress: true
+
+      # Metrics configuration
+      metrics:
+        prometheus_enabled: true
+        statsd_enabled: false
+        reporting_interval: 10s 

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,19 +14,22 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// CloudConfig defines the configuration for cloud storage
+// CloudConfig holds configuration for cloud storage
 type CloudConfig struct {
-	Endpoint        string        // S3/MinIO endpoint
-	Bucket          string        // Bucket name
-	Region          string        // AWS region or MinIO region
-	BatchSize       int           // Number of messages to batch before upload
-	BatchTimeout    time.Duration // Maximum time to wait before uploading a batch
-	RetentionPeriod time.Duration // How long to keep messages in cloud storage
-	UploadWorkers   int           // Number of concurrent upload workers
+	Endpoint        string
+	AccessKeyID     string
+	SecretAccessKey string
+	Bucket          string
+	Region          string
+	BatchSize       int
+	BatchTimeout    time.Duration
+	RetentionPeriod time.Duration
+	UploadWorkers   int
 }
 
 // CloudStore implements cloud storage using S3/MinIO
@@ -58,34 +60,30 @@ type messageBatch struct {
 
 // NewCloudStore creates a new S3/MinIO-backed store
 func NewCloudStore(cfg CloudConfig) (*CloudStore, error) {
-	// Load AWS configuration
+	// Validate config
+	if cfg.Endpoint == "" {
+		return nil, fmt.Errorf("endpoint must be set")
+	}
+	if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
+		return nil, fmt.Errorf("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set")
+	}
+	if cfg.Bucket == "" {
+		return nil, fmt.Errorf("bucket must be set")
+	}
+
+	// Create AWS config
 	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
 		return aws.Endpoint{
-			URL:               cfg.Endpoint,
+			URL:               "http://" + cfg.Endpoint,
 			SigningRegion:     cfg.Region,
 			HostnameImmutable: true,
-			Source:            aws.EndpointSourceCustom,
 		}, nil
 	})
 
-	// Get credentials from environment variables
-	accessKey := os.Getenv("MINIO_ACCESS_KEY")
-	secretKey := os.Getenv("MINIO_SECRET_KEY")
-	if accessKey == "" || secretKey == "" {
-		return nil, fmt.Errorf("MINIO_ACCESS_KEY and MINIO_SECRET_KEY must be set")
-	}
-
-	creds := aws.Credentials{
-		AccessKeyID:     accessKey,
-		SecretAccessKey: secretKey,
-	}
-
 	awsCfg, err := config.LoadDefaultConfig(context.Background(),
-		config.WithEndpointResolverWithOptions(customResolver),
 		config.WithRegion(cfg.Region),
-		config.WithCredentialsProvider(aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
-			return creds, nil
-		})),
+		config.WithEndpointResolverWithOptions(customResolver),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, "")),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
@@ -120,9 +118,6 @@ func NewCloudStore(cfg CloudConfig) (*CloudStore, error) {
 						Status: types.ExpirationStatusEnabled,
 						Expiration: &types.LifecycleExpiration{
 							Days: aws.Int32(int32(cfg.RetentionPeriod.Hours() / 24)),
-						},
-						Filter: &types.LifecycleRuleFilter{
-							Prefix: aws.String("messages/"),
 						},
 						ID: aws.String("message-expiration"),
 					},
@@ -415,7 +410,7 @@ func (cs *CloudStore) GetTopicMessages(topic string) ([]Message, error) {
 			}
 		}
 
-		if output.IsTruncated == nil || !*output.IsTruncated {
+		if !aws.ToBool(output.IsTruncated) {
 			break
 		}
 		continuationToken = output.NextContinuationToken

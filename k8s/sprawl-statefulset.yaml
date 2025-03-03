@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sprawl
+  labels:
+    app: sprawl
+spec:
+  serviceName: sprawl
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sprawl
+  template:
+    metadata:
+      labels:
+        app: sprawl
+    spec:
+      containers:
+      - name: sprawl
+        image: sprawl:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 7946
+          name: gossip
+        - containerPort: 8300
+          name: raft
+        env:
+        - name: SPRAWL_NODE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: SPRAWL_HTTP_PORT
+          value: "8080"
+        - name: SPRAWL_GOSSIP_PORT
+          value: "7946"
+        - name: SPRAWL_RAFT_PORT
+          value: "8300"
+        - name: SPRAWL_CLUSTER_SEEDS
+          value: "sprawl-0.sprawl:7946"
+        - name: SPRAWL_DATA_DIR
+          value: "/data"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 20
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sprawl
+  labels:
+    app: sprawl
+spec:
+  clusterIP: None
+  selector:
+    app: sprawl
+  ports:
+  - port: 8080
+    name: http
+  - port: 7946
+    name: gossip
+  - port: 8300
+    name: raft
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sprawl-lb
+  labels:
+    app: sprawl
+spec:
+  type: LoadBalancer
+  selector:
+    app: sprawl
+  ports:
+  - port: 8080
+    name: http
+    targetPort: 8080 

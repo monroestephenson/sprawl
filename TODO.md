@@ -54,11 +54,11 @@
     - [x] Basic consistency protocols
     - [x] Advanced replica synchronization
     - [x] Leader election
-  - [ ] Distributed subscriber registry
-    - [ ] Subscriber state replication
-    - [ ] Consumer group management
-    - [ ] Offset tracking
-    - [ ] Rebalancing protocols
+  - [x] Distributed subscriber registry
+    - [x] Subscriber state replication
+    - [x] Consumer group management
+    - [x] Offset tracking
+    - [x] Rebalancing protocols
 - [x] Add backpressure handling
   - [x] Node-level throttling
     - [x] Adaptive rate limiting

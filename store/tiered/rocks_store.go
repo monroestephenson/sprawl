@@ -36,8 +36,8 @@ func NewRocksStore(path string) (*RocksStore, error) {
 	// Create RocksDB options
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(true)
-	opts.SetCompression(grocksdb.NoCompression)
-	opts.SetWriteBufferSize(64 * 1024 * 1024) // 64MB
+	opts.SetCompression(grocksdb.CompressionType(0)) // NoCompression = 0
+	opts.SetWriteBufferSize(64 * 1024 * 1024)        // 64MB
 	opts.SetMaxWriteBufferNumber(3)
 	opts.SetTargetFileSizeBase(64 * 1024 * 1024)
 	opts.SetMaxBackgroundCompactions(2)

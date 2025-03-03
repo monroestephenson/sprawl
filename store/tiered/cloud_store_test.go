@@ -45,8 +45,14 @@ func cleanupBucket(t *testing.T, store *CloudStore) {
 }
 
 func getTestConfig(t *testing.T) CloudConfig {
+	endpoint := os.Getenv("MINIO_ENDPOINT")
+	if endpoint == "" {
+		endpoint = "localhost:19000" // Default to the exposed port
+	}
 	return CloudConfig{
-		Endpoint:        os.Getenv("MINIO_ENDPOINT"),
+		Endpoint:        endpoint,
+		AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
+		SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
 		Bucket:          "test-bucket",
 		Region:          "us-east-1",
 		BatchSize:       10,
@@ -60,11 +66,13 @@ func TestCloudStore_BasicOperations(t *testing.T) {
 	// Skip if no MinIO endpoint is provided
 	endpoint := os.Getenv("MINIO_ENDPOINT")
 	if endpoint == "" {
-		t.Skip("Skipping cloud store test: MINIO_ENDPOINT not set")
+		endpoint = "localhost:19000" // Default to the exposed port
 	}
 
 	cfg := CloudConfig{
 		Endpoint:        endpoint,
+		AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
+		SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
 		Bucket:          "test-bucket",
 		Region:          "us-east-1",
 		BatchSize:       1, // Set to 1 for immediate upload

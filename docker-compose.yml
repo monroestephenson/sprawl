@@ -1,55 +1,78 @@
-version: '3.8'
-
 services:
+  # First node - leader
+  sprawl1:
+    build: .
+    container_name: sprawl1
+    environment:
+      - SPRAWL_NODE_ID=node1
+      - SPRAWL_HTTP_PORT=8080
+      - SPRAWL_BIND_PORT=7946
+      - SPRAWL_RAFT_PORT=8300
+      - SPRAWL_CLUSTER_SEEDS=sprawl1:7946
+      - SPRAWL_DATA_DIR=/data
+    ports:
+      - "18080:8080"
+      - "17946:7946"
+      - "18300:8300"
+    volumes:
+      - sprawl1_data:/data
+
+  # Second node
+  sprawl2:
+    build: .
+    container_name: sprawl2
+    environment:
+      - SPRAWL_NODE_ID=node2
+      - SPRAWL_HTTP_PORT=8080
+      - SPRAWL_BIND_PORT=7946
+      - SPRAWL_RAFT_PORT=8300
+      - SPRAWL_CLUSTER_SEEDS=sprawl1:7946
+      - SPRAWL_DATA_DIR=/data
+    ports:
+      - "18081:8080"
+      - "17947:7946"
+      - "18301:8300"
+    volumes:
+      - sprawl2_data:/data
+    depends_on:
+      - sprawl1
+
+  # Third node
+  sprawl3:
+    build: .
+    container_name: sprawl3
+    environment:
+      - SPRAWL_NODE_ID=node3
+      - SPRAWL_HTTP_PORT=8080
+      - SPRAWL_BIND_PORT=7946
+      - SPRAWL_RAFT_PORT=8300
+      - SPRAWL_CLUSTER_SEEDS=sprawl1:7946
+      - SPRAWL_DATA_DIR=/data
+    ports:
+      - "18082:8080"
+      - "17948:7946"
+      - "18302:8300"
+    volumes:
+      - sprawl3_data:/data
+    depends_on:
+      - sprawl1
+
+  # MinIO for cloud storage tier
   minio:
     image: minio/minio
-    command: server /data --console-address ":9001"
+    container_name: minio
     environment:
       - MINIO_ROOT_USER=minioadmin
       - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "19000:9000"
+      - "19001:9001"
     volumes:
       - minio_data:/data
 
-  node1:
-    build: .
-    ports:
-      - "8080:8080"
-      - "7946:7946"
-    environment:
-      - MINIO_ENDPOINT=http://minio:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
-    depends_on:
-      - minio
-
-  node2:
-    build: .
-    ports:
-      - "8081:8080"
-      - "7947:7946"
-    environment:
-      - MINIO_ENDPOINT=http://minio:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
-      - SEEDS=node1:7946
-    depends_on:
-      - node1
-
-  node3:
-    build: .
-    ports:
-      - "8082:8080"
-      - "7948:7946"
-    environment:
-      - MINIO_ENDPOINT=http://minio:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
-      - SEEDS=node1:7946
-    depends_on:
-      - node1
-
 volumes:
+  sprawl1_data:
+  sprawl2_data:
+  sprawl3_data:
   minio_data: 
