@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: sprawl
+  namespace: sprawl
   labels:
     app: sprawl
 spec:
@@ -18,43 +19,55 @@ spec:
       containers:
       - name: sprawl
         image: sprawl:latest
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Never
         ports:
-        - containerPort: 8080
-          name: http
         - containerPort: 7946
           name: gossip
-        - containerPort: 8300
+        - containerPort: 7947
           name: raft
+        - containerPort: 8080
+          name: http
         env:
-        - name: SPRAWL_NODE_ID
+        - name: SPRAWL_BIND_ADDR
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: SPRAWL_ADVERTISE_ADDR
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAME
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
-        - name: SPRAWL_HTTP_PORT
-          value: "8080"
-        - name: SPRAWL_GOSSIP_PORT
-          value: "7946"
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         - name: SPRAWL_RAFT_PORT
-          value: "8300"
+          value: "7947"
         - name: SPRAWL_CLUSTER_SEEDS
-          value: "sprawl-0.sprawl:7946"
+          value: "sprawl-0.sprawl.sprawl.svc.cluster.local:7946"
         - name: SPRAWL_DATA_DIR
           value: "/data"
         volumeMounts:
         - name: data
           mountPath: /data
         readinessProbe:
-          httpGet:
-            path: /health
-            port: http
-          initialDelaySeconds: 5
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "exit 0"
+          initialDelaySeconds: 10
           periodSeconds: 10
         livenessProbe:
-          httpGet:
-            path: /health
-            port: http
-          initialDelaySeconds: 15
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "test -e /proc/1 && ps aux | grep -v grep | grep -q sprawl"
+          initialDelaySeconds: 20
           periodSeconds: 20
   volumeClaimTemplates:
   - metadata:
@@ -63,25 +76,24 @@ spec:
       accessModes: [ "ReadWriteOnce" ]
       resources:
         requests:
-          storage: 10Gi
+          storage: 1Gi
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: sprawl
-  labels:
-    app: sprawl
+  namespace: sprawl
 spec:
   clusterIP: None
   selector:
     app: sprawl
   ports:
-  - port: 8080
-    name: http
   - port: 7946
     name: gossip
-  - port: 8300
+  - port: 7947
     name: raft
+  - port: 8080
+    name: http
 ---
 apiVersion: v1
 kind: Service

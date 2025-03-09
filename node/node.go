@@ -19,6 +19,7 @@ import (
 	"sprawl/store"
 
 	"github.com/google/uuid"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 )
 
@@ -30,28 +31,28 @@ func init() {
 
 // Node represents a node in the Sprawl cluster
 type Node struct {
-	ID          string
-	Gossip      *GossipManager
-	Store       *store.Store
-	DHT         *dht.DHT
-	Router      *router.Router
-	Balancer    *balancer.LoadBalancer
-	Metrics     *metrics.Metrics
-	Consensus   *consensus.RaftNode
-	Replication *consensus.ReplicationManager
-	BindAddress string
-	HTTPAddress string
-	HTTPPort    int
-	semaphore   chan struct{} // Limit concurrent requests
-	server      interface{}   // Added to store the HTTP server
-	raft        *raft.Raft
-	registry    *registry.Registry
-	fsm         *registry.RegistryFSM
-	mu          sync.RWMutex
+	ID            string
+	Gossip        *GossipManager
+	Store         *store.Store
+	DHT           *dht.DHT
+	Router        *router.Router
+	Balancer      *balancer.LoadBalancer
+	Metrics       *metrics.Metrics
+	Consensus     *consensus.RaftNode
+	Replication   *consensus.ReplicationManager
+	BindAddress   string
+	AdvertiseAddr string
+	HTTPPort      int
+	semaphore     chan struct{} // Limit concurrent requests
+	server        interface{}   // Added to store the HTTP server
+	raft          *raft.Raft
+	registry      *registry.Registry
+	fsm           *registry.RegistryFSM
+	mu            sync.RWMutex
 }
 
 // NewNode initializes a Node with a gossip manager and an in-memory store
-func NewNode(bindAddr string, bindPort int, httpAddr string, httpPort int) (*Node, error) {
+func NewNode(bindAddr string, advertiseAddr string, bindPort int, httpPort int) (*Node, error) {
 	nodeID := uuid.New().String()
 
 	dht := dht.NewDHT(nodeID)
@@ -66,19 +67,41 @@ func NewNode(bindAddr string, bindPort int, httpAddr string, httpPort int) (*Nod
 	reg := registry.NewRegistry(nodeID)
 	fsm := registry.NewRegistryFSM(reg)
 
+	// Create a logger for Raft
+	logger := hclog.New(&hclog.LoggerOptions{
+		Name:   "raft",
+		Level:  hclog.LevelFromString("INFO"),
+		Output: log.Writer(),
+	})
+
 	// Initialize Raft configuration
 	raftConfig := raft.DefaultConfig()
 	raftConfig.LocalID = raft.ServerID(nodeID)
-	raftConfig.LogOutput = log.Writer()
+	raftConfig.Logger = logger
+
+	// Configure timeouts appropriate for Kubernetes
+	raftConfig.HeartbeatTimeout = 1000 * time.Millisecond  // Increase heartbeat timeout
+	raftConfig.ElectionTimeout = 1500 * time.Millisecond   // Increase election timeout
+	raftConfig.LeaderLeaseTimeout = 750 * time.Millisecond // Shorter lease timeout
+	raftConfig.CommitTimeout = 100 * time.Millisecond      // Faster commits
+	raftConfig.MaxAppendEntries = 64                       // Limit batch size
+	raftConfig.TrailingLogs = 10240                        // Keep more logs for recovery
 
 	// Create in-memory Raft storage
 	logStore := raft.NewInmemStore()
 	stableStore := raft.NewInmemStore()
 	snapshotStore := raft.NewInmemSnapshotStore()
 
-	// Create Raft transport
-	addr := fmt.Sprintf("%s:%d", bindAddr, bindPort+1) // Use bindPort+1 for Raft
-	transport, err := raft.NewTCPTransport(addr, nil, 3, 10*time.Second, log.Writer())
+	// Configure Raft transport addresses
+	raftPort := bindPort + 1
+	raftBindAddr := fmt.Sprintf("%s:%d", bindAddr, raftPort)
+	raftAdvertiseAddr := fmt.Sprintf("%s:%d", advertiseAddr, raftPort)
+
+	log.Printf("[Node] Initializing Raft transport - Bind: %s, Advertise: %s", raftBindAddr, raftAdvertiseAddr)
+
+	// Create and configure transport
+	// We use the standard TCPTransport and let it handle the underlying address management
+	transport, err := raft.NewTCPTransport(raftBindAddr, nil, 3, 10*time.Second, log.Writer())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Raft transport: %w", err)
 	}
@@ -94,7 +117,7 @@ func NewNode(bindAddr string, bindPort int, httpAddr string, httpPort int) (*Nod
 		Servers: []raft.Server{
 			{
 				ID:      raft.ServerID(nodeID),
-				Address: raft.ServerAddress(addr),
+				Address: raft.ServerAddress(raftAdvertiseAddr),
 			},
 		},
 	}
@@ -110,22 +133,22 @@ func NewNode(bindAddr string, bindPort int, httpAddr string, httpPort int) (*Nod
 	metrics := metrics.NewMetrics()
 
 	node := &Node{
-		ID:          nodeID,
-		Gossip:      gm,
-		Store:       store,
-		DHT:         dht,
-		Router:      router,
-		Balancer:    balancer,
-		Metrics:     metrics,
-		Consensus:   raftNode,
-		Replication: replication,
-		BindAddress: bindAddr,
-		HTTPAddress: httpAddr,
-		HTTPPort:    httpPort,
-		semaphore:   make(chan struct{}, 100), // Limit to 100 concurrent requests
-		raft:        r,
-		registry:    reg,
-		fsm:         fsm,
+		ID:            nodeID,
+		Gossip:        gm,
+		Store:         store,
+		DHT:           dht,
+		Router:        router,
+		Balancer:      balancer,
+		Metrics:       metrics,
+		Consensus:     raftNode,
+		Replication:   replication,
+		BindAddress:   bindAddr,
+		AdvertiseAddr: advertiseAddr,
+		HTTPPort:      httpPort,
+		semaphore:     make(chan struct{}, 100), // Limit to 100 concurrent requests
+		raft:          r,
+		registry:      reg,
+		fsm:           fsm,
 	}
 
 	// Set up replication commit callback
@@ -139,14 +162,23 @@ func NewNode(bindAddr string, bindPort int, httpAddr string, httpPort int) (*Nod
 
 // StartHTTP starts the HTTP server for publish/subscribe endpoints
 func (n *Node) StartHTTP() {
+	// Create a new HTTP server mux
 	mux := http.NewServeMux()
+
+	// Add health check endpoint at multiple paths to ensure it's available
+	healthHandler := http.HandlerFunc(n.handleHealth)
+	mux.Handle("/health", healthHandler)
+	mux.Handle("/healthz", healthHandler)
+
+	// Regular API endpoints
 	mux.HandleFunc("/publish", n.handlePublish)
 	mux.HandleFunc("/subscribe", n.handleSubscribe)
 	mux.HandleFunc("/metrics", n.handleMetrics)
 	mux.HandleFunc("/status", n.handleStatus)
 
+	// Use 0.0.0.0 for the HTTP server to bind to all interfaces
 	server := &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", n.HTTPAddress, n.HTTPPort),
+		Addr:    fmt.Sprintf("0.0.0.0:%d", n.HTTPPort),
 		Handler: mux,
 		// Configure timeouts
 		ReadTimeout:       5 * time.Second,
@@ -159,9 +191,16 @@ func (n *Node) StartHTTP() {
 
 	n.server = server
 
-	log.Printf("Starting HTTP server on %s:%d", n.HTTPAddress, n.HTTPPort)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("HTTP server failed: %v", err)
+	log.Printf("[Node %s] Starting main HTTP server on 0.0.0.0:%d (uses different port from health check server)",
+		n.ID[:8], n.HTTPPort)
+
+	// Start the server and log errors
+	if err := server.ListenAndServe(); err != nil {
+		if err != http.ErrServerClosed {
+			log.Printf("[Node %s] HTTP server error: %v", n.ID[:8], err)
+		} else {
+			log.Printf("[Node %s] HTTP server closed", n.ID[:8])
+		}
 	}
 }
 
@@ -380,6 +419,22 @@ func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
+}
+
+// handleHealth handles health check requests
+func (n *Node) handleHealth(w http.ResponseWriter, r *http.Request) {
+	// Log health check request for debugging
+	log.Printf("[Node %s] Health check request from %s (path: %s)",
+		n.ID[:8], r.RemoteAddr, r.URL.Path)
+
+	// Simple health check that responds with 200
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "ok",
+		"nodeId": n.ID,
+		"uptime": time.Since(startTime).String(),
+	})
 }
 
 // JoinCluster attempts to join an existing cluster
