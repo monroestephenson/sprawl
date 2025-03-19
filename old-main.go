@@ -2,11 +2,14 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"sprawl/node"
 )
@@ -38,6 +41,34 @@ func main() {
 		log.Fatalf("Failed to create node: %v", err)
 	}
 
+	// Start HTTP server in a goroutine
+	go n.StartHTTP()
+
+	// Wait for HTTP server to be ready
+	ready := make(chan struct{})
+	go func() {
+		for {
+			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", *httpPort))
+			if err == nil && resp.StatusCode == http.StatusOK {
+				resp.Body.Close()
+				close(ready)
+				return
+			}
+			if resp != nil {
+				resp.Body.Close()
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	// Wait for server to be ready or timeout
+	select {
+	case <-ready:
+		log.Printf("HTTP server is ready on port %d", *httpPort)
+	case <-time.After(5 * time.Second):
+		log.Printf("Warning: HTTP server readiness check timed out")
+	}
+
 	// Join cluster if seeds provided
 	var seedsArr []string
 	if *seedNodes != "" {
@@ -55,9 +86,6 @@ func main() {
 	// Set up signal handling for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// Start HTTP server in a goroutine
-	go n.StartHTTP()
 
 	// Wait for shutdown signal
 	sig := <-sigCh

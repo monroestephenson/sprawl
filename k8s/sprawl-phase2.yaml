@@ -1,29 +1,25 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: sprawl
+  name: sprawl-phase2
   namespace: sprawl
   labels:
-    app: sprawl
+    app: sprawl-phase2
 spec:
-  serviceName: sprawl
-  replicas: 3
+  serviceName: sprawl-phase2
+  replicas: 1
   selector:
     matchLabels:
-      app: sprawl
+      app: sprawl-phase2
   template:
     metadata:
       labels:
-        app: sprawl
+        app: sprawl-phase2
     spec:
       containers:
       - name: sprawl
-        image: sprawl:latest
+        image: sprawl:phase2-complete
         imagePullPolicy: Never
-        command:
-        - /bin/sh
-        - -c
-        - "source /data/run-validator.sh && /app/sprawl"
         ports:
         - containerPort: 7946
           name: gossip
@@ -31,8 +27,6 @@ spec:
           name: raft
         - containerPort: 8080
           name: http
-        - containerPort: 8081
-          name: health
         env:
         - name: SPRAWL_BIND_ADDR
           valueFrom:
@@ -53,53 +47,26 @@ spec:
         - name: SPRAWL_RAFT_PORT
           value: "7947"
         - name: SPRAWL_CLUSTER_SEEDS
-          value: "sprawl-0.sprawl.sprawl.svc.cluster.local:7946"
+          value: "sprawl-phase2-0.sprawl-phase2.sprawl.svc.cluster.local:7946"
         - name: SPRAWL_DATA_DIR
           value: "/data"
         - name: SPRAWL_HTTP_PORT
           value: "8080"
-        - name: SPRAWL_HEALTH_PORT
-          value: "8081"
-        - name: SPRAWL_HTTP_PORT_VALIDATE
-          value: "true"
-        volumeMounts:
-        - name: data
-          mountPath: /data
-        - name: http-port-fix
-          mountPath: /scripts
         readinessProbe:
-          exec:
-            command:
-            - /bin/sh
-            - -c
-            - "netstat -tulpn | grep -q ':8080'"
+          httpGet:
+            path: /metrics
+            port: 8080
           initialDelaySeconds: 10
           periodSeconds: 5
         livenessProbe:
-          exec:
-            command:
-            - /bin/sh
-            - -c
-            - "ps aux | grep -v grep | grep -q sprawl"
+          httpGet:
+            path: /status
+            port: 8080
           initialDelaySeconds: 15
           periodSeconds: 15
-      initContainers:
-      - name: http-port-fix
-        image: alpine:latest
-        command:
-        - /bin/sh
-        - -c
-        - "cp /scripts/http-port-fix.sh /data/ && chmod +x /data/http-port-fix.sh && /data/http-port-fix.sh"
         volumeMounts:
         - name: data
           mountPath: /data
-        - name: http-port-fix
-          mountPath: /scripts
-      volumes:
-      - name: http-port-fix
-        configMap:
-          name: http-port-fix
-          defaultMode: 0755
   volumeClaimTemplates:
   - metadata:
       name: data
@@ -112,12 +79,12 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: sprawl
+  name: sprawl-phase2
   namespace: sprawl
 spec:
   clusterIP: None
   selector:
-    app: sprawl
+    app: sprawl-phase2
   ports:
   - port: 7946
     name: gossip
@@ -125,23 +92,19 @@ spec:
     name: raft
   - port: 8080
     name: http
-  - port: 8081
-    name: health
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: sprawl-lb
+  name: sprawl-phase2-lb
+  namespace: sprawl
   labels:
-    app: sprawl
+    app: sprawl-phase2
 spec:
   type: LoadBalancer
   selector:
-    app: sprawl
+    app: sprawl-phase2
   ports:
   - port: 8080
     name: http
-    targetPort: 8080
-  - port: 8081
-    name: health
-    targetPort: 8081 
+    targetPort: 8080 

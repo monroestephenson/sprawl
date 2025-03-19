@@ -4,13 +4,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime"
 	"time"
 
 	"sprawl/node/dht"
+	"sprawl/node/utils"
 
 	"github.com/hashicorp/memberlist"
 )
 
+// GossipManager handles cluster membership and metadata gossip
 type GossipManager struct {
 	list     *memberlist.Memberlist
 	config   *memberlist.Config
@@ -18,9 +21,10 @@ type GossipManager struct {
 	metadata map[string]interface{}
 	stopCh   chan struct{}
 	done     chan struct{}
+	httpPort int
 }
 
-// GossipMetadata represents the metadata shared between nodes
+// GossipMetadata represents metadata shared between nodes
 type GossipMetadata struct {
 	NodeID    string              `json:"node_id"`
 	Topics    []string            `json:"topics"`
@@ -30,40 +34,91 @@ type GossipMetadata struct {
 	Timestamp time.Time           `json:"timestamp"`
 }
 
+// LoadStats represents node load metrics
 type LoadStats struct {
 	CPUUsage    float64 `json:"cpu_usage"`
 	MemoryUsage float64 `json:"memory_usage"`
 	MsgCount    int64   `json:"msg_count"`
 }
 
-// NewGossipManager configures a new gossip manager
-func NewGossipManager(nodeID, bindAddr string, bindPort int, dhtInstance *dht.DHT) (*GossipManager, error) {
-	cfg := memberlist.DefaultLocalConfig()
-	cfg.Name = nodeID
-	cfg.BindAddr = bindAddr
-	cfg.BindPort = bindPort
+// Helper function to log a shortened node ID
+func logID(id string) string {
+	return utils.TruncateID(id)
+}
 
-	// Add delegate for metadata exchange
-	cfg.Delegate = NewGossipDelegate(dhtInstance)
-
-	ml, err := memberlist.Create(cfg)
-	if err != nil {
-		return nil, err
+// NewGossipManager creates a new gossip manager
+func NewGossipManager(nodeID, bindAddr string, bindPort int, dhtInstance *dht.DHT, httpPort int) (*GossipManager, error) {
+	// Validate the HTTP port
+	if httpPort <= 0 {
+		defaultPort := 8080
+		log.Printf("[Gossip] CRITICAL: Invalid HTTP port %d provided to NewGossipManager, defaulting to %d",
+			httpPort, defaultPort)
+		httpPort = defaultPort
 	}
 
-	gm := &GossipManager{
-		list:     ml,
-		config:   cfg,
+	log.Printf("[Gossip] Creating new GossipManager for node %s with HTTP port %d",
+		logID(nodeID), httpPort)
+
+	// Create a new manager
+	g := &GossipManager{
 		dht:      dhtInstance,
 		metadata: make(map[string]interface{}),
 		stopCh:   make(chan struct{}),
 		done:     make(chan struct{}),
+		httpPort: httpPort,
 	}
 
-	// Start periodic metadata broadcast
-	go gm.startMetadataBroadcast()
+	// Configure memberlist
+	config := memberlist.DefaultLANConfig()
+	config.Name = nodeID
+	config.BindAddr = bindAddr
+	config.BindPort = bindPort
+	config.LogOutput = &logWriter{prefix: "[Memberlist] "}
 
-	return gm, nil
+	// Enhance metadata exchange reliability
+	config.EnableCompression = true                // Enable compression for more efficient metadata transfer
+	config.TCPTimeout = 5 * time.Second            // Increase TCP timeout for better reliability
+	config.PushPullInterval = 15 * time.Second     // More frequent state exchange
+	config.GossipInterval = 100 * time.Millisecond // More frequent gossiping
+	config.ProbeTimeout = 2 * time.Second          // Shorter probe timeout
+	config.ProbeInterval = 1 * time.Second         // More frequent probing
+
+	// Use our custom delegate
+	delegate := NewGossipDelegate(dhtInstance, httpPort)
+	config.Delegate = delegate
+
+	// Add events delegate to track membership changes
+	config.Events = g // GossipManager implements NotifyJoin/Leave/Update
+
+	// Create memberlist
+	list, err := memberlist.Create(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create memberlist: %v", err)
+	}
+
+	// Log success
+	log.Printf("[Gossip] Successfully created memberlist with node ID %s and HTTP port %d",
+		logID(nodeID), httpPort)
+
+	// Initialize fields
+	g.list = list
+	g.config = config
+
+	// Start metadata broadcast
+	go g.startMetadataBroadcast()
+
+	return g, nil
+}
+
+// logWriter implements io.Writer for memberlist logging
+type logWriter struct {
+	prefix string
+}
+
+// Write satisfies the io.Writer interface
+func (w *logWriter) Write(p []byte) (n int, err error) {
+	log.Printf("%s%s", w.prefix, string(p))
+	return len(p), nil
 }
 
 // startMetadataBroadcast periodically broadcasts node metadata
@@ -74,103 +129,141 @@ func (g *GossipManager) startMetadataBroadcast() {
 
 	for {
 		select {
-		case <-g.stopCh:
-			return
 		case <-ticker.C:
 			g.broadcastMetadata()
+		case <-g.stopCh:
+			return
 		}
 	}
 }
 
-// broadcastMetadata shares this node's metadata with the cluster
+// broadcastMetadata sends a metadata update to other nodes
 func (g *GossipManager) broadcastMetadata() {
-	// Get current topic map from DHT
-	topicMap := g.dht.GetTopicMap()
+	// Get own node info from DHT
+	nodeInfo := g.dht.GetNodeInfo()
 
-	meta := GossipMetadata{
-		NodeID:    g.config.Name,
+	// Ensure consistent HTTP port (8080)
+	originalPort := nodeInfo.HTTPPort
+	nodeInfo.HTTPPort = 8080
+
+	if originalPort != 8080 {
+		log.Printf("[Gossip] Ensuring HTTP port is 8080 (was %d) for broadcasting metadata",
+			originalPort)
+	}
+
+	// Create metadata with our current topic map and node info
+	metadata := GossipMetadata{
+		NodeID:    g.list.LocalNode().Name,
 		Topics:    g.getLocalTopics(),
 		LoadStats: g.getLoadStats(),
-		DHTPeers:  topicMap,
-		NodeInfo:  g.dht.GetNodeInfo(),
+		DHTPeers:  g.dht.GetTopicMap(),
+		NodeInfo:  nodeInfo, // Contains our validated HTTP port
 		Timestamp: time.Now(),
 	}
 
-	data, err := json.Marshal(meta)
+	// Verify that the HTTP port is set correctly
+	if metadata.NodeInfo.HTTPPort != 8080 {
+		log.Printf("[Gossip] Warning: NodeInfo HTTP port is %d after assignment, fixing to 8080",
+			metadata.NodeInfo.HTTPPort)
+		metadata.NodeInfo.HTTPPort = 8080
+	}
+
+	log.Printf("[Gossip] Broadcasting metadata with HTTP port %d",
+		metadata.NodeInfo.HTTPPort)
+
+	// Convert to JSON and broadcast as a gossip message
+	data, err := json.Marshal(metadata)
 	if err != nil {
 		log.Printf("[Gossip] Failed to marshal metadata: %v", err)
 		return
 	}
 
-	// Log the DHT information being shared
-	log.Printf("[Gossip] Broadcasting DHT info with %d topic mappings", len(topicMap))
+	// Log what we're broadcasting
+	log.Printf("[Gossip] Broadcasting metadata (%d bytes)", len(data))
 
-	// Send to all members
+	// Broadcast to all members
 	for _, node := range g.list.Members() {
-		if node.Name != g.config.Name { // Don't send to self
-			if err := g.list.SendReliable(node, data); err != nil {
-				log.Printf("[Gossip] Failed to send metadata to %s: %v", node.Name, err)
-			}
+		if node.Name == g.list.LocalNode().Name {
+			continue // Skip self
+		}
+
+		err := g.list.SendReliable(node, data)
+		if err != nil {
+			log.Printf("[Gossip] Failed to send metadata to %s: %v", logID(node.Name), err)
 		}
 	}
 }
 
-// getLoadStats collects current node metrics
+// getLoadStats collects system load statistics
 func (g *GossipManager) getLoadStats() LoadStats {
-	// In practice, implement real metrics collection
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+
 	return LoadStats{
-		CPUUsage:    0.5, // Example values
-		MemoryUsage: 0.4,
-		MsgCount:    1000,
+		CPUUsage:    0, // Not implemented yet
+		MemoryUsage: float64(stats.Alloc) / 1024 / 1024,
+		MsgCount:    0, // Not implemented yet
 	}
 }
 
-// getLocalTopics returns topics this node is responsible for
+// getLocalTopics retrieves topics this node is responsible for
 func (g *GossipManager) getLocalTopics() []string {
-	// Get all topics from DHT where this node is registered
-	topicMap := g.dht.GetTopicMap()
-	localTopics := make([]string, 0)
-
-	for topic, nodes := range topicMap {
-		for _, nodeID := range nodes {
-			if nodeID == g.config.Name {
-				localTopics = append(localTopics, topic)
-				break
-			}
-		}
-	}
-
-	return localTopics
+	// For now, just return an empty list
+	// In the future, this would be populated from the router/consumer groups
+	return []string{}
 }
 
-// JoinCluster tries to join the existing cluster via the given seed nodes
+// JoinCluster joins a cluster by specifying seed nodes
 func (g *GossipManager) JoinCluster(seeds []string) error {
-	if len(seeds) == 0 {
-		log.Println("No seeds provided, running as initial node in cluster.")
-		return nil
+	log.Printf("[Gossip] Attempting to join cluster with seeds: %v", seeds)
+
+	// Convert string addresses to IP addresses
+	addrs := make([]string, 0, len(seeds))
+	for _, seed := range seeds {
+		addrs = append(addrs, seed)
 	}
 
-	joined, err := g.list.Join(seeds)
+	// Join the cluster
+	n, err := g.list.Join(addrs)
 	if err != nil {
-		return fmt.Errorf("failed to join cluster: %w", err)
+		return err
 	}
-	log.Printf("Joined %d nodes\n", joined)
+
+	log.Printf("[Gossip] Joined %d nodes", n)
 	return nil
 }
 
-// GetMembers returns the current gossip cluster members
+// GetMembers returns all members in the cluster
 func (g *GossipManager) GetMembers() []string {
 	members := g.list.Members()
-	var names []string
+	result := make([]string, 0, len(members))
+
 	for _, m := range members {
-		names = append(names, fmt.Sprintf("%s (%s:%d)", m.Name, m.Address(), m.Port))
+		result = append(result, m.Name)
 	}
-	return names
+
+	return result
 }
 
-// Shutdown gracefully leaves the cluster
+// Shutdown stops the gossip manager
 func (g *GossipManager) Shutdown() {
+	log.Printf("[Gossip] Shutting down gossip manager")
 	close(g.stopCh)
-	<-g.done // Wait for broadcast to stop
+	<-g.done
 	g.list.Shutdown()
+}
+
+// NotifyJoin is called when a node joins the cluster
+func (g *GossipManager) NotifyJoin(node *memberlist.Node) {
+	log.Printf("[Gossip] Node %s joined at %s", logID(node.Name), node.Addr)
+}
+
+// NotifyLeave is called when a node leaves the cluster
+func (g *GossipManager) NotifyLeave(node *memberlist.Node) {
+	log.Printf("[Gossip] Node %s left", logID(node.Name))
+}
+
+// NotifyUpdate is called when a node information is updated
+func (g *GossipManager) NotifyUpdate(node *memberlist.Node) {
+	log.Printf("[Gossip] Node %s updated", logID(node.Name))
 }

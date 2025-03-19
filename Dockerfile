@@ -18,18 +18,14 @@ FROM alpine:latest
 
 WORKDIR /app
 
-# Install Python and CA certificates
-RUN apk add --no-cache ca-certificates python3
+# Install required tools
+RUN apk add --no-cache ca-certificates net-tools procps
 
 # Copy binary from builder stage
 COPY --from=builder /app/sprawl .
 
-# Copy health check script
-COPY k8s/health-server.sh /app/health-server.sh
-RUN chmod +x /app/health-server.sh
-
 # Create data directory
 RUN mkdir -p /data
 
-# Set the health check server as the entry point
-ENTRYPOINT ["/bin/sh", "-c", "/app/health-server.sh & /app/sprawl"] 
+# Set the application as the entry point
+ENTRYPOINT ["/app/sprawl"] 

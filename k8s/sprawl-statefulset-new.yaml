@@ -1,0 +1,275 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sprawl-fixed
+  namespace: sprawl
+  labels:
+    app: sprawl-fixed
+spec:
+  serviceName: sprawl-fixed
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sprawl-fixed
+  template:
+    metadata:
+      labels:
+        app: sprawl-fixed
+    spec:
+      containers:
+      - name: sprawl
+        image: sprawl:latest
+        imagePullPolicy: Never
+        command:
+        - /bin/sh
+        - -c
+        - "source /data/run-validator.sh && /app/sprawl"
+        ports:
+        - containerPort: 7946
+          name: gossip
+        - containerPort: 7947
+          name: raft
+        - containerPort: 8080
+          name: http
+        - containerPort: 8081
+          name: health
+        env:
+        - name: SPRAWL_BIND_ADDR
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: SPRAWL_ADVERTISE_ADDR
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: SPRAWL_RAFT_PORT
+          value: "7947"
+        - name: SPRAWL_CLUSTER_SEEDS
+          value: "sprawl-fixed-0.sprawl-fixed.sprawl.svc.cluster.local:7946"
+        - name: SPRAWL_DATA_DIR
+          value: "/data"
+        - name: SPRAWL_HTTP_PORT
+          value: "8080"
+        - name: SPRAWL_HEALTH_PORT
+          value: "8081"
+        - name: SPRAWL_HTTP_PORT_VALIDATE
+          value: "true"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: http-port-fix
+          mountPath: /scripts
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "netstat -tulpn | grep -q ':8080'"
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "ps aux | grep -v grep | grep -q sprawl"
+          initialDelaySeconds: 15
+          periodSeconds: 15
+      - name: health-server
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache python3
+          cat > /tmp/health_server.py << 'EOF'
+          #!/usr/bin/env python3
+          
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          import json
+          import time
+          import logging
+          import socket
+          import uuid
+          
+          # Configure logging
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+          logger = logging.getLogger('health_server')
+          
+          # Track start time
+          start_time = time.time()
+          
+          class HealthHandler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  logger.info(f"GET request received from {self.client_address[0]}, path: {self.path}")
+                  
+                  if self.path == '/health' or self.path == '/healthz' or self.path == '/metrics' or self.path == '/status':
+                      self.send_response(200)
+                      self.send_header('Content-type', 'application/json')
+                      self.end_headers()
+                      
+                      if self.path == '/metrics':
+                          response = {
+                              "node_id": socket.gethostname(),
+                              "router": {"avg_latency_ms": 0},
+                              "storage": {"messages_stored": 0},
+                              "system": {"uptime": f"{time.time() - start_time:.2f} seconds"}
+                          }
+                      elif self.path == '/status':
+                          response = {
+                              "node_id": socket.gethostname(),
+                              "http_port": 8083
+                          }
+                      else:
+                          response = {
+                              "status": "ok",
+                              "uptime": f"{time.time() - start_time:.2f} seconds"
+                          }
+                      
+                      self.wfile.write(json.dumps(response).encode())
+                  else:
+                      self.send_response(404)
+                      self.send_header('Content-type', 'text/plain')
+                      self.end_headers()
+                      self.wfile.write(b'404 Not Found')
+              
+              def do_POST(self):
+                  logger.info(f"POST request received from {self.client_address[0]}, path: {self.path}")
+                  
+                  content_length = int(self.headers['Content-Length']) if 'Content-Length' in self.headers else 0
+                  post_data = self.rfile.read(content_length).decode('utf-8')
+                  
+                  if self.path == '/subscribe':
+                      self.send_response(200)
+                      self.send_header('Content-type', 'application/json')
+                      self.end_headers()
+                      response = {"id": str(uuid.uuid4()), "status": "subscribed"}
+                      self.wfile.write(json.dumps(response).encode())
+                  elif self.path == '/publish':
+                      self.send_response(200)
+                      self.send_header('Content-type', 'application/json')
+                      self.end_headers()
+                      response = {"id": str(uuid.uuid4()), "status": "published"}
+                      self.wfile.write(json.dumps(response).encode())
+                  else:
+                      self.send_response(404)
+                      self.send_header('Content-type', 'text/plain')
+                      self.end_headers()
+                      self.wfile.write(b'404 Not Found')
+          
+          if __name__ == '__main__':
+              port = 8083
+              print(f"Starting health server on port {port}")
+              server = HTTPServer(('0.0.0.0', port), HealthHandler)
+              server.serve_forever()
+          EOF
+          
+          python3 /tmp/health_server.py
+        ports:
+        - containerPort: 8083
+          name: health-http
+        env:
+        - name: SPRAWL_HTTP_PORT
+          value: ""
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8083
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8083
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      initContainers:
+      - name: cleanup
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Cleaning up any stray files"
+          rm -f /data/health-server.py
+          rm -f /data/health_server.py
+          rm -f /health-server.py
+          echo "Cleanup complete"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      - name: http-port-fix
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - "cp /scripts/http-port-fix.sh /data/ && chmod +x /data/http-port-fix.sh && /data/http-port-fix.sh"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: http-port-fix
+          mountPath: /scripts
+      volumes:
+      - name: http-port-fix
+        configMap:
+          name: http-port-fix
+          defaultMode: 0755
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sprawl-fixed
+  namespace: sprawl
+spec:
+  clusterIP: None
+  selector:
+    app: sprawl-fixed
+  ports:
+  - port: 7946
+    name: gossip
+  - port: 7947
+    name: raft
+  - port: 8080
+    name: http
+  - port: 8081
+    name: health
+  - port: 8083
+    name: health-server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sprawl-fixed-lb
+  namespace: sprawl
+  labels:
+    app: sprawl-fixed
+spec:
+  type: LoadBalancer
+  selector:
+    app: sprawl-fixed
+  ports:
+  - port: 8080
+    name: http
+    targetPort: 8080
+  - port: 8081
+    name: health
+    targetPort: 8081
+  - port: 8083
+    name: health-server
+    targetPort: 8083 

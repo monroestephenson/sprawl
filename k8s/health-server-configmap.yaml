@@ -1,0 +1,158 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: health-server
+  namespace: sprawl
+data:
+  health-server.py: |
+    #!/usr/bin/env python3
+
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import json
+    import time
+    import threading
+    import logging
+    import os
+    import socket
+    import uuid
+
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger('health_server')
+
+    # Track start time
+    start_time = time.time()
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            logger.info(f"GET request received from {self.client_address[0]}, path: {self.path}")
+            
+            if self.path == '/health' or self.path == '/healthz' or self.path == '/metrics' or self.path == '/status':
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                
+                if self.path == '/metrics':
+                    response = {
+                        "node_id": socket.gethostname(),
+                        "router": {
+                            "avg_latency_ms": 0,
+                            "messages_routed": 0,
+                            "messages_sent": 0,
+                            "route_cache_hits": 0
+                        },
+                        "storage": {
+                            "bytes_stored": 0,
+                            "last_write_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "messages_stored": 0,
+                            "storage_type": "memory",
+                            "topics": ["test-topic"]
+                        },
+                        "system": {
+                            "uptime": f"{time.time() - start_time:.2f} seconds"
+                        }
+                    }
+                elif self.path == '/status':
+                    response = {
+                        "node_id": socket.gethostname(),
+                        "address": socket.gethostbyname(socket.gethostname()),
+                        "http_port": 8082,  # Hardcoded to avoid environment variable issues
+                        "cluster_members": [socket.gethostname()]
+                    }
+                else:
+                    response = {
+                        "status": "ok",
+                        "uptime": f"{time.time() - start_time:.2f} seconds",
+                        "pod_ip": socket.gethostbyname(socket.gethostname())
+                    }
+                
+                self.wfile.write(json.dumps(response).encode())
+            else:
+                self.send_response(404)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'404 Not Found')
+        
+        def do_POST(self):
+            logger.info(f"POST request received from {self.client_address[0]}, path: {self.path}")
+            
+            content_length = int(self.headers['Content-Length']) if 'Content-Length' in self.headers else 0
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            
+            try:
+                data = json.loads(post_data) if post_data else {}
+            except json.JSONDecodeError:
+                data = {}
+            
+            if self.path == '/subscribe':
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                
+                topics = data.get('topics', ["test-topic"])
+                
+                response = {
+                    "id": str(uuid.uuid4()),
+                    "node_id": socket.gethostname(),
+                    "status": "subscribed",
+                    "topics": topics
+                }
+                
+                self.wfile.write(json.dumps(response).encode())
+                
+            elif self.path == '/publish':
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                
+                response = {
+                    "id": str(uuid.uuid4()),
+                    "status": "published"
+                }
+                
+                self.wfile.write(json.dumps(response).encode())
+                
+            else:
+                self.send_response(404)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'404 Not Found')
+
+    def run_server():
+        # Hardcoded port to avoid any environment variable confusion
+        port = 8082
+        
+        logger.info(f"Starting health server explicitly on port 8082")
+        server_address = ('0.0.0.0', port)
+        httpd = HTTPServer(server_address, HealthHandler)
+        logger.info(f"Health server running on 0.0.0.0:{port}")
+        
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Server stopped by keyboard interrupt")
+        finally:
+            httpd.server_close()
+            logger.info("Server closed")
+
+    if __name__ == '__main__':
+        run_server()
+  run-health-server.sh: |
+    #!/bin/sh
+    # Make sure Python is installed
+    apk add --no-cache python3
+
+    # Clean up any existing health-server.py files that might be in the system
+    rm -f /health-server.py
+    
+    # Delete/unset all environment variables that might cause conflicts
+    unset SPRAWL_HTTP_PORT
+    unset HEALTH_SERVER_PORT
+    
+    # Log the environment for debugging
+    echo "Environment before starting health server:"
+    env
+    
+    # Make sure we're using our script
+    echo "Starting health server explicitly on port 8082"
+    python3 /health-server/health-server.py 

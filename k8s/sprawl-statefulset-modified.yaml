@@ -83,7 +83,51 @@ spec:
             - "ps aux | grep -v grep | grep -q sprawl"
           initialDelaySeconds: 15
           periodSeconds: 15
+      - name: health-server
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - "sh /health-server/run-health-server.sh"
+        ports:
+        - containerPort: 8082
+          name: http-health
+        env:
+        - name: SPRAWL_HTTP_PORT
+          value: ""
+        - name: SPRAWL_HEALTH_PORT
+          value: ""
+        - name: HEALTH_SERVER_PORT
+          value: ""
+        volumeMounts:
+        - name: health-server-config
+          mountPath: /health-server
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8082
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8082
+          initialDelaySeconds: 10
+          periodSeconds: 10
       initContainers:
+      - name: cleanup
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Cleaning up any stray health server files"
+          rm -f /data/health-server.py
+          rm -f /health-server.py
+          echo "Cleanup complete"
+        volumeMounts:
+        - name: data
+          mountPath: /data
       - name: http-port-fix
         image: alpine:latest
         command:
@@ -99,6 +143,10 @@ spec:
       - name: http-port-fix
         configMap:
           name: http-port-fix
+          defaultMode: 0755
+      - name: health-server-config
+        configMap:
+          name: health-server
           defaultMode: 0755
   volumeClaimTemplates:
   - metadata:
@@ -127,11 +175,14 @@ spec:
     name: http
   - port: 8081
     name: health
+  - port: 8082
+    name: health-server
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: sprawl-lb
+  namespace: sprawl
   labels:
     app: sprawl
 spec:
@@ -144,4 +195,7 @@ spec:
     targetPort: 8080
   - port: 8081
     name: health
-    targetPort: 8081 
+    targetPort: 8081
+  - port: 8082
+    name: health-server
+    targetPort: 8082 

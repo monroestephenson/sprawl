@@ -179,7 +179,17 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 
 		// If no leader found or other error, store locally as fallback
 		log.Printf("[Router] Falling back to local storage for message %s", truncateID(msg.ID))
-		r.store.Publish(msg.Topic, msg.Payload)
+
+		// Create a store.Message from the router.Message
+		storeMsg := store.Message{
+			ID:        msg.ID,
+			Topic:     msg.Topic,
+			Payload:   msg.Payload,
+			Timestamp: time.Now(),
+			TTL:       msg.TTL,
+		}
+		r.store.Publish(storeMsg)
+
 		msgState.Destinations[r.nodeID] = true
 		r.metrics.messagesRouted.Add(1)
 		r.metrics.messagesStored.Add(1)
