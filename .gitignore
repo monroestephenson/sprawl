@@ -11,6 +11,7 @@ sprawlctl
 
 # Output of the go coverage tool
 *.out
+coverage.html
 
 # Dependency directories
 vendor/
@@ -20,15 +21,39 @@ vendor/
 .vscode/
 *.swp
 *.swo
+*~
+.history/
 
 # Log files
 *.log
+logs/
 
-# MinIO data
+# Data directories
+data/
 minio_data/
+rocksdb/
+/tmp/
+
+# Environment files
+.env
+.env.local
+.env.*
+
+# Build and deployment artifacts
+dist/
+build/
+*.tar.gz
+*.zip
 
 # OS specific
 .DS_Store
 Thumbs.db
+desktop.ini
 
+# Documentation drafts
 overview.md
+draft*.md
+
+# Debug files
+debug
+__debug_bin

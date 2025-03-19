@@ -2,7 +2,7 @@
 
 A distributed, scalable pub/sub messaging system with intelligent routing and DHT-based topic distribution.
 
-![Version](https://img.shields.io/badge/version-0.0.1-blue.svg)
+![Version](https://img.shields.io/badge/version-0.0.2-blue.svg)
 ![Go Version](https://img.shields.io/badge/go-%3E%3D1.21-blue)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -42,12 +42,21 @@ A distributed, scalable pub/sub messaging system with intelligent routing and DH
 git clone https://github.com/yourusername/sprawl.git
 cd sprawl
 
-# Build the CLI tool
+# Build the node and CLI tool
+go build -o sprawl cmd/sprawl/main.go
 go build -o sprawlctl cmd/sprawlctl/main.go
 ```
 
-### Running a Cluster
+### Running a Node with Tiered Storage
 ```bash
+# Create required directories
+mkdir -p data/node1/disk
+
+# Start a node with disk storage enabled
+SPRAWL_STORAGE_DISK_ENABLED=true \
+SPRAWL_STORAGE_DISK_PATH=./data/node1/disk \
+./sprawl -bindAddr=127.0.0.1 -bindPort=7946 -httpPort=8080
+
 # Start MinIO (required for cloud storage)
 docker run -d --name minio \
     -p 9000:9000 -p 9001:9001 \
@@ -55,17 +64,17 @@ docker run -d --name minio \
     -e "MINIO_ROOT_PASSWORD=minioadmin" \
     minio/minio server /data --console-address ":9001"
 
-# Start the first node (seed node)
+# Start a node with all storage tiers enabled
 MINIO_ENDPOINT=http://localhost:9000 \
 MINIO_ACCESS_KEY=minioadmin \
 MINIO_SECRET_KEY=minioadmin \
-go run main.go -bindAddr=127.0.0.1 -bindPort=7946 -httpAddr=127.0.0.1 -httpPort=8080
-
-# Start additional nodes
-MINIO_ENDPOINT=http://localhost:9000 \
-MINIO_ACCESS_KEY=minioadmin \
-MINIO_SECRET_KEY=minioadmin \
-go run main.go -bindAddr=127.0.0.1 -bindPort=7947 -httpAddr=127.0.0.1 -httpPort=8081 -seeds=127.0.0.1:7946
+SPRAWL_STORAGE_DISK_ENABLED=true \
+SPRAWL_STORAGE_DISK_PATH=./data/node1/disk \
+SPRAWL_STORAGE_CLOUD_ENABLED=true \
+SPRAWL_STORAGE_CLOUD_BUCKET=sprawl-messages \
+SPRAWL_STORAGE_MEMORY_TO_DISK_AGE=3600 \
+SPRAWL_STORAGE_DISK_TO_CLOUD_AGE=86400 \
+./sprawl -bindAddr=127.0.0.1 -bindPort=7946 -httpPort=8080
 ```
 
 ### Basic Usage
@@ -76,8 +85,45 @@ go run main.go -bindAddr=127.0.0.1 -bindPort=7947 -httpAddr=127.0.0.1 -httpPort=
 # Publish to a topic
 ./sprawlctl -n http://localhost:8080 publish -t my-topic -m "Hello, World!"
 
-# Run integration tests
-./test.sh
+# Check storage tier status
+curl http://localhost:8080/store | jq
+
+# Run the verification script to test tiered storage
+./scripts/verify-tiering.sh
+```
+
+## Tiered Storage Architecture
+
+Sprawl implements a three-tiered storage system:
+
+1. **Memory Tier**: Fast in-memory storage for recent messages
+2. **Disk Tier**: RocksDB-based persistent storage for older messages
+3. **Cloud Tier**: S3/MinIO storage for long-term archival
+
+Messages automatically move between tiers based on:
+- Age (configurable retention periods)
+- Memory pressure (when memory usage exceeds threshold)
+- Disk usage (when disk usage exceeds threshold)
+
+### Configuration Options
+
+Control tiered storage behavior with these environment variables:
+
+```bash
+# Enable/disable tiers
+SPRAWL_STORAGE_DISK_ENABLED=true|false
+SPRAWL_STORAGE_CLOUD_ENABLED=true|false
+
+# Paths and endpoints
+SPRAWL_STORAGE_DISK_PATH=/path/to/rocksdb
+MINIO_ENDPOINT=http://minio:9000
+MINIO_ACCESS_KEY=your-access-key
+MINIO_SECRET_KEY=your-secret-key
+
+# Thresholds and retention periods
+SPRAWL_STORAGE_MEMORY_MAX_SIZE=104857600  # 100MB
+SPRAWL_STORAGE_MEMORY_TO_DISK_AGE=3600    # 1 hour
+SPRAWL_STORAGE_DISK_TO_CLOUD_AGE=86400    # 24 hours
 ```
 
 ## Architecture
@@ -92,6 +138,16 @@ Sprawl is built on several key components:
 
 For more details, see [architecture.md](architecture.md).
 
+## Running a Cluster
+
+```bash
+# Start the first node (seed node)
+./sprawl -bindAddr=127.0.0.1 -bindPort=7946 -httpPort=8080
+
+# Start additional nodes
+./sprawl -bindAddr=127.0.0.1 -bindPort=7947 -httpPort=8081 -seeds=127.0.0.1:7946
+```
+
 ## Configuration
 
 Key configuration options:
@@ -103,11 +159,6 @@ Key configuration options:
 -httpAddr string   # HTTP bind address (default "0.0.0.0")
 -httpPort int      # HTTP server port (default 8080)
 -seeds string      # Comma-separated list of seed nodes
-
-# Environment Variables
-MINIO_ENDPOINT     # MinIO/S3 endpoint
-MINIO_ACCESS_KEY   # MinIO/S3 access key
-MINIO_SECRET_KEY   # MinIO/S3 secret key
 ```
 
 ## Production Deployment
