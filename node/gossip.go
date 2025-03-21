@@ -142,30 +142,14 @@ func (g *GossipManager) broadcastMetadata() {
 	// Get own node info from DHT
 	nodeInfo := g.dht.GetNodeInfo()
 
-	// Ensure consistent HTTP port (8080)
-	originalPort := nodeInfo.HTTPPort
-	nodeInfo.HTTPPort = 8080
-
-	if originalPort != 8080 {
-		log.Printf("[Gossip] Ensuring HTTP port is 8080 (was %d) for broadcasting metadata",
-			originalPort)
-	}
-
 	// Create metadata with our current topic map and node info
 	metadata := GossipMetadata{
 		NodeID:    g.list.LocalNode().Name,
 		Topics:    g.getLocalTopics(),
 		LoadStats: g.getLoadStats(),
 		DHTPeers:  g.dht.GetTopicMap(),
-		NodeInfo:  nodeInfo, // Contains our validated HTTP port
+		NodeInfo:  nodeInfo, // Use the node info with actual HTTP port
 		Timestamp: time.Now(),
-	}
-
-	// Verify that the HTTP port is set correctly
-	if metadata.NodeInfo.HTTPPort != 8080 {
-		log.Printf("[Gossip] Warning: NodeInfo HTTP port is %d after assignment, fixing to 8080",
-			metadata.NodeInfo.HTTPPort)
-		metadata.NodeInfo.HTTPPort = 8080
 	}
 
 	log.Printf("[Gossip] Broadcasting metadata with HTTP port %d",

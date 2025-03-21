@@ -1,0 +1,10 @@
+2025/03/21 09:39:32.090823 main.go:16: Starting test server on port 9090
+2025/03/21 09:39:32.091163 main.go:40: Server starting on http://localhost:9090
+2025/03/21 09:39:38.097156 main.go:48: Received subscribe request from [::1]:57523, method: POST
+2025/03/21 09:39:38.097188 main.go:51: Headers: map[Accept:[*/*] Content-Length:[47] Content-Type:[application/json] User-Agent:[curl/8.7.1]]
+2025/03/21 09:39:38.097228 main.go:54: Content length: 47
+2025/03/21 09:39:38.097247 main.go:78: Error reading body: EOF
+2025/03/21 09:39:38.097261 main.go:80: Request body: {"topics": ["test-topic"], "id": "test-client"}
+2025/03/21 09:39:38.097338 main.go:89: Decoded subscribe request: ID=test-client, Topics=[test-topic]
+2025/03/21 09:39:38.097355 main.go:100: Sending response: map[id:test-client status:subscribed]
+2025/03/21 09:39:38.097393 main.go:105: Successfully sent subscribe response

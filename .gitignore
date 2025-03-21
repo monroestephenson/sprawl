@@ -1,22 +1,20 @@
-# Binaries
+# Compiled binaries and object files
 sprawl
 sprawlctl
 *.exe
 *.dll
 *.so
 *.dylib
+*.o
+*.a
 
-# Test binary, built with `go test -c`
+# Go specific
 *.test
-
-# Output of the go coverage tool
 *.out
 coverage.html
+/vendor/
 
-# Dependency directories
-vendor/
-
-# IDE specific files
+# IDE and editor files
 .idea/
 .vscode/
 *.swp
@@ -24,36 +22,55 @@ vendor/
 *~
 .history/
 
-# Log files
+# Logs and data
 *.log
 logs/
-
-# Data directories
+server_logs.txt
 data/
 minio_data/
 rocksdb/
 /tmp/
 
-# Environment files
-.env
-.env.local
-.env.*
+# Environment and configuration
+.env*
+*.toml
+*.yaml
+*.yml
+!example.env
+!default.toml
+!config.example.yaml
 
-# Build and deployment artifacts
+# Build and deployment
 dist/
 build/
 *.tar.gz
 *.zip
+*.tgz
 
-# OS specific
+# OS generated files
 .DS_Store
 Thumbs.db
+.directory
 desktop.ini
-
-# Documentation drafts
-overview.md
-draft*.md
 
 # Debug files
 debug
 __debug_bin
+debug.test
+
+# Documentation drafts and temporary files
+draft*.md
+temp/
+TODO.md
+
+# Test data and fixtures
+testdata/
+fixtures/
+mock/
+
+# Dependencies
+go.sum
+
+# Cache directories
+.cache/
+node_modules/

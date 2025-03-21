@@ -20,10 +20,13 @@ A distributed, scalable pub/sub messaging system with intelligent routing and DH
 - ✅ Cross-node message forwarding
 - ✅ Route caching system
 - ✅ Basic load-based topic balancing
+- ✅ AI-powered traffic analysis and load prediction
+  - ✅ Automatic resource monitoring and prediction
+  - ✅ Anomaly detection for network traffic
+  - ✅ Self-training models requiring minimal data
 
 ### Coming Soon
 - 🔄 Advanced backpressure handling
-- 🔄 AI-powered traffic analysis and load prediction
 - 🔄 Security features (TLS, Authentication, E2E encryption)
 - 🔄 Kubernetes operator
 - 🔄 WebSocket support
@@ -52,7 +55,8 @@ go build -o sprawlctl cmd/sprawlctl/main.go
 # Create required directories
 mkdir -p data/node1/disk
 
-# Start a node with disk storage enabled
+# Start a node with disk storage enabled and custom ports
+SPRAWL_HEALTH_PORT=8091 \
 SPRAWL_STORAGE_DISK_ENABLED=true \
 SPRAWL_STORAGE_DISK_PATH=./data/node1/disk \
 ./sprawl -bindAddr=127.0.0.1 -bindPort=7946 -httpPort=8080
@@ -68,6 +72,7 @@ docker run -d --name minio \
 MINIO_ENDPOINT=http://localhost:9000 \
 MINIO_ACCESS_KEY=minioadmin \
 MINIO_SECRET_KEY=minioadmin \
+SPRAWL_HEALTH_PORT=8091 \
 SPRAWL_STORAGE_DISK_ENABLED=true \
 SPRAWL_STORAGE_DISK_PATH=./data/node1/disk \
 SPRAWL_STORAGE_CLOUD_ENABLED=true \
@@ -90,6 +95,33 @@ curl http://localhost:8080/store | jq
 
 # Run the verification script to test tiered storage
 ./scripts/verify-tiering.sh
+
+# Check AI predictions for resource usage (CPU)
+curl http://localhost:8080/ai/predictions?resource=cpu | jq
+
+# Manually trigger AI model training (normally happens automatically)
+curl -X POST http://localhost:8080/ai/train?resource=cpu,memory,message_rate | jq
+```
+
+## Port Configuration
+
+Sprawl uses three distinct ports that can be configured:
+
+1. **HTTP Server Port** (default: 8080)
+   - Set with `-httpPort` flag
+   - Used for pub/sub endpoints and API
+
+2. **Health Server Port** (default: 8081)
+   - Set with `SPRAWL_HEALTH_PORT` environment variable
+   - Used for health checks and metrics
+
+3. **Gossip/DHT Port** (default: 7946)
+   - Set with `-bindPort` flag
+   - Used for node discovery and DHT
+
+Example with custom ports:
+```bash
+SPRAWL_HEALTH_PORT=8091 ./sprawl -bindAddr=127.0.0.1 -bindPort=7950 -httpPort=8087
 ```
 
 ## Tiered Storage Architecture
@@ -126,26 +158,40 @@ SPRAWL_STORAGE_MEMORY_TO_DISK_AGE=3600    # 1 hour
 SPRAWL_STORAGE_DISK_TO_CLOUD_AGE=86400    # 24 hours
 ```
 
-## Architecture
+## AI-Powered Features
 
-Sprawl is built on several key components:
+Sprawl includes intelligent features for system optimization:
 
-1. **DHT Layer**: Manages topic distribution and routing
-2. **Storage Layer**: Tiered storage with memory, disk, and cloud options
-3. **Consensus Layer**: Raft-based cluster management
-4. **Router Layer**: Intelligent message routing and load balancing
-5. **API Layer**: HTTP endpoints for pub/sub operations
+1. **Automatic Resource Monitoring**: Continuously tracks CPU, memory, message rate, and network metrics
+2. **Self-Training ML Models**: Models automatically train with minimal data points (as few as 3)
+3. **Predictive Capacity Planning**: Forecasts resource usage for the next hour
+4. **Anomaly Detection**: Identifies unusual patterns in network traffic and system metrics
+5. **Intelligent Routing**: Uses ML insights to optimize message paths
 
-For more details, see [architecture.md](architecture.md).
+These features require no configuration and work automatically as the system runs. You can access predictions via the API endpoints:
+
+```bash
+# Get CPU usage predictions
+curl http://localhost:8080/ai/predictions?resource=cpu | jq
+
+# Get memory usage predictions
+curl http://localhost:8080/ai/predictions?resource=memory | jq
+
+# Get message rate predictions
+curl http://localhost:8080/ai/predictions?resource=message_rate | jq
+
+# Get network traffic predictions
+curl http://localhost:8080/ai/predictions?resource=network | jq
+```
 
 ## Running a Cluster
 
 ```bash
 # Start the first node (seed node)
-./sprawl -bindAddr=127.0.0.1 -bindPort=7946 -httpPort=8080
+SPRAWL_HEALTH_PORT=8091 ./sprawl -bindAddr=127.0.0.1 -bindPort=7946 -httpPort=8080
 
-# Start additional nodes
-./sprawl -bindAddr=127.0.0.1 -bindPort=7947 -httpPort=8081 -seeds=127.0.0.1:7946
+# Start additional nodes with unique ports
+SPRAWL_HEALTH_PORT=8092 ./sprawl -bindAddr=127.0.0.1 -bindPort=7947 -httpPort=8081 -seeds=127.0.0.1:7946
 ```
 
 ## Configuration
@@ -159,11 +205,10 @@ Key configuration options:
 -httpAddr string   # HTTP bind address (default "0.0.0.0")
 -httpPort int      # HTTP server port (default 8080)
 -seeds string      # Comma-separated list of seed nodes
+
+# Environment Variables
+SPRAWL_HEALTH_PORT # Health server port (default 8081)
 ```
-
-## Production Deployment
-
-For production deployment instructions, see [deployment.md](docs/deployment.md).
 
 ## Contributing
 

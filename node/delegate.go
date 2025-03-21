@@ -213,14 +213,20 @@ func (d *gossipDelegate) processNodeInfo(nodeData map[string]interface{}) {
 	dataBytes, _ := json.Marshal(nodeData)
 	log.Printf("[Gossip] Processing node data for %s: %s", utils.TruncateID(nodeID), string(dataBytes))
 
-	// Create node info structure with forced HTTP port of 8080
+	// Create node info structure
 	nodeInfo := dht.NodeInfo{
-		ID:       nodeID,
-		HTTPPort: 8080, // Always use 8080 for consistency
+		ID: nodeID,
 	}
 
-	log.Printf("[Gossip] Setting HTTP port to 8080 for node %s",
-		utils.TruncateID(nodeID))
+	// Extract HTTP port from node data or use default
+	if httpPortVal, ok := nodeData["http_port"].(float64); ok && httpPortVal > 0 {
+		nodeInfo.HTTPPort = int(httpPortVal)
+		log.Printf("[Gossip] Using extracted HTTP port %d for node %s", nodeInfo.HTTPPort, utils.TruncateID(nodeID))
+	} else {
+		// Fallback to delegate's configured HTTP port
+		nodeInfo.HTTPPort = d.httpPort
+		log.Printf("[Gossip] Using delegate's HTTP port %d for node %s", nodeInfo.HTTPPort, utils.TruncateID(nodeID))
+	}
 
 	// Extract other fields for completeness
 	if address, ok := nodeData["address"].(string); ok && address != "" {
@@ -235,9 +241,8 @@ func (d *gossipDelegate) processNodeInfo(nodeData map[string]interface{}) {
 		nodeInfo.Port = 7946 // Default memberlist port
 	}
 
-	// Add the node to DHT with our forced HTTP port
-	log.Printf("[Gossip] Adding node %s to DHT with HTTP port 8080",
-		utils.TruncateID(nodeID))
+	// Add the node to DHT with the correct HTTP port
+	log.Printf("[Gossip] Adding node %s to DHT with HTTP port %d", utils.TruncateID(nodeID), nodeInfo.HTTPPort)
 	d.dht.AddNode(nodeInfo)
 }
 
