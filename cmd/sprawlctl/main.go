@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -185,35 +186,104 @@ func publish(nodeURL, topic, payload string) error {
 		return fmt.Errorf("error marshaling request: %w", err)
 	}
 
-	// Use the doRequest function with 3 retries
-	resp, err := doRequest(nodeURL+"/publish", jsonData, 3)
-	if err != nil {
-		return fmt.Errorf("error publishing message: %w", err)
+	// Enhanced retry logic for publish with specific handling for 503 (Service Unavailable)
+	var resp *http.Response
+	maxRetries := 5
+	baseBackoff := 100 * time.Millisecond
+	maxBackoff := 10 * time.Second
+
+	for i := 0; i <= maxRetries; i++ {
+		resp, err = http.Post(nodeURL+"/publish", "application/json", bytes.NewBuffer(jsonData))
+
+		// Network error handling
+		if err != nil {
+			if i < maxRetries {
+				backoff := time.Duration(math.Pow(2, float64(i))) * baseBackoff
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				fmt.Printf("Connection error, retrying in %v... (%d/%d): %v\n", backoff, i+1, maxRetries, err)
+				time.Sleep(backoff)
+				continue
+			} else {
+				return fmt.Errorf("request failed after %d attempts: %w", maxRetries+1, err)
+			}
+		}
+
+		// HTTP status code handling
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			// Handle "Server is too busy" with adaptive backoff
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			var errorResp struct {
+				Error      string `json:"error"`
+				RetryAfter string `json:"retry_after"`
+			}
+
+			// Default retry values
+			retryAfter := time.Duration(math.Pow(2, float64(i))) * baseBackoff
+			if retryAfter > maxBackoff {
+				retryAfter = maxBackoff
+			}
+
+			// Try to parse response for more precise retry guidance
+			if err := json.Unmarshal(body, &errorResp); err == nil && errorResp.RetryAfter != "" {
+				if secs, err := time.ParseDuration(errorResp.RetryAfter + "s"); err == nil {
+					retryAfter = secs
+				}
+			}
+
+			if i < maxRetries {
+				fmt.Printf("Server busy, retrying in %v... (%d/%d)\n", retryAfter, i+1, maxRetries)
+				time.Sleep(retryAfter)
+				continue
+			}
+
+			return fmt.Errorf("server is too busy after %d retries", maxRetries)
+		} else if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusGatewayTimeout {
+			// Handle timeout errors
+			resp.Body.Close()
+
+			if i < maxRetries {
+				backoff := time.Duration(math.Pow(2, float64(i))) * baseBackoff * 2 // Double backoff for timeouts
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				fmt.Printf("Request timed out, retrying with longer timeout in %v... (%d/%d)\n", backoff, i+1, maxRetries)
+				time.Sleep(backoff)
+				continue
+			}
+
+			return fmt.Errorf("request timed out after %d attempts", maxRetries+1)
+		} else if resp.StatusCode != http.StatusOK {
+			// Handle other HTTP errors
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return fmt.Errorf("unexpected status: %d - %s", resp.StatusCode, string(body))
+		}
+
+		// Success case - parse the response
+		defer resp.Body.Close()
+		var result struct {
+			Status string `json:"status"`
+			ID     string `json:"id"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return fmt.Errorf("error decoding response: %w", err)
+		}
+
+		if result.Status != "published" && result.Status != "dropped" {
+			return fmt.Errorf("unexpected status: %s", result.Status)
+		}
+
+		// Successfully published
+		return nil
 	}
-	defer resp.Body.Close()
 
-	// Rest of the function remains the same
-	var result struct {
-		Status string `json:"status"`
-		ID     string `json:"id"`
-		Error  string `json:"error,omitempty"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("error decoding response: %w", err)
-	}
-
-	if result.Status == "dropped" {
-		return fmt.Errorf("message was dropped: %s", result.Error)
-	}
-
-	if result.Status != "published" {
-		return fmt.Errorf("unexpected status: %s", result.Status)
-	}
-
-	fmt.Printf("Successfully published message to topic: %s on node: %s (ID: %s)\n", topic, nodeURL, result.ID)
-
-	return nil
+	// This should never happen but added for completeness
+	return fmt.Errorf("failed to publish after %d retries", maxRetries)
 }
 
 // Add a new function to check node health before operations

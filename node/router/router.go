@@ -9,6 +9,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -84,7 +86,7 @@ func NewRouter(nodeID string, dht *dht.DHT, store *store.Store, replication *con
 		nodeID:      nodeID,
 		metrics:     &RouterMetrics{},
 		ackTracker:  &AckTracker{pending: make(map[string]*MessageState), maxRetry: 3},
-		semaphore:   make(chan struct{}, 50),
+		semaphore:   make(chan struct{}, 200),
 		replication: replication,
 	}
 }
@@ -102,6 +104,43 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 	}
 	r.ackTracker.mu.RUnlock()
 
+	// Use a semaphore to limit concurrent message processing with retry logic
+	var acquired bool
+	backoffDuration := 50 * time.Millisecond
+	maxRetries := 5
+
+	log.Printf("[Router] RouteMessage for %s: semaphore check, current capacity: %d/%d",
+		truncateID(msg.ID), len(r.semaphore), cap(r.semaphore))
+
+	for retry := 0; retry < maxRetries; retry++ {
+		select {
+		case r.semaphore <- struct{}{}:
+			acquired = true
+			log.Printf("[Router] RouteMessage for %s: semaphore acquired, new capacity: %d/%d",
+				truncateID(msg.ID), len(r.semaphore), cap(r.semaphore))
+			defer func() {
+				<-r.semaphore
+				log.Printf("[Router] RouteMessage for %s: semaphore released, new capacity: %d/%d",
+					truncateID(msg.ID), len(r.semaphore), cap(r.semaphore))
+			}()
+			goto PROCESS_MESSAGE
+		case <-ctx.Done():
+			return fmt.Errorf("context deadline exceeded while waiting for router semaphore: %w", ctx.Err())
+		case <-time.After(backoffDuration):
+			// Exponential backoff for next iteration
+			backoffDuration *= 2
+			log.Printf("[Router] Failed to acquire semaphore for message %s, retry %d/%d with timeout %v, current capacity: %d/%d",
+				truncateID(msg.ID), retry+1, maxRetries, backoffDuration, len(r.semaphore), cap(r.semaphore))
+			continue
+		}
+	}
+
+	if !acquired {
+		return fmt.Errorf("failed to acquire routing semaphore after %d retries for message %s",
+			maxRetries, truncateID(msg.ID))
+	}
+
+PROCESS_MESSAGE:
 	// Create message state for tracking
 	msgState := &MessageState{
 		Message:      msg,
@@ -172,6 +211,8 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 
 			if leaderNode != nil {
 				// Forward to leader
+				log.Printf("[Router] Forwarding message %s to leader node %s",
+					truncateID(msg.ID), truncateID(leaderNode.ID))
 				r.metrics.messagesRouted.Add(1)
 				return r.forwardToNode(ctx, *leaderNode, msg)
 			}
@@ -216,10 +257,6 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 		wg.Add(1)
 		go func(targetNode dht.NodeInfo) {
 			defer wg.Done()
-
-			// Acquire semaphore
-			r.semaphore <- struct{}{}
-			defer func() { <-r.semaphore }()
 
 			err := r.forwardToNode(ctx, targetNode, msg)
 			if err != nil {
@@ -277,74 +314,227 @@ func truncateID(id string) string {
 }
 
 func (r *Router) forwardToNode(ctx context.Context, targetNode dht.NodeInfo, msg Message) error {
-	// Create message payload
-	payload := map[string]interface{}{
-		"topic":   msg.Topic,
-		"payload": string(msg.Payload),
-		"id":      msg.ID,
-		"ttl":     msg.TTL - 1, // Decrement TTL before forwarding
-	}
+	// Create a copy of the message with decremented TTL
+	forwardMsg := msg
+	forwardMsg.TTL--
 
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal message: %w", err)
-	}
+	// Retry configuration
+	maxRetries := 3
+	initialBackoff := 100 * time.Millisecond
+	backoff := initialBackoff
 
-	// Create HTTP client with timeouts
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   2 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	}
-
-	// Create context with timeout
-	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
+	// Construct the URL for the target node
 	url := fmt.Sprintf("http://%s:%d/publish", targetNode.Address, targetNode.HTTPPort)
-	req, err := http.NewRequestWithContext(sendCtx, "POST", url, bytes.NewBuffer(jsonData))
+
+	log.Printf("[Router] Forwarding message %s to node %s at %s",
+		truncateID(msg.ID), truncateID(targetNode.ID), url)
+
+	// Prepare the payload
+	payload := map[string]interface{}{
+		"id":      forwardMsg.ID,
+		"topic":   forwardMsg.Topic,
+		"payload": string(forwardMsg.Payload),
+		"ttl":     forwardMsg.TTL,
+	}
+
+	// Convert payload to JSON
+	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("error marshaling message to JSON: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
+	var lastErr error
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to send message: %w", err)
-	}
-	defer resp.Body.Close()
+	// Retry loop with exponential backoff
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Check if our context is still valid
+		if ctx.Err() != nil {
+			return fmt.Errorf("context cancelled before forwarding to %s: %w",
+				truncateID(targetNode.ID), ctx.Err())
+		}
 
-	// Read response body with timeout
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	if err != nil {
-		return fmt.Errorf("failed to read response: %w", err)
+		// If this is a retry, log it
+		if attempt > 0 {
+			log.Printf("[Router] Retrying forward to node %s for message %s (attempt %d/%d, backoff %v)",
+				truncateID(targetNode.ID), truncateID(msg.ID), attempt, maxRetries, backoff)
+		}
+
+		// Set up for this attempt
+		shouldRetry := false
+
+		// Enhanced error context for HTTP requests
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: 20,
+				IdleConnTimeout:     30 * time.Second,
+				DisableCompression:  true,
+			},
+		}
+
+		// Create HTTP request
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonPayload))
+		if err != nil {
+			lastErr = fmt.Errorf("error creating forward request to %s: %w",
+				truncateID(targetNode.ID), err)
+			continue
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Forwarded-By", r.nodeID)
+
+		// Send the request
+		resp, err := client.Do(req)
+		if err != nil {
+			// Check if the error is due to context cancellation or timeout
+			if ctx.Err() != nil {
+				return fmt.Errorf("forward request to %s cancelled or timed out: %w",
+					truncateID(targetNode.ID), ctx.Err())
+			}
+
+			// More descriptive network error handling
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				lastErr = fmt.Errorf("forward request to %s timed out", truncateID(targetNode.ID))
+				shouldRetry = true
+			} else if strings.Contains(err.Error(), "dial tcp") || strings.Contains(err.Error(), "lookup") {
+				// Check if it's a DNS or connection error
+				lastErr = fmt.Errorf("connection error to %s (%s:%d): %w",
+					truncateID(targetNode.ID), targetNode.Address, targetNode.HTTPPort, err)
+				shouldRetry = true
+			} else {
+				lastErr = fmt.Errorf("forward request to %s failed: %w", truncateID(targetNode.ID), err)
+				shouldRetry = true
+			}
+
+			// Skip to next retry iteration
+			if shouldRetry && attempt < maxRetries {
+				// Sleep for backoff duration before retrying
+				select {
+				case <-ctx.Done():
+					return fmt.Errorf("context cancelled during retry: %w", ctx.Err())
+				case <-time.After(backoff):
+					// Increase backoff for next round
+					backoff = backoff * 2
+				}
+				continue
+			} else if shouldRetry {
+				return lastErr
+			}
+		}
+
+		// We should only get here if we have a valid response
+		if resp != nil {
+			defer resp.Body.Close()
+
+			// Read response body for better logging
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("[Router] Forward response from %s: status=%d, body=%s",
+				truncateID(targetNode.ID), resp.StatusCode, string(body))
+
+			// Special handling for 501 Not Implemented
+			if resp.StatusCode == http.StatusNotImplemented {
+				lastErr = fmt.Errorf("node %s returned 501 Not Implemented - cross-node messaging not supported",
+					truncateID(targetNode.ID))
+				// Don't retry 501 errors - these are implementation errors, not transient
+				return lastErr
+			}
+
+			// Check for "server too busy" response (503) which we should retry
+			if resp.StatusCode == http.StatusServiceUnavailable {
+				// Create a new reader for the body since we've already read it
+				bodyReader := bytes.NewReader(body)
+
+				// Try to parse it as JSON
+				var errorResp struct {
+					Error      string `json:"error"`
+					RetryAfter string `json:"retry_after"`
+				}
+
+				retrySeconds := 1 // Default backoff is 1 second
+				if json.NewDecoder(bodyReader).Decode(&errorResp) == nil && errorResp.RetryAfter != "" {
+					if s, err := strconv.Atoi(errorResp.RetryAfter); err == nil {
+						retrySeconds = s
+					}
+				}
+
+				// If this was our last retry, give up
+				if attempt == maxRetries {
+					return fmt.Errorf("node %s is too busy after %d retries",
+						truncateID(targetNode.ID), maxRetries+1)
+				}
+
+				// Otherwise, do a backoff for the suggested time (or our exponential backoff)
+				backoff = time.Duration(retrySeconds) * time.Second
+				if backoff < initialBackoff*(1<<uint(attempt)) {
+					backoff = initialBackoff * (1 << uint(attempt))
+				}
+
+				lastErr = fmt.Errorf("node %s is busy, will retry in %v",
+					truncateID(targetNode.ID), backoff)
+				shouldRetry = true
+			} else if resp.StatusCode >= 400 {
+				// Handle other error responses with detailed information
+				var errResp struct {
+					Error string `json:"error"`
+				}
+
+				// Create a new reader for the body since we've already read it
+				bodyReader := bytes.NewReader(body)
+
+				if err := json.NewDecoder(bodyReader).Decode(&errResp); err == nil && errResp.Error != "" {
+					lastErr = fmt.Errorf("node %s returned error (status %d): %s",
+						truncateID(targetNode.ID), resp.StatusCode, errResp.Error)
+				} else {
+					lastErr = fmt.Errorf("node %s returned error status: %d",
+						truncateID(targetNode.ID), resp.StatusCode)
+				}
+				shouldRetry = true
+			} else {
+				// Decode the response body
+				var result struct {
+					Status string `json:"status"`
+					ID     string `json:"id"`
+				}
+
+				// Create a new reader for the body since we've already read it
+				bodyReader := bytes.NewReader(body)
+
+				if err := json.NewDecoder(bodyReader).Decode(&result); err != nil {
+					lastErr = fmt.Errorf("error decoding response from %s: %w",
+						truncateID(targetNode.ID), err)
+					shouldRetry = true
+				} else if result.Status != "published" && result.Status != "dropped" {
+					// Check if the message was published or dropped
+					lastErr = fmt.Errorf("unexpected status from %s: %s",
+						truncateID(targetNode.ID), result.Status)
+					shouldRetry = true
+				} else {
+					// Success!
+					log.Printf("[Router] Successfully forwarded message %s to node %s, status: %s",
+						truncateID(msg.ID), truncateID(targetNode.ID), result.Status)
+					return nil
+				}
+			}
+
+			// Handle retry logic
+			if shouldRetry && attempt < maxRetries {
+				// Sleep for backoff duration before retrying
+				select {
+				case <-ctx.Done():
+					return fmt.Errorf("context cancelled during retry: %w", ctx.Err())
+				case <-time.After(backoff):
+					// Increase backoff for next round
+					backoff = backoff * 2
+				}
+				continue
+			} else if shouldRetry {
+				return lastErr
+			}
+		}
 	}
 
-	var result struct {
-		Status string `json:"status"`
-		Error  string `json:"error"`
-	}
-	if err := json.Unmarshal(bodyBytes, &result); err != nil {
-		return fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if result.Status == "published" {
-		log.Printf("[Router] Node %s acknowledged message %s", targetNode.ID[:8], msg.ID[:8])
-		return nil
-	} else if result.Status == "dropped" {
-		log.Printf("[Router] Message %s dropped by node %s (TTL: %d)", msg.ID[:8], targetNode.ID[:8], msg.TTL)
-		return fmt.Errorf("message dropped by node %s", targetNode.ID[:8])
-	} else {
-		return fmt.Errorf("unexpected response status: %s", result.Status)
-	}
+	// We should never reach here, but just in case
+	return lastErr
 }
 
 // GetMetrics returns the current router metrics

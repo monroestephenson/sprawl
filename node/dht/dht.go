@@ -163,14 +163,11 @@ func (d *DHT) AddNode(info NodeInfo) {
 	log.Printf("[DHT] Processing AddNode call for node %s with original HTTPPort=%d",
 		utils.TruncateID(info.ID), info.HTTPPort)
 
-	// Always ensure HTTPPort is valid (8080)
-	originalPort := info.HTTPPort
-	info.HTTPPort = 8080
-
-	// Log what we're doing
-	if originalPort != 8080 {
-		log.Printf("[DHT] Overriding HTTP port %d with 8080 for node %s",
-			originalPort, utils.TruncateID(info.ID))
+	// Set a valid port if HTTPPort is missing
+	if info.HTTPPort <= 0 {
+		info.HTTPPort = 8080
+		log.Printf("[DHT] Node %s had invalid HTTP port, setting to default 8080",
+			utils.TruncateID(info.ID))
 	}
 
 	// Set a valid port if missing
@@ -189,24 +186,24 @@ func (d *DHT) AddNode(info NodeInfo) {
 			utils.TruncateID(info.ID), info.HTTPPort)
 	}
 
-	// Store the node with our forced HTTPPort
+	// Store the node
 	d.nodes[info.ID] = info
 
 	// Verify the node was stored correctly
 	if storedNode, ok := d.nodes[info.ID]; ok {
-		if storedNode.HTTPPort != 8080 {
-			log.Printf("[DHT] Error: Node %s was stored with HTTPPort=%d instead of 8080!",
-				utils.TruncateID(info.ID), storedNode.HTTPPort)
+		if storedNode.HTTPPort != info.HTTPPort {
+			log.Printf("[DHT] Error: Node %s was stored with HTTPPort=%d instead of %d!",
+				utils.TruncateID(info.ID), storedNode.HTTPPort, info.HTTPPort)
 
 			// Try one more time to fix it
-			storedNode.HTTPPort = 8080
+			storedNode.HTTPPort = info.HTTPPort
 			d.nodes[info.ID] = storedNode
 
 			log.Printf("[DHT] Made second attempt to fix HTTPPort for node %s",
 				utils.TruncateID(info.ID))
 		} else {
-			log.Printf("[DHT] Node %s was stored with correct HTTPPort=8080",
-				utils.TruncateID(info.ID))
+			log.Printf("[DHT] Node %s was stored with correct HTTPPort=%d",
+				utils.TruncateID(info.ID), info.HTTPPort)
 		}
 	}
 
@@ -269,8 +266,22 @@ func (d *DHT) GetNodesForTopic(topic string) []NodeInfo {
 		log.Printf("[DHT] Warning: Found topic mapping but no valid node info")
 	}
 
-	log.Printf("[DHT] No registered nodes found for topic %s", topic)
-	return []NodeInfo{} // Return empty list instead of falling back to closest nodes
+	// FALLBACK: If no nodes are found for the topic, register the current node and return it
+	log.Printf("[DHT] No registered nodes found for topic %s, using current node as fallback", topic)
+
+	// Get current node's info
+	if info, ok := d.nodes[d.nodeID]; ok {
+		// Auto-register current node for this topic
+		d.mu.RUnlock() // Unlock for read before write
+		d.RegisterNode(topic, d.nodeID, info.HTTPPort)
+		d.mu.RLock() // Lock for read again
+
+		log.Printf("[DHT] Auto-registered current node %s for topic %s as fallback",
+			utils.TruncateID(d.nodeID), topic)
+		return []NodeInfo{info}
+	}
+
+	return []NodeInfo{} // Return empty list as last resort
 }
 
 // findClosestNodes finds the N closest nodes to a hash
@@ -341,7 +352,9 @@ func (d *DHT) RegisterNode(topic string, nodeID string, httpPort int) {
 	if httpPort <= 0 {
 		log.Printf("[DHT] Warning: Attempted to register node %s with invalid HTTP port %d",
 			utils.TruncateID(nodeID), httpPort)
-		return
+		// Use default port 8080 as fallback instead of returning
+		httpPort = 8080
+		log.Printf("[DHT] Using fallback HTTP port %d for node %s", httpPort, utils.TruncateID(nodeID))
 	}
 
 	hash := d.HashTopic(topic)

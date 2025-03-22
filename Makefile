@@ -1,5 +1,5 @@
 # Sprawl Makefile
-.PHONY: all build test clean run_node run_demo demo_tiering setup_minio run_full_node init_directories verify
+.PHONY: all build test clean run_node run_demo demo_tiering setup_minio run_full_node init_directories verify comprehensive_test
 
 # Default target
 all: build
@@ -34,6 +34,21 @@ coverage:
 	go test -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
 
+# Run comprehensive tests
+comprehensive_test: build
+	chmod +x ./test_comprehensive.sh
+	./test_comprehensive.sh
+
+# Run specific component tests
+test_ai:
+	go test -v ./ai/...
+
+test_node:
+	go test -v ./node/...
+
+test_store:
+	go test -v ./store/...
+
 # Run the tiered storage demonstration
 demo_tiering: sprawl sprawlctl
 	./scripts/demonstrate-tiering.sh
@@ -46,6 +61,7 @@ clean:
 	rm -f coverage.html
 	rm -rf data/
 	rm -rf minio_data/
+	rm -rf test_logs_*
 
 # Set up MinIO for cloud storage tier
 setup_minio:
