@@ -7,7 +7,7 @@ sprawlctl
 *.dylib
 *.o
 *.a
-
+prompt_test.md
 # Go specific
 *.test
 *.out
