@@ -14,6 +14,9 @@ prompt_test.md
 coverage.html
 /vendor/
 
+overview.md
+helpful_input.md
+
 # IDE and editor files
 .idea/
 .vscode/

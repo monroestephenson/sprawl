@@ -657,7 +657,7 @@ func (n *Node) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"bytes_stored":    n.Store.GetMemoryUsage(),
 		"messages_stored": n.Store.GetMessageCount(),
 		"topics":          n.Store.GetTopics(),
-		"storage_type":    "memory",
+		"storage_type":    n.Store.GetStorageType(),
 		"last_write_time": time.Now().Format(time.RFC3339Nano),
 	}
 
@@ -679,11 +679,22 @@ func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get leader information from replication manager if available
+	var leader string
+	if n.Replication != nil {
+		leader = n.Replication.GetLeader()
+	}
+
+	// Get actual live members from the gossip manager
+	members := n.Gossip.GetMembers()
+
 	status := map[string]interface{}{
 		"node_id":         n.ID,
 		"address":         n.BindAddress,
 		"http_port":       n.HTTPPort,
-		"cluster_members": n.Gossip.GetMembers(),
+		"cluster_members": members,
+		"leader":          leader,
+		"is_leader":       leader == n.ID,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1289,14 +1300,14 @@ func (n *Node) handleTopics(w http.ResponseWriter, r *http.Request) {
 
 	// Get topics from DHT and store
 	storeTopics := n.Store.GetTopics()
-	dhtTopics := n.DHT.GetTopicMap()
+	dhtTopics := n.DHT.GetTopicMapByName() // Use the name-based map
 
 	// Create a response with topics and their information
 	response := topicsResponse{
 		Topics: []topicInfo{},
 	}
 
-	// Add topics to response
+	// First add all store topics
 	for _, topic := range storeTopics {
 		info := topicInfo{
 			Name:         topic,
@@ -1311,6 +1322,28 @@ func (n *Node) handleTopics(w http.ResponseWriter, r *http.Request) {
 		}
 
 		response.Topics = append(response.Topics, info)
+	}
+
+	// Then add any topics that might be in DHT but not in store
+	for topic, nodes := range dhtTopics {
+		// Check if this topic was already added
+		found := false
+		for _, existingTopic := range storeTopics {
+			if existingTopic == topic {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			info := topicInfo{
+				Name:         topic,
+				MessageCount: 0,
+				Subscribers:  0,
+				Nodes:        nodes,
+			}
+			response.Topics = append(response.Topics, info)
+		}
 	}
 
 	// Set content type and encode response

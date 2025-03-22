@@ -83,6 +83,13 @@ func NewGossipManager(nodeID, bindAddr string, bindPort int, dhtInstance *dht.DH
 	config.ProbeTimeout = 2 * time.Second          // Shorter probe timeout
 	config.ProbeInterval = 1 * time.Second         // More frequent probing
 
+	// Improve failure detection
+	config.SuspicionMult = 3            // Lower suspicion multiplier (default is 4)
+	config.SuspicionMaxTimeoutMult = 4  // Lower max timeout multiplier (default is 6)
+	config.TCPTimeout = 2 * time.Second // Shorter TCP timeout
+	config.RetransmitMult = 2           // Lower retransmit multiplier
+	config.IndirectChecks = 2           // Fewer indirect checks for faster failure detection
+
 	// Use our custom delegate
 	delegate := NewGossipDelegate(dhtInstance, httpPort)
 	config.Delegate = delegate
@@ -244,7 +251,22 @@ func (g *GossipManager) NotifyJoin(node *memberlist.Node) {
 
 // NotifyLeave is called when a node leaves the cluster
 func (g *GossipManager) NotifyLeave(node *memberlist.Node) {
-	log.Printf("[Gossip] Node %s left", logID(node.Name))
+	log.Printf("[Gossip] Node %s left, removing from DHT and notifying all peers", logID(node.Name))
+
+	// Remove the node from the DHT immediately
+	g.dht.RemoveNode(node.Name)
+
+	// Broadcast updated state to all remaining nodes immediately
+	go g.broadcastMetadata()
+
+	// Force a membership update to all peers to ensure they see the change
+	go func() {
+		// Broadcast multiple times to ensure delivery
+		for i := 0; i < 3; i++ {
+			g.broadcastMetadata()
+			time.Sleep(500 * time.Millisecond)
+		}
+	}()
 }
 
 // NotifyUpdate is called when a node information is updated

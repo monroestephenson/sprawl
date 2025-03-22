@@ -50,12 +50,15 @@ func NewStore() *Store {
 
 // initTieredStorage initializes tiered storage based on environment variables
 func (s *Store) initTieredStorage() {
-	// Check if disk storage is enabled
-	diskEnabled := os.Getenv("SPRAWL_STORAGE_DISK_ENABLED") == "true"
+	// Check storage type from environment variable
+	storageType := os.Getenv("SPRAWL_STORAGE_TYPE")
+
+	// Set disk enabled based on storage type
+	diskEnabled := storageType == "disk" || storageType == "s3" || os.Getenv("SPRAWL_STORAGE_DISK_ENABLED") == "true" || os.Getenv("SPRAWL_DISK_STORAGE") == "true"
 	s.diskEnabled = diskEnabled
 
-	// Check if cloud storage is enabled
-	cloudEnabled := os.Getenv("SPRAWL_STORAGE_CLOUD_ENABLED") == "true"
+	// Set cloud enabled based on storage type
+	cloudEnabled := storageType == "s3" || os.Getenv("SPRAWL_STORAGE_CLOUD_ENABLED") == "true"
 	s.cloudEnabled = cloudEnabled
 
 	// If neither is enabled, return early
@@ -89,6 +92,8 @@ func (s *Store) initTieredStorage() {
 	// Set up disk store path
 	diskPath := "/data/rocksdb" // Default path
 	if envPath := os.Getenv("SPRAWL_STORAGE_DISK_PATH"); envPath != "" {
+		diskPath = envPath
+	} else if envPath := os.Getenv("SPRAWL_STORAGE_PATH"); envPath != "" {
 		diskPath = envPath
 	}
 
@@ -530,4 +535,15 @@ func (s *Store) Shutdown() {
 			log.Printf("[Store] Error closing tiered manager: %v", err)
 		}
 	}
+}
+
+// GetStorageType returns the current storage type
+func (s *Store) GetStorageType() string {
+	if s.cloudEnabled {
+		return "s3"
+	}
+	if s.diskEnabled {
+		return "disk"
+	}
+	return "memory"
 }

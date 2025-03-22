@@ -1,0 +1,683 @@
+#!/bin/bash
+set -e
+
+# Enhanced testing script for Sprawl
+# Focuses on storage configurations, high-scale deployments, and failure recovery
+
+# Colors for output
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+TIMESTAMP=$(date +%s)
+LOGS_DIR="enhanced_test_logs_${TIMESTAMP}"
+TEST_RESULTS="${LOGS_DIR}/test_results.txt"
+
+# Base ports for different node ranges
+STORAGE_BASE_PORT=8000
+SCALE_BASE_PORT=8100
+RECOVERY_BASE_PORT=8200
+
+# Create log directories
+mkdir -p ${LOGS_DIR}/{storage,scale,recovery}
+
+# Clean up any existing nodes
+echo -e "${YELLOW}Cleaning up any existing nodes...${NC}"
+pkill -f "sprawl" || echo "No sprawl processes running"
+sleep 2
+
+# Build the binaries if needed
+if [ ! -f "./sprawl" ] || [ ! -f "./sprawlctl" ]; then
+    echo -e "${YELLOW}Building Sprawl binaries...${NC}"
+    go build -o sprawl cmd/sprawl/main.go
+    go build -o sprawlctl cmd/sprawlctl/main.go
+    chmod +x sprawl sprawlctl
+fi
+
+# Initialize test results file
+echo "Sprawl Enhanced Test Results - $(date)" > ${TEST_RESULTS}
+echo "=======================================" >> ${TEST_RESULTS}
+
+# Function to log test results
+log_test_result() {
+    local test_name=$1
+    local test_result=$2
+    local description=$3
+    
+    echo -e "${test_name}: ${test_result}"
+    echo "${test_name}: ${test_result}" >> ${TEST_RESULTS}
+    echo "  ${description}" >> ${TEST_RESULTS}
+    echo "----------------------------------------" >> ${TEST_RESULTS}
+}
+
+# Function to wait for a node to be ready
+wait_for_node() {
+    local port=$1
+    local max_wait=${2:-30}
+    
+    echo -n "Waiting for node on port ${port} "
+    for i in $(seq 1 $max_wait); do
+        if curl -s http://localhost:${port}/health > /dev/null 2>&1; then
+            echo -e "${GREEN}✓${NC}"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo -e "${RED}✗${NC}"
+    return 1
+}
+
+###########################################
+# PART 1: STORAGE CONFIGURATION TESTING
+###########################################
+echo -e "\n${YELLOW}PART 1: STORAGE CONFIGURATION TESTING${NC}"
+echo -e "${BLUE}Testing different storage configurations and transitions${NC}"
+
+# Function to verify storage type
+verify_storage_type() {
+    local port=$1
+    local expected_type=$2
+    local result
+    
+    sleep 5  # Give time for initialization
+    result=$(curl -s http://localhost:${port}/metrics)
+    storage_type=$(echo $result | grep -o '"storage_type":"[^"]*"' | cut -d'"' -f4)
+    
+    if [ "$storage_type" = "$expected_type" ]; then
+        echo -e "${GREEN}Storage type matches expected: ${expected_type}${NC}"
+        return 0
+    else
+        echo -e "${RED}Storage type mismatch: expected ${expected_type}, got ${storage_type}${NC}"
+        return 1
+    fi
+}
+
+# Test 1.1: Memory Storage (Default)
+echo -e "\n${BLUE}Test 1.1: Memory Storage (Default)${NC}"
+./sprawl -bindAddr=127.0.0.1 -bindPort=${STORAGE_BASE_PORT} -httpPort=$((STORAGE_BASE_PORT+70)) > ${LOGS_DIR}/storage/memory.log 2>&1 &
+MEMORY_PID=$!
+
+if wait_for_node $((STORAGE_BASE_PORT+70)); then
+    if verify_storage_type $((STORAGE_BASE_PORT+70)) "memory"; then
+        log_test_result "Memory Storage" "PASSED" "Default storage initialized correctly as memory"
+    else
+        log_test_result "Memory Storage" "FAILED" "Default storage did not initialize as memory"
+    fi
+else
+    log_test_result "Memory Storage" "FAILED" "Node failed to start"
+fi
+
+# Clean up memory node
+kill $MEMORY_PID || true
+sleep 2
+
+# Test 1.2: Disk Storage - Testing with environment variables
+echo -e "\n${BLUE}Test 1.2: Disk Storage via Environment Variables${NC}"
+mkdir -p data/disk_test
+
+# Try different environment variable combinations to find which one works
+export SPRAWL_STORAGE_TYPE=disk
+export SPRAWL_STORAGE_PATH=./data/disk_test
+export SPRAWL_DISK_STORAGE=true
+export SPRAWL_STORAGE_DISK_PATH=./data/disk_test
+
+./sprawl -bindAddr=127.0.0.1 -bindPort=${STORAGE_BASE_PORT} -httpPort=$((STORAGE_BASE_PORT+70)) > ${LOGS_DIR}/storage/disk.log 2>&1 &
+DISK_PID=$!
+
+if wait_for_node $((STORAGE_BASE_PORT+70)); then
+    if verify_storage_type $((STORAGE_BASE_PORT+70)) "disk"; then
+        log_test_result "Disk Storage (ENV)" "PASSED" "Disk storage initialized correctly via environment variables"
+    else
+        log_test_result "Disk Storage (ENV)" "FAILED" "Failed to initialize disk storage via environment variables"
+        echo -e "${YELLOW}Checking logs for disk storage configuration issues...${NC}"
+        grep -i "storage\|disk" ${LOGS_DIR}/storage/disk.log | tail -20
+    fi
+else
+    log_test_result "Disk Storage (ENV)" "FAILED" "Node failed to start with disk storage environment variables"
+fi
+
+# Clean up disk node
+kill $DISK_PID || true
+sleep 2
+
+# Test 1.3: Disk Storage - Testing with command line flags
+echo -e "\n${BLUE}Test 1.3: Disk Storage via Command Line Flags${NC}"
+
+# Try with our new flags
+./sprawl -bindAddr=127.0.0.1 -bindPort=${STORAGE_BASE_PORT} -httpPort=$((STORAGE_BASE_PORT+70)) \
+  -storageType=disk -diskStoragePath=./data/disk_test -memoryMaxSize=104857600 -memoryToDiskAge=60 \
+  > ${LOGS_DIR}/storage/disk_flags.log 2>&1 &
+DISK_FLAGS_PID=$!
+
+if wait_for_node $((STORAGE_BASE_PORT+70)); then
+    if verify_storage_type $((STORAGE_BASE_PORT+70)) "disk"; then
+        log_test_result "Disk Storage (Flags)" "PASSED" "Disk storage initialized correctly via command line flags"
+    else
+        log_test_result "Disk Storage (Flags)" "FAILED" "Failed to initialize disk storage via command line flags"
+        echo -e "${YELLOW}Checking logs for disk storage configuration issues...${NC}"
+        grep -i "storage\|disk" ${LOGS_DIR}/storage/disk_flags.log | tail -20
+    fi
+else
+    log_test_result "Disk Storage (Flags)" "FAILED" "Node failed to start with disk storage command line flags"
+fi
+
+# Clean up disk flags node
+kill $DISK_FLAGS_PID || true
+sleep 2
+
+# Test 1.4: S3/MinIO Storage Configuration
+echo -e "\n${BLUE}Test 1.4: S3/MinIO Storage Configuration${NC}"
+
+# Only run this test if MinIO is running locally, otherwise skip
+if nc -z localhost 9000 2>/dev/null; then
+    ./sprawl -bindAddr=127.0.0.1 -bindPort=${STORAGE_BASE_PORT} -httpPort=$((STORAGE_BASE_PORT+70)) \
+      -storageType=s3 -diskStoragePath=./data/s3_temp \
+      -s3Bucket=sprawl-test -s3Endpoint=localhost:9000 \
+      -s3AccessKey=minioadmin -s3SecretKey=minioadmin \
+      -memoryMaxSize=104857600 -memoryToDiskAge=60 -diskToCloudAge=300 \
+      > ${LOGS_DIR}/storage/s3.log 2>&1 &
+    S3_PID=$!
+
+    if wait_for_node $((STORAGE_BASE_PORT+70)); then
+        if verify_storage_type $((STORAGE_BASE_PORT+70)) "s3"; then
+            log_test_result "S3/MinIO Storage" "PASSED" "S3/MinIO storage initialized correctly"
+        else
+            log_test_result "S3/MinIO Storage" "FAILED" "Failed to initialize S3/MinIO storage"
+            echo -e "${YELLOW}Checking logs for S3 storage configuration issues...${NC}"
+            grep -i "storage\|s3\|minio" ${LOGS_DIR}/storage/s3.log | tail -20
+        fi
+    else
+        log_test_result "S3/MinIO Storage" "FAILED" "Node failed to start with S3/MinIO storage configuration"
+    fi
+
+    # Clean up S3 node
+    kill $S3_PID || true
+    sleep 2
+else
+    echo -e "${YELLOW}Skipping S3/MinIO test as MinIO server is not running on port 9000${NC}"
+    log_test_result "S3/MinIO Storage" "SKIPPED" "MinIO server not available on port 9000"
+fi
+
+###########################################
+# PART 2: LARGE-SCALE DEPLOYMENT TESTING
+###########################################
+echo -e "\n${YELLOW}PART 2: LARGE-SCALE DEPLOYMENT TESTING${NC}"
+echo -e "${BLUE}Testing larger cluster sizes and partition distribution${NC}"
+
+# Function to start multiple nodes
+start_cluster() {
+    local size=$1
+    local base_port=$2
+    local http_base=$3
+    local pids=()
+    
+    # Start seed node
+    echo -e "\n${BLUE}Starting seed node...${NC}"
+    ./sprawl -bindAddr=127.0.0.1 -bindPort=${base_port} -httpPort=${http_base} > ${LOGS_DIR}/scale/node0.log 2>&1 &
+    pids+=($!)
+    
+    if ! wait_for_node ${http_base} 30; then
+        echo -e "${RED}Seed node failed to start. Aborting cluster launch.${NC}"
+        kill ${pids[0]} || true
+        return 1
+    fi
+    
+    # Start remaining nodes
+    for i in $(seq 1 $((size-1))); do
+        echo -e "Starting node $i..."
+        ./sprawl -bindAddr=127.0.0.1 -bindPort=$((base_port+i)) -httpPort=$((http_base+i)) -seeds=127.0.0.1:${base_port} > ${LOGS_DIR}/scale/node${i}.log 2>&1 &
+        pids+=($!)
+        sleep 1
+    done
+    
+    # Wait for all nodes to start
+    echo -e "\n${BLUE}Waiting for all nodes to initialize...${NC}"
+    local all_started=true
+    for i in $(seq 1 $((size-1))); do
+        if ! wait_for_node $((http_base+i)) 30; then
+            echo -e "${RED}Node $i failed to start.${NC}"
+            all_started=false
+        fi
+    done
+    
+    if [ "$all_started" = true ]; then
+        echo -e "${GREEN}All $size nodes started successfully${NC}"
+        # Wait for cluster to form
+        echo "Waiting for cluster to form..."
+        sleep $((size * 2))
+        return 0
+    else
+        echo -e "${RED}Some nodes failed to start.${NC}"
+        return 1
+    fi
+    
+    echo "Node PIDs: ${pids[@]}"
+}
+
+# Function to verify cluster size
+verify_cluster_size() {
+    local port=$1
+    local expected_size=$2
+    local max_retries=${3:-5}
+    local retry_wait=${4:-2}
+    local attempt=1
+    
+    while [ $attempt -le $max_retries ]; do
+        local status=$(curl -s http://localhost:${port}/status)
+        local members=$(echo "$status" | grep -o '"cluster_members":\[[^]]*\]' | grep -o "," | wc -l)
+        members=$((members + 1))
+        
+        if [ "$members" -eq "$expected_size" ]; then
+            echo -e "${GREEN}Cluster size matches expected: ${expected_size}${NC}"
+            return 0
+        else
+            echo -e "${YELLOW}Attempt $attempt: Cluster size mismatch: expected ${expected_size}, got ${members} - waiting for gossip to converge${NC}"
+            
+            if [ $attempt -lt $max_retries ]; then
+                echo "Retrying in $retry_wait seconds..."
+                sleep $retry_wait
+            fi
+            
+            attempt=$((attempt + 1))
+        fi
+    done
+    
+    echo -e "${RED}Cluster size mismatch after $max_retries attempts: expected ${expected_size}, got ${members}${NC}"
+    return 1
+}
+
+# Function to test topic distribution
+test_topic_distribution() {
+    local http_base=$1
+    local size=$2
+    local topics=$3
+    
+    # Subscribe to topics from different nodes
+    echo "Creating $topics topics across the cluster..."
+    for i in $(seq 1 $topics); do
+        local node_idx=$((i % size))
+        curl -s -X POST -H "Content-Type: application/json" \
+             -d "{\"topics\":[\"scale-topic-${i}\"]}" \
+             http://localhost:$((http_base+node_idx))/subscribe > /dev/null
+    done
+    
+    # Give time for topic registrations to propagate
+    sleep $((topics / 5 + 3))
+    
+    # Check topic distribution on all nodes
+    local total_topics=0
+    local node_topics=()
+    
+    for i in $(seq 0 $((size-1))); do
+        local topics_data=$(curl -s http://localhost:$((http_base+i))/topics)
+        local node_topic_count=$(echo "$topics_data" | grep -o '"name"' | wc -l)
+        node_topics[i]=$node_topic_count
+        total_topics=$((total_topics + node_topic_count))
+        echo "Node $i has $(printf "%8d" ${node_topics[i]}) topics"
+    done
+    
+    # Check if all topics are accounted for
+    if [ "$total_topics" -ge "$topics" ]; then
+        echo -e "${GREEN}All topics distributed across the cluster${NC}"
+        
+        # Calculate standard deviation to check distribution balance
+        local sum=0
+        local mean=$((total_topics / size))
+        
+        for i in $(seq 0 $((size-1))); do
+            local diff=$((node_topics[i] - mean))
+            sum=$((sum + diff*diff))
+        done
+        
+        local variance=$((sum / size))
+        echo "Topic distribution variance: $variance"
+        
+        if [ "$variance" -lt "$((topics / 2))" ]; then
+            echo -e "${GREEN}Topics are relatively well-balanced across nodes${NC}"
+            return 0
+        else
+            echo -e "${YELLOW}Topics are not well-balanced across nodes${NC}"
+            return 1
+        fi
+    else
+        echo -e "${RED}Some topics are missing: expected at least ${topics}, got ${total_topics}${NC}"
+        return 1
+    fi
+}
+
+# Test 2.1: Medium Cluster (5 nodes)
+echo -e "\n${BLUE}Test 2.1: Medium Cluster (5 nodes)${NC}"
+if start_cluster 5 ${SCALE_BASE_PORT} $((SCALE_BASE_PORT+70)); then
+    if verify_cluster_size $((SCALE_BASE_PORT+70)) 5; then
+        log_test_result "Medium Cluster Formation (5 nodes)" "PASSED" "All 5 nodes formed a cluster correctly"
+        
+        # Test topic distribution
+        if test_topic_distribution $((SCALE_BASE_PORT+70)) 5 20; then
+            log_test_result "Medium Cluster Topic Distribution" "PASSED" "Topics distributed correctly across 5 nodes"
+        else
+            log_test_result "Medium Cluster Topic Distribution" "FAILED" "Topics not distributed correctly across 5 nodes"
+        fi
+    else
+        log_test_result "Medium Cluster Formation (5 nodes)" "FAILED" "5-node cluster did not form correctly"
+    fi
+else
+    log_test_result "Medium Cluster Formation (5 nodes)" "FAILED" "Failed to start 5-node cluster"
+fi
+
+# Clean up
+pkill -f "sprawl" || echo "No sprawl processes to clean up"
+sleep 3
+
+# Test 2.2: Large Cluster (10 nodes)
+echo -e "\n${BLUE}Test 2.2: Large Cluster (10 nodes)${NC}"
+if start_cluster 10 ${SCALE_BASE_PORT} $((SCALE_BASE_PORT+70)); then
+    if verify_cluster_size $((SCALE_BASE_PORT+70)) 10; then
+        log_test_result "Large Cluster Formation (10 nodes)" "PASSED" "All 10 nodes formed a cluster correctly"
+        
+        # Test topic distribution
+        if test_topic_distribution $((SCALE_BASE_PORT+70)) 10 50; then
+            log_test_result "Large Cluster Topic Distribution" "PASSED" "Topics distributed correctly across 10 nodes"
+        else
+            log_test_result "Large Cluster Topic Distribution" "FAILED" "Topics not distributed correctly across 10 nodes"
+        fi
+    else
+        log_test_result "Large Cluster Formation (10 nodes)" "FAILED" "10-node cluster did not form correctly"
+    fi
+else
+    log_test_result "Large Cluster Formation (10 nodes)" "FAILED" "Failed to start 10-node cluster"
+fi
+
+# Clean up
+pkill -f "sprawl" || echo "No sprawl processes to clean up"
+sleep 3
+
+###########################################
+# PART 3: FAILURE RECOVERY TESTING
+###########################################
+echo -e "\n${YELLOW}PART 3: FAILURE RECOVERY TESTING${NC}"
+echo -e "${BLUE}Testing system behavior during node failures and network partitions${NC}"
+
+# Test 3.1: Single Node Failure and Recovery
+echo -e "\n${BLUE}Test 3.1: Single Node Failure and Recovery${NC}"
+
+# Start a 5-node cluster
+echo "Starting 5-node cluster for failure testing..."
+start_cluster 5 ${RECOVERY_BASE_PORT} $((RECOVERY_BASE_PORT+70))
+
+# Create some topics and publish messages
+echo "Creating topics and publishing messages..."
+for i in {1..5}; do
+    curl -s -X POST -H "Content-Type: application/json" \
+         -d "{\"topics\":[\"recovery-topic-${i}\"]}" \
+         http://localhost:$((RECOVERY_BASE_PORT+70))/subscribe > /dev/null
+         
+    curl -s -X POST -H "Content-Type: application/json" \
+         -d "{\"topic\":\"recovery-topic-${i}\", \"payload\":\"Pre-failure message ${i}\"}" \
+         http://localhost:$((RECOVERY_BASE_PORT+70))/publish > /dev/null
+done
+
+# Let messages propagate
+sleep 5
+
+# Kill node 2 (index 1)
+echo "Killing node 2..."
+NODE2_PORT=$((RECOVERY_BASE_PORT+1))
+NODE2_PROCESS=$(ps aux | grep "sprawl.*-bindPort=${NODE2_PORT}" | grep -v grep | awk '{print $2}')
+
+if [ -n "$NODE2_PROCESS" ]; then
+    echo "Found node 2 process (PID: $NODE2_PROCESS), killing with SIGKILL..."
+    kill -9 $NODE2_PROCESS
+    
+    # Verify that the process was killed
+    sleep 2
+    if ps -p $NODE2_PROCESS > /dev/null; then
+        echo "Warning: Node 2 process is still running!"
+    else
+        echo "Node 2 process successfully terminated."
+    fi
+else
+    echo "Warning: Could not find process for node 2"
+fi
+
+# Give cluster time to detect the node failure
+echo "Waiting for cluster to detect node failure..."
+sleep 10
+
+# Publish more messages after node failure
+echo "Publishing messages after node failure..."
+for i in {1..5}; do
+    curl -s -X POST -H "Content-Type: application/json" \
+         -d "{\"topic\":\"recovery-topic-${i}\", \"payload\":\"Post-failure message ${i}\"}" \
+         http://localhost:$((RECOVERY_BASE_PORT+70))/publish > /dev/null
+done
+
+# Verify cluster adapted to failure
+if verify_cluster_size $((RECOVERY_BASE_PORT+70)) 4; then
+    echo -e "${GREEN}Cluster correctly shows 4 nodes after failure${NC}"
+    
+    # Restart the failed node
+    echo "Restarting failed node..."
+    ./sprawl -bindAddr=127.0.0.1 -bindPort=${NODE2_PORT} -httpPort=$((RECOVERY_BASE_PORT+71)) -seeds=127.0.0.1:${RECOVERY_BASE_PORT} > ${LOGS_DIR}/recovery/node_restart.log 2>&1 &
+    
+    if wait_for_node $((RECOVERY_BASE_PORT+71)) 30; then
+        # Wait for node to rejoin
+        sleep 10
+        
+        # Check if node rejoined
+        if verify_cluster_size $((RECOVERY_BASE_PORT+70)) 5; then
+            log_test_result "Single Node Failure Recovery" "PASSED" "Node successfully rejoined the cluster after failure"
+            
+            # Publish after recovery
+            echo "Publishing messages after recovery..."
+            for i in {1..5}; do
+                curl -s -X POST -H "Content-Type: application/json" \
+                     -d "{\"topic\":\"recovery-topic-${i}\", \"payload\":\"Post-recovery message ${i}\"}" \
+                     http://localhost:$((RECOVERY_BASE_PORT+71))/publish > /dev/null
+            done
+            
+            sleep 5
+        else
+            log_test_result "Single Node Failure Recovery" "FAILED" "Node failed to rejoin the cluster after restart"
+        fi
+    else
+        log_test_result "Single Node Failure Recovery" "FAILED" "Failed to restart the node"
+    fi
+else
+    log_test_result "Single Node Failure Recovery" "FAILED" "Cluster did not adapt correctly to node failure"
+fi
+
+# Clean up
+pkill -f "sprawl" || echo "No sprawl processes to clean up"
+sleep 3
+
+# Test 3.2: Leader Node Failure
+echo -e "\n${BLUE}Test 3.2: Leader Node Failure${NC}"
+
+# Start a 3-node cluster
+echo "Starting 3-node cluster for leader failure testing..."
+start_cluster 3 ${RECOVERY_BASE_PORT} $((RECOVERY_BASE_PORT+70))
+
+# Wait for cluster to stabilize
+sleep 5
+
+# Find the leader node - Check all nodes to ensure consistent leader view
+echo "Detecting current leader..."
+LEADER_ID=""
+MAX_ATTEMPTS=5
+for attempt in $(seq 1 $MAX_ATTEMPTS); do
+    for node in {0..2}; do
+        NODE_PORT=$((RECOVERY_BASE_PORT + 70 + node*2))
+        NODE_STATUS=$(curl -s http://localhost:${NODE_PORT}/status)
+        CURR_LEADER=$(echo "$NODE_STATUS" | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
+        
+        if [ -n "$CURR_LEADER" ]; then
+            if [ -z "$LEADER_ID" ]; then
+                LEADER_ID=$CURR_LEADER
+                LEADER_PORT=$NODE_PORT
+                echo "Leader detected: $LEADER_ID at port $LEADER_PORT"
+            elif [ "$CURR_LEADER" != "$LEADER_ID" ]; then
+                echo "Inconsistent leader view detected. Waiting for cluster to stabilize..."
+                LEADER_ID=""
+                break
+            fi
+        fi
+    done
+    
+    if [ -n "$LEADER_ID" ]; then
+        break
+    fi
+    
+    if [ $attempt -lt $MAX_ATTEMPTS ]; then
+        echo "Retrying leader detection in 2 seconds..."
+        sleep 2
+    fi
+done
+
+if [ -z "$LEADER_ID" ]; then
+    echo "Failed to detect a consistent leader after $MAX_ATTEMPTS attempts."
+    log_test_result "Leader Node Failure Recovery" "FAILED" "Could not determine initial leader"
+    # Clean up and exit this test
+    pkill -f "sprawl" || echo "No sprawl processes to clean up"
+    return
+fi
+
+# Create topics and publish messages
+for i in {1..3}; do
+    curl -s -X POST -H "Content-Type: application/json" \
+         -d "{\"topics\":[\"leader-topic-${i}\"]}" \
+         http://localhost:${LEADER_PORT}/subscribe > /dev/null
+         
+    curl -s -X POST -H "Content-Type: application/json" \
+         -d "{\"topic\":\"leader-topic-${i}\", \"payload\":\"Pre-leader-failure message ${i}\"}" \
+         http://localhost:${LEADER_PORT}/publish > /dev/null
+done
+
+# Let messages propagate
+sleep 5
+
+# Find which process to kill based on the port
+LEADER_PROCESS=$(ps aux | grep "sprawl.*-bindPort=$(($LEADER_PORT-70))" | grep -v grep | awk '{print $2}')
+if [ -n "$LEADER_PROCESS" ]; then
+    echo "Killing leader node (PID: $LEADER_PROCESS)..."
+    kill -9 $LEADER_PROCESS
+else
+    echo "Failed to find leader process for port $(($LEADER_PORT-70))"
+    log_test_result "Leader Node Failure Recovery" "FAILED" "Could not locate leader process"
+    # Clean up and exit this test
+    pkill -f "sprawl" || echo "No sprawl processes to clean up"
+    return
+fi
+
+# Wait for the cluster to detect the failure and elect a new leader
+echo "Waiting for new leader election..."
+sleep 15
+
+# Find a working node to query
+WORKING_PORT=""
+for node in {0..2}; do
+    NODE_PORT=$((RECOVERY_BASE_PORT + 70 + node*2))
+    if [ "$NODE_PORT" != "$LEADER_PORT" ] && curl -s -m 2 http://localhost:${NODE_PORT}/status > /dev/null; then
+        WORKING_PORT=$NODE_PORT
+        break
+    fi
+done
+
+if [ -z "$WORKING_PORT" ]; then
+    echo "Could not find any working nodes after leader failure"
+    log_test_result "Leader Node Failure Recovery" "FAILED" "All nodes are unresponsive after leader failure"
+    # Clean up
+    pkill -f "sprawl" || echo "No sprawl processes to clean up"
+    return
+fi
+
+# Check if a new leader was elected
+NEW_LEADER_ID=""
+for attempt in $(seq 1 $MAX_ATTEMPTS); do
+    NEW_LEADER_RESPONSE=$(curl -s http://localhost:${WORKING_PORT}/status)
+    NEW_LEADER_ID=$(echo "$NEW_LEADER_RESPONSE" | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
+    
+    if [ -n "$NEW_LEADER_ID" ] && [ "$NEW_LEADER_ID" != "$LEADER_ID" ]; then
+        echo "New leader elected: $NEW_LEADER_ID"
+        break
+    fi
+    
+    if [ $attempt -lt $MAX_ATTEMPTS ]; then
+        echo "No new leader detected yet, waiting 2 seconds..."
+        sleep 2
+    fi
+done
+
+if [ -z "$NEW_LEADER_ID" ] || [ "$NEW_LEADER_ID" = "$LEADER_ID" ]; then
+    echo "Failed to detect new leader after original leader failure"
+    log_test_result "Leader Node Failure Recovery" "FAILED" "No new leader elected after leader failure"
+else
+    echo -e "${GREEN}New leader elected after leader failure: $NEW_LEADER_ID${NC}"
+    
+    # Try publishing to the cluster through the working node
+    echo "Publishing messages to cluster through working node..."
+    SUCCESS=true
+    for i in {1..3}; do
+        PUBLISH_RESULT=$(curl -s -X POST -H "Content-Type: application/json" \
+             -d "{\"topic\":\"leader-topic-${i}\", \"payload\":\"Post-leader-failure message ${i}\"}" \
+             http://localhost:${WORKING_PORT}/publish)
+        
+        if ! echo "$PUBLISH_RESULT" | grep -q "success"; then
+            echo "Failed to publish message to topic leader-topic-${i}"
+            SUCCESS=false
+            break
+        fi
+    done
+    
+    if [ "$SUCCESS" = true ]; then
+        log_test_result "Leader Node Failure Recovery" "PASSED" "New leader elected and cluster continued functioning"
+    else
+        log_test_result "Leader Node Failure Recovery" "FAILED" "Cluster could not process messages after leader change"
+    fi
+fi
+
+# Clean up
+pkill -f "sprawl" || echo "No sprawl processes to clean up"
+sleep 3
+
+###########################################
+# SUMMARY
+###########################################
+# Count results
+PASSED_COUNT=$(grep -c "PASSED" ${TEST_RESULTS})
+FAILED_COUNT=$(grep -c "FAILED" ${TEST_RESULTS})
+TOTAL_COUNT=$((PASSED_COUNT + FAILED_COUNT))
+
+echo -e "\n${YELLOW}=== ENHANCED TEST SUMMARY ===${NC}"
+echo -e "Total tests: ${TOTAL_COUNT}"
+echo -e "${GREEN}Passed: ${PASSED_COUNT}${NC}"
+echo -e "${RED}Failed: ${FAILED_COUNT}${NC}"
+echo -e "\nDetailed results stored in: ${TEST_RESULTS}"
+
+# Recommend enhancements based on test results
+echo -e "\n${YELLOW}=== RECOMMENDATIONS ===${NC}"
+
+if grep -q "Disk Storage.*FAILED" ${TEST_RESULTS}; then
+    echo -e "1. ${RED}Implement proper CLI flags for storage configuration:${NC}"
+    echo "   - Add -storageType flag (memory, disk, s3)"
+    echo "   - Add -storagePath flag for path configuration"
+    echo "   - Document all storage options in README.md"
+fi
+
+if grep -q "Topic Distribution.*FAILED" ${TEST_RESULTS}; then
+    echo -e "2. ${RED}Improve topic distribution and partitioning:${NC}"
+    echo "   - Enhance DHT algorithm for more balanced distribution"
+    echo "   - Add explicit partition management endpoints"
+    echo "   - Implement partition visibility in metrics"
+fi
+
+if grep -q "Failure Recovery.*FAILED" ${TEST_RESULTS}; then
+    echo -e "3. ${RED}Enhance failure recovery mechanisms:${NC}"
+    echo "   - Improve leader election algorithms"
+    echo "   - Add automatic state reconciliation after rejoin"
+    echo "   - Implement configurable failure detection timeouts"
+fi
+
+echo -e "\n${GREEN}Testing completed!${NC}" 

@@ -15,6 +15,16 @@ type Options struct {
 	AutoPortAssign        bool // Add auto port assignment option
 	PortRangeStart        int  // Starting port when auto-assigning
 	PortRangeEnd          int  // Ending port when auto-assigning
+	// Storage-related fields
+	StorageType     string
+	DiskStoragePath string
+	S3Bucket        string
+	S3Endpoint      string
+	S3AccessKey     string
+	S3SecretKey     string
+	MemoryMaxSize   uint64
+	MemoryToDiskAge int64
+	DiskToCloudAge  int64
 }
 
 // DefaultOptions returns default node options
@@ -30,5 +40,10 @@ func DefaultOptions() *Options {
 		AutoPortAssign:        true, // Enable auto port assignment by default
 		PortRangeStart:        8080, // Default starting port
 		PortRangeEnd:          8180, // Default ending port
+		StorageType:           "memory",
+		DiskStoragePath:       "./data/disk",
+		MemoryMaxSize:         104857600, // 100MB default
+		MemoryToDiskAge:       3600,      // 1 hour default
+		DiskToCloudAge:        86400,     // 24 hours default
 	}
 }

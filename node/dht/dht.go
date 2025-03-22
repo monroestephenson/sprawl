@@ -369,17 +369,33 @@ func (d *DHT) RegisterNode(topic string, nodeID string, httpPort int) {
 			// Update our own node info
 			existingNode.Address = "127.0.0.1" // Default for local testing
 		}
+
+		// Add topic to the Topics array if not present
+		var hasTopicInArray bool
+		for _, t := range existingNode.Topics {
+			if t == topic {
+				hasTopicInArray = true
+				break
+			}
+		}
+		if !hasTopicInArray {
+			existingNode.Topics = append(existingNode.Topics, topic)
+		}
+
 		d.nodes[nodeID] = existingNode
-		log.Printf("[DHT] Updated node info for %s (HTTP port: %d)", utils.TruncateID(nodeID), httpPort)
+		log.Printf("[DHT] Updated node info for %s (HTTP port: %d, topics: %v)",
+			utils.TruncateID(nodeID), httpPort, existingNode.Topics)
 	} else {
 		// Create new node info
 		nodeInfo := NodeInfo{
 			ID:       nodeID,
 			Address:  "127.0.0.1", // Default for local testing
 			HTTPPort: httpPort,
+			Topics:   []string{topic}, // Add the topic to the Topics array
 		}
 		d.nodes[nodeID] = nodeInfo
-		log.Printf("[DHT] Created new node info for %s (HTTP port: %d)", utils.TruncateID(nodeID), httpPort)
+		log.Printf("[DHT] Created new node info for %s (HTTP port: %d, topics: %v)",
+			utils.TruncateID(nodeID), httpPort, nodeInfo.Topics)
 	}
 
 	// Create or update the node list for this topic
@@ -639,4 +655,48 @@ func (d *DHT) DumpNodeInfo() {
 	}
 
 	log.Printf("[DHT] === End of Node Information Dump ===")
+}
+
+// GetTopicMapByName returns a copy of the topic map with original topic names as keys
+func (d *DHT) GetTopicMapByName() map[string][]string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Create a reverse map from hash -> topic name
+	topicByHash := make(map[string]string)
+
+	// Make a copy with topic names as keys
+	topicMapByName := make(map[string][]string)
+
+	// First pass: build hash->topic mapping
+	for hash, nodes := range d.topicMap {
+		// Extract topic name from the hash through node registrations
+		// For now, we'll use a loop through all topics registered by nodes
+		for _, info := range d.nodes {
+			for _, topic := range info.Topics {
+				if d.HashTopic(topic) == hash {
+					topicByHash[hash] = topic
+					break
+				}
+			}
+			if _, found := topicByHash[hash]; found {
+				break
+			}
+		}
+
+		// If we can't find the original topic name, use the hash
+		if _, found := topicByHash[hash]; !found {
+			topicByHash[hash] = hash
+		}
+
+		// Copy the nodes
+		nodesCopy := make([]string, len(nodes))
+		copy(nodesCopy, nodes)
+
+		// Store with the topic name as key
+		topicName := topicByHash[hash]
+		topicMapByName[topicName] = nodesCopy
+	}
+
+	return topicMapByName
 }
