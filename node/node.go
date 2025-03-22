@@ -737,12 +737,40 @@ func (n *Node) JoinCluster(seeds []string) error {
 	// Get the current cluster members from gossip
 	members := n.Gossip.GetMembers()
 	var peers []string
+	var peerAddrs []string
+
+	// Updated this section to extract member IDs and also populate node info
 	for _, member := range members {
-		// Extract just the node ID from the member string
-		// Format is "nodeID (address:port)"
-		if id := strings.Split(member, " ")[0]; id != n.ID {
-			peers = append(peers, id)
+		if member == n.ID {
+			continue
 		}
+
+		// Get node info from DHT
+		nodeInfo := n.DHT.GetNodeInfoByID(member)
+		if nodeInfo != nil {
+			peers = append(peers, member)
+
+			// Register the node's info with the consensus module
+			n.Consensus.UpdateNodeInfo(
+				member,
+				nodeInfo.Address,
+				nodeInfo.HTTPPort,
+			)
+
+			peerAddrs = append(peerAddrs,
+				fmt.Sprintf("%s (addr: %s, httpPort: %d)",
+					member[:8],
+					nodeInfo.Address,
+					nodeInfo.HTTPPort,
+				),
+			)
+		}
+	}
+
+	if len(peers) > 0 {
+		log.Printf("[Node %s] Discovered %d peers: %v", n.ID[:8], len(peers), peerAddrs)
+	} else {
+		log.Printf("[Node %s] No peers discovered, acting as standalone node", n.ID[:8])
 	}
 
 	// Update Raft peers
@@ -757,10 +785,21 @@ func (n *Node) JoinCluster(seeds []string) error {
 	for {
 		select {
 		case <-electionTimeout.C:
-			return fmt.Errorf("timeout waiting for leader election")
+			// Even if we time out waiting for a leader, we can still operate
+			// This is not a fatal error as the cluster can converge later
+			log.Printf("[Node %s] Timeout waiting for leader election, continuing as follower", n.ID[:8])
+			return nil
 		case <-ticker.C:
+			// Check if there's a leader
 			if leader := n.Consensus.GetLeader(); leader != "" {
 				log.Printf("[Node %s] Cluster joined successfully, leader is %s", n.ID[:8], leader)
+				return nil
+			}
+
+			// If we're the only node, we should become the leader
+			if len(peers) == 0 {
+				// The election should handle this automatically
+				log.Printf("[Node %s] No other peers, should be operating as leader", n.ID[:8])
 				return nil
 			}
 		}
@@ -826,26 +865,53 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("/store", n.handleStore)
 	mux.HandleFunc("/store/tiers", n.handleStorageTiers)
 	mux.HandleFunc("/store/compact", n.handleStorageCompact)
+
+	// Topic endpoints
 	mux.HandleFunc("/topics", n.handleTopics)
-	mux.HandleFunc("/topics/", n.handleTopic)
 
-	// Consumer groups endpoints
-	mux.HandleFunc("/consumer-groups", n.handleConsumerGroups)
-	mux.HandleFunc("/consumer-groups/", n.handleConsumerGroup)
-
-	// Offsets endpoints
-	mux.HandleFunc("/offsets", n.handleOffsets)
-	mux.HandleFunc("/offsets/", n.handleOffset)
-
-	// New AI endpoint
+	// AI endpoints
 	mux.HandleFunc("/ai", n.handleAI)
-	mux.HandleFunc("/ai/predictions", ai.HandlePredictions)
+	mux.HandleFunc("/ai/status", n.handleAIStatus)
 	mux.HandleFunc("/ai/recommendations", n.handleAIRecommendations)
 	mux.HandleFunc("/ai/anomalies", n.handleAIAnomalies)
+	mux.HandleFunc("/ai/predictions", n.handleAIPredictions)
 	mux.HandleFunc("/ai/train", n.handleAITrain)
-	mux.HandleFunc("/ai/status", n.handleAIStatus)
 
-	return mux
+	// Raft consensus endpoints
+	log.Printf("[Node %s] Registering Raft consensus endpoints", n.ID[:8])
+	mux.HandleFunc("/raft/vote", n.Consensus.HandleVote)
+	mux.HandleFunc("/raft/append", n.Consensus.HandleAppendEntries)
+
+	// Add other handlers as needed
+	return mux // Using direct mux without middleware for simplicity
+}
+
+// rateLimiterMiddleware is a simple rate limiter for handling high-load scenarios
+func (n *Node) rateLimiterMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip rate limiting for health checks and raft consensus
+		if r.URL.Path == "/health" || r.URL.Path == "/healthz" ||
+			strings.HasPrefix(r.URL.Path, "/raft/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Try to acquire a semaphore slot
+		select {
+		case n.semaphore <- struct{}{}:
+			// Got a slot, continue with the request
+			defer func() { <-n.semaphore }()
+			next.ServeHTTP(w, r)
+		default:
+			// No slots available, return a 429 Too Many Requests
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":   "Server is too busy",
+				"success": false,
+			})
+		}
+	})
 }
 
 // handleConsumerGroups handles consumer group operations

@@ -257,9 +257,9 @@ func (g *GossipManager) NotifyLeave(node *memberlist.Node) {
 	g.dht.RemoveNode(node.Name)
 
 	// Broadcast updated state to all remaining nodes immediately
-	go g.broadcastMetadata()
+	g.broadcastMetadata()
 
-	// Force a membership update to all peers to ensure they see the change
+	// Force a membership update to all peers to ensure the change propagates
 	go func() {
 		// Broadcast multiple times to ensure delivery
 		for i := 0; i < 3; i++ {

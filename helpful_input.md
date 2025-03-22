@@ -11,3 +11,7 @@ Add specific monitoring endpoints for topic partitioning status
 Implement visualization for partition distribution
 Create real-time metrics for rebalancing operations
 Add logging for partition events and decisions
+
+Failure Recovery - We needed to fix how nodes are removed from the DHT and cluster when they fail. The NotifyLeave method in GossipManager required enhancement to aggressively broadcast updates.
+Message Replication - The leader election component had some issues in real-world scenarios, as seen in the failing leader node failure test.
+Distributed Subscriber Registry - This appears to be implemented but depends on proper node failure detection.

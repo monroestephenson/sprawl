@@ -500,82 +500,38 @@ func (d *DHT) MergeTopicMap(peerMap map[string][]string) {
 	}
 }
 
-// GetNodeInfo returns information about this node
+// GetNodeInfo gets info about the local node
 func (d *DHT) GetNodeInfo() NodeInfo {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	// Default HTTP port
-	const defaultHTTPPort = 8080
-
-	// First, check if our own node info exists
-	if info, ok := d.nodes[d.nodeID]; ok {
-		// If HTTP port is invalid, fix it
-		if info.HTTPPort <= 0 {
-			// Log this issue
-			log.Printf("[DHT] CRITICAL: Own node %s has invalid HTTP port (%d), fixing to %d",
-				utils.TruncateID(d.nodeID), info.HTTPPort, defaultHTTPPort)
-
-			// To fix it properly, we need to update with write lock
-			d.mu.RUnlock()
-			d.mu.Lock()
-
-			// Check again after acquiring write lock
-			if currentInfo, exists := d.nodes[d.nodeID]; exists {
-				currentInfo.HTTPPort = defaultHTTPPort
-				d.nodes[d.nodeID] = currentInfo
-				log.Printf("[DHT] Fixed: Updated own node HTTP port to %d", defaultHTTPPort)
-
-				// Unlock and reacquire read lock
-				d.mu.Unlock()
-				d.mu.RLock()
-
-				// Return the updated info
-				return d.nodes[d.nodeID]
-			}
-
-			// If node doesn't exist anymore (unlikely), create it
-			newInfo := NodeInfo{
-				ID:       d.nodeID,
-				HTTPPort: defaultHTTPPort,
-			}
-
-			d.nodes[d.nodeID] = newInfo
-			log.Printf("[DHT] Created missing own node with HTTP port %d", defaultHTTPPort)
-
-			// Unlock and reacquire read lock
-			d.mu.Unlock()
-			d.mu.RLock()
-
-			return newInfo
-		}
-
-		// Node info exists and has valid HTTP port
-		return info
+	// Return a copy of the node info for the current node
+	nodeID := d.nodeID
+	if node, ok := d.nodes[nodeID]; ok {
+		return node
 	}
 
-	// Our own node info doesn't exist - this is a critical error
-	log.Printf("[DHT] CRITICAL: Own node %s info missing, creating default",
-		utils.TruncateID(d.nodeID))
-
-	// Create default info
-	defaultInfo := NodeInfo{
+	// Return default info if we somehow don't have our own info
+	return NodeInfo{
 		ID:       d.nodeID,
-		HTTPPort: defaultHTTPPort,
+		Address:  "127.0.0.1",
+		Port:     7946,
+		HTTPPort: 8080,
+	}
+}
+
+// GetNodeInfoByID gets info about a specific node by ID
+func (d *DHT) GetNodeInfoByID(nodeID string) *NodeInfo {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Return the node info for the specified node ID
+	if node, ok := d.nodes[nodeID]; ok {
+		nodeCopy := node
+		return &nodeCopy
 	}
 
-	// We need to store this with write lock
-	d.mu.RUnlock()
-	d.mu.Lock()
-
-	d.nodes[d.nodeID] = defaultInfo
-	log.Printf("[DHT] Created default node info with HTTP port %d", defaultHTTPPort)
-
-	// Unlock and reacquire read lock
-	d.mu.Unlock()
-	d.mu.RLock()
-
-	return defaultInfo
+	return nil
 }
 
 // InitializeOwnNode initializes this node's own information in the DHT

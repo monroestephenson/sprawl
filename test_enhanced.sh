@@ -400,245 +400,51 @@ sleep 3
 echo -e "\n${YELLOW}PART 3: FAILURE RECOVERY TESTING${NC}"
 echo -e "${BLUE}Testing system behavior during node failures and network partitions${NC}"
 
+# Clean up any existing nodes before starting failure tests
+pkill -f "sprawl" || echo "No sprawl processes to clean up"
+sleep 3
+
 # Test 3.1: Single Node Failure and Recovery
 echo -e "\n${BLUE}Test 3.1: Single Node Failure and Recovery${NC}"
+echo "Running single node failure test using run_failure_tests.sh..."
 
-# Start a 5-node cluster
-echo "Starting 5-node cluster for failure testing..."
-start_cluster 5 ${RECOVERY_BASE_PORT} $((RECOVERY_BASE_PORT+70))
+# Make sure the script is executable
+chmod +x run_failure_tests.sh
 
-# Create some topics and publish messages
-echo "Creating topics and publishing messages..."
-for i in {1..5}; do
-    curl -s -X POST -H "Content-Type: application/json" \
-         -d "{\"topics\":[\"recovery-topic-${i}\"]}" \
-         http://localhost:$((RECOVERY_BASE_PORT+70))/subscribe > /dev/null
-         
-    curl -s -X POST -H "Content-Type: application/json" \
-         -d "{\"topic\":\"recovery-topic-${i}\", \"payload\":\"Pre-failure message ${i}\"}" \
-         http://localhost:$((RECOVERY_BASE_PORT+70))/publish > /dev/null
-done
+# Run the test script
+./run_failure_tests.sh
+NODE_FAILURE_EXIT_CODE=$?
 
-# Let messages propagate
-sleep 5
-
-# Kill node 2 (index 1)
-echo "Killing node 2..."
-NODE2_PORT=$((RECOVERY_BASE_PORT+1))
-NODE2_PROCESS=$(ps aux | grep "sprawl.*-bindPort=${NODE2_PORT}" | grep -v grep | awk '{print $2}')
-
-if [ -n "$NODE2_PROCESS" ]; then
-    echo "Found node 2 process (PID: $NODE2_PROCESS), killing with SIGKILL..."
-    kill -9 $NODE2_PROCESS
-    
-    # Verify that the process was killed
-    sleep 2
-    if ps -p $NODE2_PROCESS > /dev/null; then
-        echo "Warning: Node 2 process is still running!"
-    else
-        echo "Node 2 process successfully terminated."
-    fi
+# Check if the test was successful based on its exit code
+if [ $NODE_FAILURE_EXIT_CODE -eq 0 ]; then
+    log_test_result "Single Node Failure Recovery" "PASSED" "Node failure was properly detected and handled"
 else
-    echo "Warning: Could not find process for node 2"
+    log_test_result "Single Node Failure Recovery" "FAILED" "Issue with node failure recovery, exit code: $NODE_FAILURE_EXIT_CODE"
 fi
 
-# Give cluster time to detect the node failure
-echo "Waiting for cluster to detect node failure..."
-sleep 10
-
-# Publish more messages after node failure
-echo "Publishing messages after node failure..."
-for i in {1..5}; do
-    curl -s -X POST -H "Content-Type: application/json" \
-         -d "{\"topic\":\"recovery-topic-${i}\", \"payload\":\"Post-failure message ${i}\"}" \
-         http://localhost:$((RECOVERY_BASE_PORT+70))/publish > /dev/null
-done
-
-# Verify cluster adapted to failure
-if verify_cluster_size $((RECOVERY_BASE_PORT+70)) 4; then
-    echo -e "${GREEN}Cluster correctly shows 4 nodes after failure${NC}"
-    
-    # Restart the failed node
-    echo "Restarting failed node..."
-    ./sprawl -bindAddr=127.0.0.1 -bindPort=${NODE2_PORT} -httpPort=$((RECOVERY_BASE_PORT+71)) -seeds=127.0.0.1:${RECOVERY_BASE_PORT} > ${LOGS_DIR}/recovery/node_restart.log 2>&1 &
-    
-    if wait_for_node $((RECOVERY_BASE_PORT+71)) 30; then
-        # Wait for node to rejoin
-        sleep 10
-        
-        # Check if node rejoined
-        if verify_cluster_size $((RECOVERY_BASE_PORT+70)) 5; then
-            log_test_result "Single Node Failure Recovery" "PASSED" "Node successfully rejoined the cluster after failure"
-            
-            # Publish after recovery
-            echo "Publishing messages after recovery..."
-            for i in {1..5}; do
-                curl -s -X POST -H "Content-Type: application/json" \
-                     -d "{\"topic\":\"recovery-topic-${i}\", \"payload\":\"Post-recovery message ${i}\"}" \
-                     http://localhost:$((RECOVERY_BASE_PORT+71))/publish > /dev/null
-            done
-            
-            sleep 5
-        else
-            log_test_result "Single Node Failure Recovery" "FAILED" "Node failed to rejoin the cluster after restart"
-        fi
-    else
-        log_test_result "Single Node Failure Recovery" "FAILED" "Failed to restart the node"
-    fi
-else
-    log_test_result "Single Node Failure Recovery" "FAILED" "Cluster did not adapt correctly to node failure"
-fi
-
-# Clean up
+# Clean up any remaining nodes
 pkill -f "sprawl" || echo "No sprawl processes to clean up"
 sleep 3
 
 # Test 3.2: Leader Node Failure
 echo -e "\n${BLUE}Test 3.2: Leader Node Failure${NC}"
+echo "Running leader node failure test using test_leader_failure.sh..."
 
-# Start a 3-node cluster
-echo "Starting 3-node cluster for leader failure testing..."
-start_cluster 3 ${RECOVERY_BASE_PORT} $((RECOVERY_BASE_PORT+70))
+# Make sure the script is executable
+chmod +x test_leader_failure.sh
 
-# Wait for cluster to stabilize
-sleep 5
+# Run the test script
+./test_leader_failure.sh
+LEADER_FAILURE_EXIT_CODE=$?
 
-# Find the leader node - Check all nodes to ensure consistent leader view
-echo "Detecting current leader..."
-LEADER_ID=""
-MAX_ATTEMPTS=5
-for attempt in $(seq 1 $MAX_ATTEMPTS); do
-    for node in {0..2}; do
-        NODE_PORT=$((RECOVERY_BASE_PORT + 70 + node*2))
-        NODE_STATUS=$(curl -s http://localhost:${NODE_PORT}/status)
-        CURR_LEADER=$(echo "$NODE_STATUS" | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
-        
-        if [ -n "$CURR_LEADER" ]; then
-            if [ -z "$LEADER_ID" ]; then
-                LEADER_ID=$CURR_LEADER
-                LEADER_PORT=$NODE_PORT
-                echo "Leader detected: $LEADER_ID at port $LEADER_PORT"
-            elif [ "$CURR_LEADER" != "$LEADER_ID" ]; then
-                echo "Inconsistent leader view detected. Waiting for cluster to stabilize..."
-                LEADER_ID=""
-                break
-            fi
-        fi
-    done
-    
-    if [ -n "$LEADER_ID" ]; then
-        break
-    fi
-    
-    if [ $attempt -lt $MAX_ATTEMPTS ]; then
-        echo "Retrying leader detection in 2 seconds..."
-        sleep 2
-    fi
-done
-
-if [ -z "$LEADER_ID" ]; then
-    echo "Failed to detect a consistent leader after $MAX_ATTEMPTS attempts."
-    log_test_result "Leader Node Failure Recovery" "FAILED" "Could not determine initial leader"
-    # Clean up and exit this test
-    pkill -f "sprawl" || echo "No sprawl processes to clean up"
-    return
-fi
-
-# Create topics and publish messages
-for i in {1..3}; do
-    curl -s -X POST -H "Content-Type: application/json" \
-         -d "{\"topics\":[\"leader-topic-${i}\"]}" \
-         http://localhost:${LEADER_PORT}/subscribe > /dev/null
-         
-    curl -s -X POST -H "Content-Type: application/json" \
-         -d "{\"topic\":\"leader-topic-${i}\", \"payload\":\"Pre-leader-failure message ${i}\"}" \
-         http://localhost:${LEADER_PORT}/publish > /dev/null
-done
-
-# Let messages propagate
-sleep 5
-
-# Find which process to kill based on the port
-LEADER_PROCESS=$(ps aux | grep "sprawl.*-bindPort=$(($LEADER_PORT-70))" | grep -v grep | awk '{print $2}')
-if [ -n "$LEADER_PROCESS" ]; then
-    echo "Killing leader node (PID: $LEADER_PROCESS)..."
-    kill -9 $LEADER_PROCESS
+# Check if the test was successful based on its exit code
+if [ $LEADER_FAILURE_EXIT_CODE -eq 0 ]; then
+    log_test_result "Leader Node Failure" "PASSED" "Leader failure was properly handled"
 else
-    echo "Failed to find leader process for port $(($LEADER_PORT-70))"
-    log_test_result "Leader Node Failure Recovery" "FAILED" "Could not locate leader process"
-    # Clean up and exit this test
-    pkill -f "sprawl" || echo "No sprawl processes to clean up"
-    return
+    log_test_result "Leader Node Failure" "FAILED" "Issue with leader failure recovery, exit code: $LEADER_FAILURE_EXIT_CODE"
 fi
 
-# Wait for the cluster to detect the failure and elect a new leader
-echo "Waiting for new leader election..."
-sleep 15
-
-# Find a working node to query
-WORKING_PORT=""
-for node in {0..2}; do
-    NODE_PORT=$((RECOVERY_BASE_PORT + 70 + node*2))
-    if [ "$NODE_PORT" != "$LEADER_PORT" ] && curl -s -m 2 http://localhost:${NODE_PORT}/status > /dev/null; then
-        WORKING_PORT=$NODE_PORT
-        break
-    fi
-done
-
-if [ -z "$WORKING_PORT" ]; then
-    echo "Could not find any working nodes after leader failure"
-    log_test_result "Leader Node Failure Recovery" "FAILED" "All nodes are unresponsive after leader failure"
-    # Clean up
-    pkill -f "sprawl" || echo "No sprawl processes to clean up"
-    return
-fi
-
-# Check if a new leader was elected
-NEW_LEADER_ID=""
-for attempt in $(seq 1 $MAX_ATTEMPTS); do
-    NEW_LEADER_RESPONSE=$(curl -s http://localhost:${WORKING_PORT}/status)
-    NEW_LEADER_ID=$(echo "$NEW_LEADER_RESPONSE" | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
-    
-    if [ -n "$NEW_LEADER_ID" ] && [ "$NEW_LEADER_ID" != "$LEADER_ID" ]; then
-        echo "New leader elected: $NEW_LEADER_ID"
-        break
-    fi
-    
-    if [ $attempt -lt $MAX_ATTEMPTS ]; then
-        echo "No new leader detected yet, waiting 2 seconds..."
-        sleep 2
-    fi
-done
-
-if [ -z "$NEW_LEADER_ID" ] || [ "$NEW_LEADER_ID" = "$LEADER_ID" ]; then
-    echo "Failed to detect new leader after original leader failure"
-    log_test_result "Leader Node Failure Recovery" "FAILED" "No new leader elected after leader failure"
-else
-    echo -e "${GREEN}New leader elected after leader failure: $NEW_LEADER_ID${NC}"
-    
-    # Try publishing to the cluster through the working node
-    echo "Publishing messages to cluster through working node..."
-    SUCCESS=true
-    for i in {1..3}; do
-        PUBLISH_RESULT=$(curl -s -X POST -H "Content-Type: application/json" \
-             -d "{\"topic\":\"leader-topic-${i}\", \"payload\":\"Post-leader-failure message ${i}\"}" \
-             http://localhost:${WORKING_PORT}/publish)
-        
-        if ! echo "$PUBLISH_RESULT" | grep -q "success"; then
-            echo "Failed to publish message to topic leader-topic-${i}"
-            SUCCESS=false
-            break
-        fi
-    done
-    
-    if [ "$SUCCESS" = true ]; then
-        log_test_result "Leader Node Failure Recovery" "PASSED" "New leader elected and cluster continued functioning"
-    else
-        log_test_result "Leader Node Failure Recovery" "FAILED" "Cluster could not process messages after leader change"
-    fi
-fi
-
-# Clean up
+# Clean up any remaining nodes
 pkill -f "sprawl" || echo "No sprawl processes to clean up"
 sleep 3
 
