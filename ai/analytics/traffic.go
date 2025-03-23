@@ -1,4 +1,6 @@
 // Package analytics provides data analysis capabilities for Sprawl
+// This file contains implementation for traffic pattern analysis and detection
+
 package analytics
 
 import (
@@ -27,18 +29,38 @@ const (
 
 // PatternProfile represents detected patterns within time series data
 type PatternProfile struct {
-	Type              PatternType
-	PeakTimes         []time.Time
-	TroughTimes       []time.Time
-	AverageValue      float64
-	MinValue          float64
-	MaxValue          float64
+	// Type of pattern (daily, weekly, etc.)
+	Type PatternType
+
+	// Times identified as peaks (high points) in the pattern
+	PeakTimes []time.Time
+
+	// Times identified as troughs (low points) in the pattern
+	TroughTimes []time.Time
+
+	// Average value across the entire dataset
+	AverageValue float64
+
+	// Minimum value in the dataset
+	MinValue float64
+
+	// Maximum value in the dataset
+	MaxValue float64
+
+	// Standard deviation of the data
 	StandardDeviation float64
-	NormalizedPattern []float64 // Values normalized to 0-1 range
-	Confidence        float64   // How confident we are in this pattern (0-1)
+
+	// Values normalized to 0-1 range for pattern comparison
+	NormalizedPattern []float64
+
+	// How confident we are in this pattern (0-1)
+	// Higher values indicate more reliable patterns
+	Confidence float64
 }
 
 // TrafficAnalyzer collects and analyzes message traffic patterns
+// It identifies recurring patterns in data and provides predictions
+// based on those patterns.
 type TrafficAnalyzer struct {
 	mu               sync.RWMutex
 	topicData        map[string][]TimeSeriesPoint
@@ -51,6 +73,9 @@ type TrafficAnalyzer struct {
 }
 
 // NewTrafficAnalyzer creates a new traffic analyzer with the specified settings
+// Parameters:
+//   - analysisInterval: how often to run pattern analysis
+//   - maxPoints: maximum number of data points to store per entity (topic/node)
 func NewTrafficAnalyzer(analysisInterval time.Duration, maxPoints int) *TrafficAnalyzer {
 	if maxPoints <= 0 {
 		maxPoints = 10000 // Default: store up to 10K data points per entity
@@ -68,18 +93,21 @@ func NewTrafficAnalyzer(analysisInterval time.Duration, maxPoints int) *TrafficA
 }
 
 // Start begins periodic pattern analysis
+// This starts a background goroutine that analyzes patterns at regular intervals
 func (ta *TrafficAnalyzer) Start() {
 	log.Println("Starting traffic pattern analyzer...")
 	go ta.analysisLoop()
 }
 
 // Stop halts the analysis process
+// This stops the background goroutine
 func (ta *TrafficAnalyzer) Stop() {
 	log.Println("Stopping traffic pattern analyzer...")
 	close(ta.stopCh)
 }
 
 // analysisLoop periodically analyzes traffic patterns
+// This is an internal function that runs in its own goroutine
 func (ta *TrafficAnalyzer) analysisLoop() {
 	ticker := time.NewTicker(ta.analysisInterval)
 	defer ticker.Stop()
@@ -95,6 +123,7 @@ func (ta *TrafficAnalyzer) analysisLoop() {
 }
 
 // analyzeAllPatterns analyzes patterns for all topics and nodes
+// This is an internal function called periodically by the analysis loop
 func (ta *TrafficAnalyzer) analyzeAllPatterns() {
 	log.Println("Analyzing traffic patterns...")
 
@@ -145,6 +174,13 @@ func (ta *TrafficAnalyzer) analyzeAllPatterns() {
 }
 
 // analyzePattern analyzes time series data to detect patterns of the specified type
+// This is the core pattern detection algorithm.
+// Parameters:
+//   - data: time series data points to analyze
+//   - patternType: type of pattern to look for (daily, weekly, etc.)
+//
+// Returns:
+//   - PatternProfile containing detected pattern characteristics
 func (ta *TrafficAnalyzer) analyzePattern(data []TimeSeriesPoint, patternType PatternType) PatternProfile {
 	profile := PatternProfile{
 		Type:        patternType,
@@ -176,12 +212,7 @@ func (ta *TrafficAnalyzer) analyzePattern(data []TimeSeriesPoint, patternType Pa
 	profile.AverageValue = sum / float64(len(data))
 
 	// Calculate standard deviation
-	varianceSum := 0.0
-	for _, val := range values {
-		diff := val - profile.AverageValue
-		varianceSum += diff * diff
-	}
-	profile.StandardDeviation = math.Sqrt(varianceSum / float64(len(data)))
+	profile.StandardDeviation = calculateStdDev(values, profile.AverageValue)
 
 	// Identify peaks and troughs (simplified algorithm)
 	windowSize := 5 // Look at ±5 points to determine peaks/troughs
@@ -227,14 +258,243 @@ func (ta *TrafficAnalyzer) analyzePattern(data []TimeSeriesPoint, patternType Pa
 	}
 
 	// Update confidence based on quality of data
-	// This would be more sophisticated in a real implementation
-	if len(data) > 100 {
-		profile.Confidence = 0.8
-	} else if len(data) > 50 {
-		profile.Confidence = 0.6
-	}
+	ta.calculatePatternConfidence(&profile, data)
 
 	return profile
+}
+
+// calculatePatternConfidence calculates the confidence for a pattern profile
+// This uses multiple statistical and signal processing techniques to assess
+// how reliable the detected pattern is.
+//
+// Parameters:
+//   - profile: the pattern profile to calculate confidence for
+//   - data: the time series data used to detect the pattern
+func (ta *TrafficAnalyzer) calculatePatternConfidence(profile *PatternProfile, data []TimeSeriesPoint) {
+	if len(data) < 10 {
+		profile.Confidence = 0.3 // Very low confidence with few data points
+		return
+	}
+
+	// Calculate several quality metrics
+	metrics := analyzeTimeSeriesQuality(data, profile.Type)
+
+	// Combine metrics into a confidence score (0-1)
+	// We weight different factors based on their importance
+	confidence := 0.0
+
+	// More data points gives higher confidence, up to a limit
+	dataPointsWeight := 0.3
+	dataPointsScore := math.Min(float64(len(data))/100.0, 1.0)
+	confidence += dataPointsWeight * dataPointsScore
+
+	// Signal-to-noise ratio (higher is better)
+	snrWeight := 0.25
+	confidence += snrWeight * metrics.SignalToNoise
+
+	// Consistency of pattern (lower variance is better)
+	consistencyWeight := 0.25
+	consistencyScore := math.Max(0, 1.0-metrics.NormalizedVariance)
+	confidence += consistencyWeight * consistencyScore
+
+	// Stationarity of the time series (is the pattern stable)
+	stationarityWeight := 0.2
+	confidence += stationarityWeight * metrics.Stationarity
+
+	// Clamp the final confidence value between 0.3 and 0.95
+	// We never want 0 confidence (which would ignore the data)
+	// and we never want 1.0 confidence (absolute certainty)
+	profile.Confidence = math.Max(0.3, math.Min(0.95, confidence))
+}
+
+// TimeSeriesQualityMetrics holds various metrics about the quality of a time series
+// These metrics are used to assess how reliable the pattern detection is.
+type TimeSeriesQualityMetrics struct {
+	// Ratio of signal power to noise power (higher is better)
+	SignalToNoise float64
+
+	// Normalized variance of the signal (lower is better for consistent patterns)
+	NormalizedVariance float64
+
+	// Measure of how stationary the time series is (higher is better for pattern detection)
+	Stationarity float64
+
+	// Strength of seasonality in the data (higher means stronger seasonal patterns)
+	Seasonality float64
+
+	// Strength of trend in the data (higher means stronger trend)
+	TrendStrength float64
+}
+
+// analyzeTimeSeriesQuality calculates various quality metrics for a time series
+// This is a comprehensive quality analysis that helps determine how reliable
+// the pattern detection is.
+//
+// Parameters:
+//   - data: time series data points to analyze
+//   - patternType: type of pattern to look for (daily, weekly, etc.)
+//
+// Returns:
+//   - TimeSeriesQualityMetrics with various quality measures
+func analyzeTimeSeriesQuality(data []TimeSeriesPoint, patternType PatternType) TimeSeriesQualityMetrics {
+	metrics := TimeSeriesQualityMetrics{}
+
+	// Extract values
+	values := make([]float64, len(data))
+	for i, point := range data {
+		values[i] = point.Value
+	}
+
+	// Calculate basic statistics
+	mean := calculateMean(values)
+	stdDev := calculateStdDev(values, mean)
+	// No need to store variance as a separate variable
+
+	// Normalize variance relative to mean (coefficient of variation)
+	// This allows comparison between time series with different scales
+	if mean != 0 {
+		metrics.NormalizedVariance = stdDev / math.Abs(mean)
+	} else {
+		metrics.NormalizedVariance = 1.0
+	}
+
+	// Estimate signal to noise ratio using autocorrelation
+	// Higher autocorrelation generally means higher signal-to-noise ratio
+	// Choose lag based on the pattern type we're looking for
+	lag := 1
+	if patternType == DailyPattern {
+		lag = 24 // For daily patterns, use 24-hour lag
+	} else if patternType == WeeklyPattern {
+		lag = 7 // For weekly patterns, use 7-day lag
+	}
+
+	autocorr := calculateAutocorrelation(values, lag)
+	// Convert autocorrelation to a 0-1 scale
+	metrics.SignalToNoise = (autocorr + 1) / 2
+
+	// Estimate stationarity by comparing statistics in first and second half
+	// A stationary time series has consistent statistical properties over time
+	// This is important for pattern detection reliability
+	halfSize := len(values) / 2
+	if halfSize > 0 {
+		firstHalf := values[:halfSize]
+		secondHalf := values[halfSize:]
+
+		firstMean := calculateMean(firstHalf)
+		secondMean := calculateMean(secondHalf)
+
+		// Use standard deviation and calculate variance
+		firstStdDev := calculateStdDev(firstHalf, firstMean)
+		secondStdDev := calculateStdDev(secondHalf, secondMean)
+
+		firstVar := firstStdDev * firstStdDev
+		secondVar := secondStdDev * secondStdDev
+
+		// Compare means and variances - smaller difference means more stationary
+		meanDiff := math.Abs(firstMean-secondMean) / math.Max(math.Abs(firstMean), math.Abs(secondMean))
+		varDiff := math.Abs(firstVar-secondVar) / math.Max(firstVar, secondVar)
+
+		// Convert to stationarity score (0-1)
+		metrics.Stationarity = 1.0 - math.Min(1.0, (meanDiff+varDiff)/2)
+	} else {
+		metrics.Stationarity = 0.5 // Default for very short series
+	}
+
+	// Advanced: detect seasonality and trend strength
+	seasonalityStrength := detectSeasonalityStrength(values, patternType)
+	metrics.Seasonality = seasonalityStrength
+
+	// If we have a strongly seasonal pattern, increase the signal-to-noise estimate
+	if metrics.Seasonality > 0.7 {
+		metrics.SignalToNoise = math.Max(metrics.SignalToNoise, 0.7)
+	}
+
+	return metrics
+}
+
+// detectSeasonalityStrength estimates the strength of seasonality in a time series
+// Uses a simplified version of STL decomposition (Seasonal-Trend-Loess)
+// to measure how strong the seasonal component is.
+//
+// Parameters:
+//   - values: data values to analyze
+//   - patternType: type of pattern to look for (daily, weekly, etc.)
+//
+// Returns:
+//   - seasonality strength as a value from 0-1 (higher means stronger seasonal pattern)
+func detectSeasonalityStrength(values []float64, patternType PatternType) float64 {
+	if len(values) < 10 {
+		return 0.5 // Not enough data to detect
+	}
+
+	// Choose period length based on pattern type
+	period := 7
+	if patternType == DailyPattern {
+		period = 24
+	} else if patternType == MonthlyPattern {
+		period = 30
+	}
+
+	// Need at least 2 full periods
+	if len(values) < period*2 {
+		return 0.5
+	}
+
+	// Calculate seasonal strength using variance decomposition approach
+	// This is a simplified version of STL decomposition
+
+	// Calculate overall variance
+	mean := calculateMean(values)
+	stdDev := calculateStdDev(values, mean)
+	totalVariance := stdDev * stdDev
+
+	if totalVariance == 0 {
+		return 0 // No variance, no pattern
+	}
+
+	// Calculate seasonal component by averaging values at the same phase
+	seasonalComponent := make([]float64, period)
+
+	// Estimate seasonal component by averaging values at the same phase
+	for i := 0; i < period; i++ {
+		sum := 0.0
+		count := 0
+
+		for j := i; j < len(values); j += period {
+			sum += values[j]
+			count++
+		}
+
+		if count > 0 {
+			seasonalComponent[i] = sum / float64(count)
+		}
+	}
+
+	// Calculate mean of seasonal component
+	seasonalMean := calculateMean(seasonalComponent)
+
+	// Center the seasonal component
+	for i := range seasonalComponent {
+		seasonalComponent[i] -= seasonalMean
+	}
+
+	// Calculate residuals after removing seasonal component
+	residuals := make([]float64, len(values))
+	for i := range values {
+		phase := i % period
+		residuals[i] = values[i] - mean - seasonalComponent[phase]
+	}
+
+	// Calculate residual variance
+	residualMean := calculateMean(residuals)
+	residualStdDev := calculateStdDev(residuals, residualMean)
+	residualVariance := residualStdDev * residualStdDev
+
+	// Strength = 1 - (residual variance / total variance)
+	// Bounded between 0 and 1
+	// This measures how much of the original variance is explained by the seasonal component
+	strength := 1.0 - residualVariance/totalVariance
+	return math.Max(0, math.Min(1, strength))
 }
 
 // AddTopicDataPoint adds a data point for a specific topic
@@ -354,6 +614,15 @@ func (ta *TrafficAnalyzer) GetBusiestTopics(limit int) []string {
 }
 
 // PredictTopicActivity predicts future activity for a topic
+// This uses the detected patterns to forecast expected activity
+// at a specific time in the future.
+//
+// Parameters:
+//   - topic: the topic to predict activity for
+//   - futureTime: the time to predict activity for
+//
+// Returns:
+//   - predicted activity value
 func (ta *TrafficAnalyzer) PredictTopicActivity(topic string, futureTime time.Time) float64 {
 	ta.mu.RLock()
 	defer ta.mu.RUnlock()
@@ -371,12 +640,10 @@ func (ta *TrafficAnalyzer) PredictTopicActivity(topic string, futureTime time.Ti
 	}
 
 	// Simple prediction using time of day pattern
-	// In a real implementation, this would be more sophisticated
 	hourOfDay := futureTime.Hour()
 	dayOfWeek := int(futureTime.Weekday())
 
 	// Use our normalized pattern to predict
-	// This is a simplified approach - real implementation would be more sophisticated
 	if len(dailyPattern.NormalizedPattern) > 0 {
 		// Map the hour to our pattern array
 		idx := (hourOfDay * len(dailyPattern.NormalizedPattern)) / 24

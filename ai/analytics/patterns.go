@@ -4,6 +4,7 @@ package analytics
 import (
 	"log"
 	"math"
+	"sort"
 	"time"
 )
 
@@ -392,33 +393,135 @@ func detectEveningPeakPattern(hourlyData []float64) float64 {
 		return 0
 	}
 
-	// Calculate ratio
-	ratio := eveningAvg / otherAvg
+	// Create TimeSeriesPoint slices for calculateRobustMax and calculatePatternPeriodicity
+	eveningPoints := make([]TimeSeriesPoint, len(eveningHoursValues))
+	for i, val := range eveningHoursValues {
+		eveningPoints[i] = TimeSeriesPoint{Value: val, Timestamp: time.Time{}}
+	}
 
-	// Calculate peak prominence
-	maxEveningValue := 0.0
-	for _, val := range eveningHoursValues {
-		if val > maxEveningValue {
-			maxEveningValue = val
+	// Advanced pattern detection using multiple techniques
+	// 1. Calculate peak prominence with outlier robustness
+	maxEveningValue := calculateRobustMax(eveningPoints)
+
+	// 2. Calculate statistical significance of the evening pattern
+	eveningStdDev := calculateStdDev(eveningHoursValues, eveningAvg)
+	otherStdDev := calculateStdDev(otherHoursValues, otherAvg)
+
+	// Calculate Cohen's d effect size - measure of statistical significance
+	// This measures how many standard deviations apart the means are
+	pooledStdDev := math.Sqrt((eveningStdDev*eveningStdDev + otherStdDev*otherStdDev) / 2)
+	effectSize := math.Abs(eveningAvg-otherAvg) / pooledStdDev
+
+	// 3. Calculate peak prominence ratio with outlier handling
+	peakProminence := maxEveningValue / otherAvg
+
+	// 4. Assess consistency of the pattern
+	eveningCV := eveningStdDev / eveningAvg // Coefficient of variation
+	otherCV := otherStdDev / otherAvg
+
+	// Lower CV means more consistent pattern
+	consistencyScore := 1.0 - math.Min(1.0, (eveningCV/(otherCV+0.001)))
+
+	// 5. Detect periodicity strength using autocorrelation at appropriate lag
+	periodicity := calculatePatternPeriodicity(eveningPoints)
+
+	// Combine multiple factors for a more robust score
+	// Weight different factors based on their importance
+	score := 0.30*math.Max(0, math.Min(1, peakProminence*2)) +
+		0.20*math.Max(0, math.Min(1, effectSize/2.0)) +
+		0.15*consistencyScore +
+		0.15*periodicity
+
+	// Apply sigmoid function for smoother scaling
+	scaledScore := 1.0 / (1.0 + math.Exp(-5.0*(score-0.5)))
+
+	return scaledScore
+}
+
+// calculateRobustMax calculates a robust maximum value from a time series
+// This handles outliers by using a high percentile (95th) instead of the absolute maximum
+// when there are enough data points.
+//
+// Parameters:
+//   - data: the time series data points to analyze
+//
+// Returns:
+//   - a robust maximum value that is resistant to outliers
+func calculateRobustMax(data []TimeSeriesPoint) float64 {
+	if len(data) == 0 {
+		return 0.0
+	}
+
+	// Extract values
+	values := make([]float64, len(data))
+	for i, point := range data {
+		values[i] = point.Value
+	}
+
+	// For small samples, just use the regular maximum
+	if len(values) < 10 {
+		max := values[0]
+		for _, v := range values[1:] {
+			if v > max {
+				max = v
+			}
+		}
+		return max
+	}
+
+	// For larger samples, use a high percentile to ignore outliers
+	// Sort the values
+	sort.Float64s(values)
+
+	// Use 95th percentile as a robust maximum
+	index := int(float64(len(values)) * 0.95)
+	if index >= len(values) {
+		index = len(values) - 1
+	}
+
+	return values[index]
+}
+
+// calculatePatternPeriodicity measures the periodicity of a time series
+// by analyzing its autocorrelation at various lags
+//
+// Parameters:
+//   - data: the time series data points to analyze
+//
+// Returns:
+//   - a periodicity score between 0 and 1, where higher values indicate
+//     stronger periodic patterns
+func calculatePatternPeriodicity(data []TimeSeriesPoint) float64 {
+	if len(data) < 4 {
+		return 0.0
+	}
+
+	// Extract values
+	values := make([]float64, len(data))
+	for i, point := range data {
+		values[i] = point.Value
+	}
+
+	// Calculate autocorrelation at different lags
+	// We'll try several potential periods and take the maximum autocorrelation
+	maxAutocorr := 0.0
+
+	// Try different lags from 2 to half the length
+	maxLag := len(values) / 2
+	if maxLag > 24 {
+		maxLag = 24 // Cap at 24 to avoid overly long computation
+	}
+
+	for lag := 2; lag <= maxLag; lag++ {
+		autocorr := calculateAutocorrelation(values, lag)
+		if autocorr > maxAutocorr {
+			maxAutocorr = autocorr
 		}
 	}
 
-	// Calculate peak prominence ratio
-	peakProminence := maxEveningValue / otherAvg
-
-	// Combine ratio and peak prominence
-	finalScore := ratio*0.7 + peakProminence*0.3
-
-	// Convert to 0-1 score
-	if finalScore >= 2.0 {
-		return 0.9
-	} else if finalScore >= 1.5 {
-		return 0.7
-	} else if finalScore >= 1.2 {
-		return 0.5
-	}
-
-	return 0
+	// Convert autocorrelation (-1 to 1) to a periodicity score (0 to 1)
+	// Only positive autocorrelations indicate periodicity
+	return math.Max(0, maxAutocorr)
 }
 
 // matchWeeklyPattern uses proper analysis to detect weekly patterns
@@ -742,21 +845,203 @@ func (pm *PatternMatcher) GetTopBurstProbabilityEntities(limit int) []MessagePat
 		patterns = append(patterns, pattern)
 	}
 
-	// Sort by burst probability (descending)
-	// In a real implementation, we would use sort.Slice from the sort package
-	// Simple insertion sort for now
-	for i := 1; i < len(patterns); i++ {
-		j := i
-		for j > 0 && patterns[j-1].BurstProbability < patterns[j].BurstProbability {
-			// Swap
-			patterns[j-1], patterns[j] = patterns[j], patterns[j-1]
-			j--
+	// Sort by burst probability (descending) using sort.Slice
+	sort.Slice(patterns, func(i, j int) bool {
+		// We want descending order (higher burst probability first)
+		return patterns[i].BurstProbability > patterns[j].BurstProbability
+	})
+
+	// Limit results if needed
+	if limit > 0 && limit < len(patterns) {
+		return patterns[:limit]
+	}
+	return patterns
+}
+
+// nolint:unused,U1000
+// detectEveningPattern identifies if there's a pattern of higher activity during evening hours (6pm-11pm)
+func detectEveningPattern(data []TimeSeriesPoint) float64 {
+	// Categorize hours
+	eveningHours := []int{18, 19, 20, 21, 22, 23}
+
+	// Separate data points into evening and other hours
+	var eveningPoints, otherPoints []TimeSeriesPoint
+
+	for _, point := range data {
+		hour := point.Timestamp.Hour()
+		isEvening := false
+		for _, h := range eveningHours {
+			if hour == h {
+				isEvening = true
+				break
+			}
+		}
+
+		if isEvening {
+			eveningPoints = append(eveningPoints, point)
+		} else {
+			otherPoints = append(otherPoints, point)
 		}
 	}
 
-	// Return top N
-	if len(patterns) <= limit {
-		return patterns
+	// Extract values for calculations
+	eveningHoursValues := make([]float64, len(eveningPoints))
+	for i, point := range eveningPoints {
+		eveningHoursValues[i] = point.Value
 	}
-	return patterns[:limit]
+
+	otherHoursValues := make([]float64, len(otherPoints))
+	for i, point := range otherPoints {
+		otherHoursValues[i] = point.Value
+	}
+
+	// If we don't have data for both periods, return low confidence
+	if len(eveningHoursValues) == 0 || len(otherHoursValues) == 0 {
+		return 0.3 // Low confidence score
+	}
+
+	// Calculate average values
+	eveningAvg := calculateMean(eveningHoursValues)
+	otherAvg := calculateMean(otherHoursValues)
+
+	// Calculate evening pattern score with multiple factors
+
+	// 1. Calculate peak prominence (ratio of evening to other hours)
+	// Use robust maximum to avoid being skewed by outliers
+	robustMax := calculateRobustMax(data)
+	prominence := (eveningAvg - otherAvg) / robustMax
+
+	// 2. Calculate statistical significance of the evening pattern
+	significance := calculateStatisticalSignificance(eveningHoursValues, otherHoursValues)
+
+	// 3. Calculate effect size using Cohen's d
+	cohensD := calculateEffectSize(eveningHoursValues, otherHoursValues)
+
+	// 4. Calculate consistency (lower coefficient of variation is better)
+	eveningConsistency := 1.0 - calculateCoefficientOfVariation(eveningHoursValues)
+
+	// 5. Detect periodicity strength using autocorrelation at appropriate lag
+	periodicity := calculatePatternPeriodicity(data)
+
+	// Combine multiple factors for a more robust score
+	// Weight different factors based on their importance
+	score := 0.30*math.Max(0, math.Min(1, prominence*2)) +
+		0.20*math.Max(0, math.Min(1, significance/3.0)) +
+		0.20*math.Max(0, math.Min(1, cohensD/1.0)) +
+		0.15*eveningConsistency +
+		0.15*periodicity
+
+	// Apply sigmoid function for smoother scaling
+	scaledScore := 1.0 / (1.0 + math.Exp(-5.0*(score-0.5)))
+
+	return scaledScore
+}
+
+// Helper functions for statistical calculations
+
+// nolint:unused,U1000
+// calculateStatisticalSignificance calculates the statistical significance between two sets of values
+// using a simple t-statistic approximation
+func calculateStatisticalSignificance(values1, values2 []float64) float64 {
+	if len(values1) < 2 || len(values2) < 2 {
+		return 1.0 // Default for small samples
+	}
+
+	// Calculate means
+	mean1 := calculateMean(values1)
+	mean2 := calculateMean(values2)
+
+	// Calculate standard deviations
+	var sd1, sd2 float64
+	sumSquared1 := 0.0
+	for _, v := range values1 {
+		diff := v - mean1
+		sumSquared1 += diff * diff
+	}
+	sd1 = math.Sqrt(sumSquared1 / float64(len(values1)-1))
+
+	sumSquared2 := 0.0
+	for _, v := range values2 {
+		diff := v - mean2
+		sumSquared2 += diff * diff
+	}
+	sd2 = math.Sqrt(sumSquared2 / float64(len(values2)-1))
+
+	// Calculate standard error
+	se := math.Sqrt((sd1 * sd1 / float64(len(values1))) + (sd2 * sd2 / float64(len(values2))))
+
+	// Calculate t-statistic
+	if se == 0 {
+		return 3.0 // High significance for zero variance (to avoid division by zero)
+	}
+
+	tStat := math.Abs(mean1-mean2) / se
+
+	return tStat
+}
+
+// nolint:unused,U1000
+// calculateEffectSize calculates Cohen's d effect size between two sets of values
+func calculateEffectSize(values1, values2 []float64) float64 {
+	if len(values1) == 0 || len(values2) == 0 {
+		return 0.0
+	}
+
+	// Calculate means
+	mean1 := calculateMean(values1)
+	mean2 := calculateMean(values2)
+
+	// Calculate pooled standard deviation
+	var sumSquared1, sumSquared2 float64
+	for _, v := range values1 {
+		diff := v - mean1
+		sumSquared1 += diff * diff
+	}
+
+	for _, v := range values2 {
+		diff := v - mean2
+		sumSquared2 += diff * diff
+	}
+
+	// Calculate pooled variance
+	pooledVariance := (sumSquared1 + sumSquared2) / float64(len(values1)+len(values2)-2)
+
+	// Handle case of zero variance
+	if pooledVariance == 0 {
+		if mean1 == mean2 {
+			return 0.0
+		}
+		return 2.0 // Large effect size for different means with no variance
+	}
+
+	// Calculate Cohen's d
+	d := math.Abs(mean1-mean2) / math.Sqrt(pooledVariance)
+
+	return d
+}
+
+// nolint:unused,U1000
+// calculateCoefficientOfVariation calculates the coefficient of variation for a set of values
+func calculateCoefficientOfVariation(values []float64) float64 {
+	if len(values) < 2 {
+		return 0.0
+	}
+
+	mean := calculateMean(values)
+
+	if mean == 0 {
+		return 1.0 // Maximum variation when mean is zero
+	}
+
+	// Calculate standard deviation
+	sumSquared := 0.0
+	for _, v := range values {
+		diff := v - mean
+		sumSquared += diff * diff
+	}
+
+	stdDev := math.Sqrt(sumSquared / float64(len(values)))
+
+	// Return coefficient of variation (CV)
+	return stdDev / math.Abs(mean)
 }

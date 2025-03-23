@@ -14,6 +14,7 @@ import (
 
 	"sprawl/ai/analytics"
 	"sprawl/ai/prediction"
+	"sprawl/store"
 
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
@@ -391,12 +392,45 @@ type StoreMetrics struct {
 
 // getStoreMetrics collects metrics from the message store
 func getStoreMetrics() StoreMetrics {
-	// In a production implementation, this would query the actual store
-	// For now, we'll return a simulated store metrics object
+	// Get a reference to the global store
+	globalStore := store.GetGlobalStore()
+	if globalStore == nil {
+		log.Println("Warning: Store not available for metrics collection, using simulated data")
+		return simulateStoreMetrics()
+	}
 
-	// Since we can't directly access the store, we'll use simulated metrics
-	// In a real implementation, the store would be injected or accessible
-	return simulateStoreMetrics()
+	// Initialize metrics object
+	metrics := StoreMetrics{
+		MessageCounts: make(map[string]int),
+	}
+
+	// Get list of topics from the store
+	topics := globalStore.GetTopics()
+
+	metrics.Topics = topics
+	totalMessages := 0
+
+	// Collect message counts for each topic
+	for _, topic := range topics {
+		// Get messages from store to count them
+		messages, err := globalStore.GetTopicMessages(topic)
+		if err != nil {
+			log.Printf("Error getting messages for topic %s: %v", topic, err)
+			continue
+		}
+
+		// Count total messages
+		messageCount := len(messages)
+		metrics.MessageCounts[topic] = messageCount
+		totalMessages += messageCount
+
+		// Get subscriber count - using the method that exists in the store
+		subsCount := globalStore.GetSubscriberCountForTopic(topic)
+		log.Printf("Topic %s has %d subscribers", topic, subsCount)
+	}
+
+	metrics.TotalMessages = totalMessages
+	return metrics
 }
 
 // simulateStoreMetrics returns simulated store metrics

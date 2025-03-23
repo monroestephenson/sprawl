@@ -2,6 +2,8 @@
 package analytics
 
 import (
+	"math"
+	"sort"
 	"time"
 )
 
@@ -135,16 +137,22 @@ func AggregatePoints(points []TimeSeriesPoint, method Aggregation, interval time
 			}
 		case CountAggregation:
 			aggregatedValue = float64(len(bucket))
-		case P95Aggregation, P99Aggregation:
-			// Extract values
+		case P95Aggregation:
 			values := make([]float64, len(bucket))
 			for i, p := range bucket {
 				values[i] = p.Value
 			}
 
-			// For percentiles, we would normally sort and calculate
-			// Simplified implementation for now
-			aggregatedValue = bucket[len(bucket)-1].Value
+			// Calculate 95th percentile properly
+			aggregatedValue = calculatePercentile(values, 95)
+		case P99Aggregation:
+			values := make([]float64, len(bucket))
+			for i, p := range bucket {
+				values[i] = p.Value
+			}
+
+			// Calculate 99th percentile properly
+			aggregatedValue = calculatePercentile(values, 99)
 		default:
 			// Default to average
 			sum := 0.0
@@ -164,4 +172,28 @@ func AggregatePoints(points []TimeSeriesPoint, method Aggregation, interval time
 	}
 
 	return result
+}
+
+// calculatePercentile computes the requested percentile from a slice of values
+func calculatePercentile(values []float64, percentile float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+
+	// Sort the values
+	sort.Float64s(values)
+
+	// Calculate the index for the percentile
+	// We use the Nearest Rank method: https://en.wikipedia.org/wiki/Percentile#The_Nearest-Rank_method
+	index := int(math.Ceil((percentile/100)*float64(len(values)))) - 1
+
+	// Boundary check
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(values) {
+		index = len(values) - 1
+	}
+
+	return values[index]
 }
