@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -124,6 +125,10 @@ func (tc *testCluster) getLeader() (*RaftNode, *ReplicationManager) {
 }
 
 func TestRaftLeaderElection(t *testing.T) {
+	// Set test mode environment variable
+	os.Setenv("SPRAWL_TEST_MODE", "1")
+	defer os.Unsetenv("SPRAWL_TEST_MODE")
+
 	cluster := newTestCluster(3)
 	cluster.start()
 	defer cluster.stop()
@@ -176,6 +181,10 @@ LeaderElected:
 }
 
 func TestReplication(t *testing.T) {
+	// Set test mode environment variable
+	os.Setenv("SPRAWL_TEST_MODE", "1")
+	defer os.Unsetenv("SPRAWL_TEST_MODE")
+
 	cluster := newTestCluster(3)
 	cluster.start()
 	defer cluster.stop()
@@ -247,6 +256,10 @@ LeaderElected:
 }
 
 func TestReplicationWithNodeFailure(t *testing.T) {
+	// Set test mode environment variable
+	os.Setenv("SPRAWL_TEST_MODE", "1")
+	defer os.Unsetenv("SPRAWL_TEST_MODE")
+
 	cluster := newTestCluster(3)
 	cluster.start()
 	defer cluster.stop()

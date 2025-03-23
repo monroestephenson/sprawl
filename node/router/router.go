@@ -231,6 +231,7 @@ PROCESS_MESSAGE:
 		}
 		if err := r.store.Publish(storeMsg); err != nil {
 			log.Printf("[Router] Error publishing message %s to local store: %v", truncateID(msg.ID), err)
+			return err
 		}
 
 		msgState.Destinations[r.nodeID] = true

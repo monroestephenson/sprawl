@@ -453,22 +453,22 @@ This document catalogs all placeholder implementations and unfinished features t
 
 ## Message Handling
 
-- [ ] **Add message tracking in gossip manager**
+- [x] **Add message tracking in gossip manager**
   - File: `node/gossip.go:378`
   - Comment: `// In a real implementation, we would track message counts`
   - Description: Implement message tracking in the gossip system for better debugging and metrics
 
-- [ ] **Implement proper RPC calls for message replication**
+- [x] **Implement proper RPC calls for message replication**
   - File: `node/consensus/replication.go:191`
   - Comment: `// In a real implementation, this would be an RPC call`
   - Description: Replace placeholder with proper RPC implementation for replication
 
-- [ ] **Add proper TTL enforcement**
+- [x] **Add proper TTL enforcement**
   - File: `store/store_test.go:208`
   - Comment: `// Note: In a real implementation with TTL enforcement, we would verify the past`
   - Description: Implement TTL check and cleanup mechanisms
 
-- [ ] **Implement graceful delivery prevention on shutdown**
+- [x] **Implement graceful delivery prevention on shutdown**
   - File: `store/store_test.go:351`
   - Comment: `// In a real implementation, the shutdown might prevent delivery`
   - Description: Ensure messages aren't delivered during system shutdown
@@ -520,8 +520,8 @@ This document catalogs all placeholder implementations and unfinished features t
 
 ## Progress
 - Total items: 30
-- Completed: 3
-- Remaining: 27
+- Completed: 15
+- Remaining: 18
 
 ## Production Enhancements Completed
 

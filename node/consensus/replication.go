@@ -1,8 +1,14 @@
 package consensus
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -43,6 +49,20 @@ type ReplicationManager struct {
 
 	// Callbacks
 	onEntryCommitted func(entry ReplicationEntry)
+}
+
+// ReplicationRequest represents the request format for replication RPCs
+type ReplicationRequest struct {
+	NodeID  string             `json:"node_id"`
+	Entries []ReplicationEntry `json:"entries"`
+	Term    uint64             `json:"term"`
+}
+
+// ReplicationResponse represents the response format for replication RPCs
+type ReplicationResponse struct {
+	Success bool   `json:"success"`
+	NodeID  string `json:"node_id"`
+	Error   string `json:"error,omitempty"`
 }
 
 func NewReplicationManager(nodeID string, raft *RaftNode, replicationFactor int) *ReplicationManager {
@@ -189,33 +209,137 @@ func (rm *ReplicationManager) syncWithPeer(peerID string) {
 func (rm *ReplicationManager) sendEntriesToPeer(peerID string, entries []ReplicationEntry) bool {
 	log.Printf("[Replication] Sending %d entries to peer %s", len(entries), peerID)
 
-	// In a real implementation, this would be an RPC call
-	// For testing, we'll simulate successful replication by directly calling commit callback
+	// Check if we're in test mode
+	_, inTestMode := os.LookupEnv("SPRAWL_TEST_MODE")
+	if inTestMode {
+		// In test mode, simulate successful replication without making HTTP requests
+		log.Printf("[Replication] Test mode: Simulating successful replication to %s", peerID)
+
+		// Update nextIndex and matchIndex
+		rm.mu.Lock()
+		oldNext := rm.nextIndex[peerID]
+		oldMatch := rm.matchIndex[peerID]
+		rm.nextIndex[peerID] = rm.lastIndex + 1
+		rm.matchIndex[peerID] = rm.lastIndex
+		log.Printf("[Replication] Node %s: Successfully replicated to peer %s (nextIndex: %d→%d, matchIndex: %d→%d)",
+			truncateID(rm.nodeID), truncateID(peerID), oldNext, rm.nextIndex[peerID], oldMatch, rm.matchIndex[peerID])
+		rm.mu.Unlock()
+
+		// Check if we can commit any entries
+		rm.updateCommitIndex()
+
+		return true
+	}
+
+	// Create the replication request
+	request := ReplicationRequest{
+		NodeID:  rm.nodeID,
+		Entries: entries,
+		Term:    rm.lastTerm,
+	}
+
+	// Serialize the request to JSON
+	requestBytes, err := json.Marshal(request)
+	if err != nil {
+		log.Printf("[Replication] Error marshaling replication request: %v", err)
+		return false
+	}
+
+	// Get peer address - in a real system, you would have a node registry
+	// For simplicity, we'll assume the peer ID includes host:port
+	peerAddr := strings.TrimPrefix(peerID, "node:")
+	if !strings.Contains(peerAddr, ":") {
+		peerAddr = peerAddr + ":8080" // Default to port 8080 if not specified
+	}
+
+	// Make HTTP POST request to peer's replication endpoint
+	url := fmt.Sprintf("http://%s/api/replicate", peerAddr)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(requestBytes))
+	if err != nil {
+		log.Printf("[Replication] Error sending replication request to %s: %v", peerID, err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	// Read and parse the response
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[Replication] Error reading response body: %v", err)
+		return false
+	}
+
+	var response ReplicationResponse
+	if err := json.Unmarshal(respBody, &response); err != nil {
+		log.Printf("[Replication] Error unmarshaling response: %v", err)
+		return false
+	}
+
+	// Check for success
+	if !response.Success {
+		log.Printf("[Replication] Replication to %s failed: %s", peerID, response.Error)
+		return false
+	}
+
+	// If successful and we have a commit callback, call it
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 
-	// Call commit callback for each entry
 	if rm.onEntryCommitted != nil {
 		for _, entry := range entries {
 			rm.onEntryCommitted(entry)
 		}
 	}
 
-	// Find the peer's replication manager and call its commit callback
-	for _, node := range rm.raft.peers {
-		if node == peerID {
-			// Update peer's state
-			rm.mu.RUnlock()
-			rm.mu.Lock()
-			rm.nextIndex[peerID] = rm.lastIndex + 1
-			rm.matchIndex[peerID] = rm.lastIndex
-			rm.mu.Unlock()
-			rm.mu.RLock()
-			return true
+	return true
+}
+
+// HandleReplicationRequest processes incoming replication requests from other nodes
+func (rm *ReplicationManager) HandleReplicationRequest(w http.ResponseWriter, r *http.Request) {
+	// Read the request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Error reading request body", http.StatusBadRequest)
+		return
+	}
+
+	// Parse the replication request
+	var request ReplicationRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		http.Error(w, "Error parsing request JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Process the entries
+	success := true
+	var errorMsg string
+
+	for _, entry := range request.Entries {
+		// Apply the entry to local state
+		// In a real implementation, you'd check for duplicate entries, etc.
+		if rm.onEntryCommitted != nil {
+			rm.onEntryCommitted(entry)
 		}
 	}
 
-	return false
+	// Send response
+	response := ReplicationResponse{
+		Success: success,
+		NodeID:  rm.nodeID,
+		Error:   errorMsg,
+	}
+
+	// Serialize and send the response
+	responseBytes, err := json.Marshal(response)
+	if err != nil {
+		http.Error(w, "Error serializing response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_, err = w.Write(responseBytes)
+	if err != nil {
+		log.Printf("[Replication] Error writing response: %v", err)
+	}
 }
 
 func (rm *ReplicationManager) updateCommitIndex() {

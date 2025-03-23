@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"sync"
 	"time"
 
 	"sprawl/node/dht"
@@ -29,6 +30,10 @@ type GossipManager struct {
 	startTime time.Time
 	isLeader  bool
 	bindAddr  string
+
+	// Add a field to track message counts
+	messageCountMu sync.RWMutex
+	messageCount   int64
 }
 
 // GossipMetadata represents the metadata gossiped between nodes
@@ -369,6 +374,13 @@ func (g *GossipManager) getMemUsage() float64 {
 	return memoryUsagePercent
 }
 
+// AddMessageCount increments the message counter by the specified amount
+func (g *GossipManager) AddMessageCount(count int) {
+	g.messageCountMu.Lock()
+	defer g.messageCountMu.Unlock()
+	g.messageCount += int64(count)
+}
+
 // getMessageCount returns the total message count processed by this node
 func (g *GossipManager) getMessageCount() int {
 	// If dht is nil, return 0
@@ -376,13 +388,7 @@ func (g *GossipManager) getMessageCount() int {
 		return 0
 	}
 
-	// In a real implementation, we would track message counts
-	// For now, return an estimate based on topic count
-	topicMap := g.dht.GetTopicMap()
-	if topicMap == nil {
-		return 0
-	}
-
-	// Estimate 10 messages per topic
-	return len(topicMap) * 10
+	g.messageCountMu.RLock()
+	defer g.messageCountMu.RUnlock()
+	return int(g.messageCount)
 }
