@@ -201,7 +201,13 @@ func (m *Manager) handleMemoryPressure(level int32) {
 
 // archiveLoop periodically checks for messages to archive
 func (m *Manager) archiveLoop() {
-	ticker := time.NewTicker(m.policy.ArchiveInterval)
+	// Ensure archive interval is positive
+	interval := m.policy.ArchiveInterval
+	if interval <= 0 {
+		interval = time.Minute // Default to 1 minute if not set or negative
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	defer close(m.done)
 

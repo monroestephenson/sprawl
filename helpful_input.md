@@ -30,3 +30,6 @@ Single Node Failure Recovery
 Leader Node Failure
 The modifications we made to the NotifyLeave method in GossipManager are working correctly - the system properly detects when a node fails and removes it from the cluster. Additionally, our enhancements to the test scripts with proper timeouts and exit codes have made the tests more reliable.
 I also notice from the logs that the leader election is functioning - we can see vote requests being sent and granted between nodes after the leader fails, and the system continues to operate successfully even after a leader node failure.
+Unit tests for individual components
+Integration tests for end-to-end flows
+Failure mode testing (broker failures, etc.)

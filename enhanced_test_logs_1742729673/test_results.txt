@@ -1,4 +1,4 @@
-Sprawl Enhanced Test Results - Sun Mar 23 11:23:04 CET 2025
+Sprawl Enhanced Test Results - Sun Mar 23 12:34:35 CET 2025
 =======================================
 Memory Storage: PASSED
   Default storage initialized correctly as memory
@@ -23,4 +23,7 @@ Large Cluster Formation (10 nodes): PASSED
 ----------------------------------------
 Large Cluster Topic Distribution: PASSED
   Topics distributed correctly across 10 nodes
+----------------------------------------
+Single Node Failure Recovery: PASSED
+  Node failure was properly detected and handled
 ----------------------------------------

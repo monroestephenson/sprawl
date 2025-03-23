@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -243,23 +244,44 @@ func (s *Store) Unsubscribe(topic string, callback SubscriberFunc) error {
 		return errors.New("topic not found")
 	}
 
-	// Find and remove the subscriber
+	// Store the callback in a variable with concrete memory address
+	// so we can reference it consistently
+	callbackToRemove := callback
+
+	// Find and remove the subscriber by function identity
 	found := false
+	newSubs := make([]SubscriberFunc, 0, len(subs))
+
 	for i, sub := range subs {
-		// This is a simplistic comparison and might not work in all cases
-		// A proper implementation would use a subscription ID or similar
-		if &sub == &callback {
-			s.subscribers[topic] = append(s.subscribers[topic][:i], s.subscribers[topic][i+1:]...)
+		// In Go, we can't compare function values for equality directly.
+		// Since subscribers are registered by function reference, we need
+		// to iterate over each one and build a new slice without the target.
+		// We use the function pointer itself as an indicator.
+
+		// Skip the current subscriber (to remove it)
+		if fmt.Sprintf("%p", sub) == fmt.Sprintf("%p", callbackToRemove) {
+			// Found the subscriber to remove
 			found = true
-			s.metrics.RecordSubscriptionRemoved(topic)
-			break
+			log.Printf("[Store] Removing subscriber at index %d from topic %s", i, topic)
+			continue
 		}
+
+		// Keep this subscriber
+		newSubs = append(newSubs, sub)
 	}
 
 	if !found {
 		return errors.New("subscriber not found")
 	}
 
+	// Update the subscribers list
+	s.subscribers[topic] = newSubs
+
+	// Record unsubscription in metrics
+	s.metrics.RecordSubscriptionRemoved(topic)
+
+	log.Printf("[Store] Removed subscriber from topic %s, %d subscribers remain",
+		topic, len(newSubs))
 	return nil
 }
 
