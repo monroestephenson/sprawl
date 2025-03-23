@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 // CloudConfig holds configuration for cloud storage
@@ -184,6 +188,43 @@ type CloudMetrics struct {
 	uploadErrors       uint64
 	currentBatchSize   uint64
 	totalBytesUploaded uint64
+
+	// Added new metrics for retries and errors
+	retryAttempts    uint64
+	retrySuccess     uint64
+	networkErrors    uint64
+	throttlingEvents uint64
+	latencySum       uint64 // For calculating average latency
+	latencyCount     uint64
+
+	// Cloud provider specific metrics
+	providerName string
+	regionName   string
+	cacheHits    uint64
+	cacheMisses  uint64
+}
+
+// CloudProviderType identifies the detected cloud provider
+type CloudProviderType string
+
+const (
+	ProviderAWS    CloudProviderType = "aws"
+	ProviderGCP    CloudProviderType = "gcp"
+	ProviderAzure  CloudProviderType = "azure"
+	ProviderMinIO  CloudProviderType = "minio"
+	ProviderCustom CloudProviderType = "custom"
+)
+
+// CloudProvider encapsulates provider-specific optimizations and detection
+type CloudProvider struct {
+	Type              CloudProviderType
+	Name              string
+	Region            string
+	IsCommercial      bool
+	IsLocalhost       bool
+	SupportsMultipart bool
+	MaxPartSize       int64
+	EndpointFormat    string
 }
 
 type messageBatch struct {
@@ -210,28 +251,52 @@ func NewCloudStore(cfg CloudConfig) (*CloudStore, error) {
 		return nil, fmt.Errorf("bucket must be set")
 	}
 
-	// Create AWS config
-	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-		return aws.Endpoint{
-			URL:               "http://" + cfg.Endpoint,
-			SigningRegion:     cfg.Region,
-			HostnameImmutable: true,
-		}, nil
-	})
+	// Detect cloud provider for optimizations
+	provider := detectCloudProvider(cfg.Endpoint, cfg.Region)
+	log.Printf("[CloudStore] Detected cloud provider: %s in region %s", provider.Name, provider.Region)
 
-	awsCfg, err := config.LoadDefaultConfig(context.Background(),
-		config.WithRegion(cfg.Region),
-		config.WithEndpointResolverWithOptions(customResolver),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, "")),
-	)
+	// Create AWS config with provider-specific optimizations
+	var awsCfg aws.Config
+	var err error
+
+	if provider.IsLocalhost {
+		// Local MinIO/Custom S3 setup
+		customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:               "http://" + cfg.Endpoint,
+				SigningRegion:     cfg.Region,
+				HostnameImmutable: true,
+			}, nil
+		})
+
+		awsCfg, err = config.LoadDefaultConfig(context.Background(),
+			config.WithRegion(cfg.Region),
+			config.WithEndpointResolverWithOptions(customResolver),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, "")),
+		)
+	} else {
+		// Commercial cloud provider - use standard config loading with region
+		awsCfg, err = config.LoadDefaultConfig(context.Background(),
+			config.WithRegion(cfg.Region),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, "")),
+		)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	// Create S3 client with path-style addressing
-	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.UsePathStyle = true
-	})
+	// Create S3 client with path-style addressing for MinIO, standard for AWS S3
+	clientOptions := []func(*s3.Options){}
+
+	// Apply provider-specific client options
+	if provider.Type == ProviderMinIO || provider.Type == ProviderCustom {
+		clientOptions = append(clientOptions, func(o *s3.Options) {
+			o.UsePathStyle = true
+		})
+	}
+
+	client := s3.NewFromConfig(awsCfg, clientOptions...)
 
 	// Ensure bucket exists
 	_, err = client.HeadBucket(context.Background(), &s3.HeadBucketInput{
@@ -273,6 +338,12 @@ func NewCloudStore(cfg CloudConfig) (*CloudStore, error) {
 		cfg.IndexPath = "./data/cloud_index"
 	}
 
+	// Create cloud metrics with provider info
+	metrics := &CloudMetrics{
+		providerName: string(provider.Type),
+		regionName:   provider.Region,
+	}
+
 	// Create a new LRU cache for ID to object mappings
 	// Use a reasonable default size if not specified
 	cacheSize := 10000
@@ -280,10 +351,12 @@ func NewCloudStore(cfg CloudConfig) (*CloudStore, error) {
 
 	// Create the CloudStore instance
 	cs := &CloudStore{
-		client:     client,
-		config:     cfg,
-		metrics:    &CloudMetrics{},
-		batch:      &messageBatch{messages: make([]Message, 0, cfg.BatchSize)},
+		client:  client,
+		config:  cfg,
+		metrics: metrics,
+		batch: &messageBatch{
+			messages: make([]Message, 0, cfg.BatchSize),
+		},
 		uploadCh:   make(chan []Message, cfg.UploadWorkers),
 		doneCh:     make(chan struct{}),
 		idMappings: &idMappingCache{cache: cache},
@@ -312,6 +385,73 @@ func NewCloudStore(cfg CloudConfig) (*CloudStore, error) {
 	}
 
 	return cs, nil
+}
+
+// detectCloudProvider attempts to determine which cloud provider is being used
+func detectCloudProvider(endpoint, region string) CloudProvider {
+	provider := CloudProvider{
+		Type:              ProviderCustom,
+		Name:              "Custom S3-compatible",
+		Region:            region,
+		IsCommercial:      false,
+		IsLocalhost:       false,
+		SupportsMultipart: true,
+		MaxPartSize:       5 * 1024 * 1024 * 1024, // 5GB default
+		EndpointFormat:    "%s.s3.%s.amazonaws.com",
+	}
+
+	// Check for localhost/custom endpoints
+	if strings.Contains(endpoint, "localhost") ||
+		strings.Contains(endpoint, "127.0.0.1") ||
+		strings.Contains(endpoint, "0.0.0.0") {
+		provider.Type = ProviderMinIO
+		provider.Name = "MinIO (local)"
+		provider.IsLocalhost = true
+		provider.MaxPartSize = 5 * 1024 * 1024 * 1024 // 5GB
+		return provider
+	}
+
+	// Check for standard AWS domains
+	if strings.HasSuffix(endpoint, "amazonaws.com") {
+		provider.Type = ProviderAWS
+		provider.Name = "Amazon S3"
+		provider.IsCommercial = true
+		provider.SupportsMultipart = true
+		provider.MaxPartSize = 5 * 1024 * 1024 * 1024 // 5GB
+		return provider
+	}
+
+	// Check for GCP
+	if strings.Contains(endpoint, "storage.googleapis.com") {
+		provider.Type = ProviderGCP
+		provider.Name = "Google Cloud Storage"
+		provider.IsCommercial = true
+		provider.SupportsMultipart = true
+		provider.MaxPartSize = 5 * 1024 * 1024 * 1024 // 5GB
+		provider.EndpointFormat = "storage.googleapis.com/%s"
+		return provider
+	}
+
+	// Check for Azure
+	if strings.Contains(endpoint, "blob.core.windows.net") {
+		provider.Type = ProviderAzure
+		provider.Name = "Azure Blob Storage"
+		provider.IsCommercial = true
+		provider.SupportsMultipart = true
+		provider.MaxPartSize = 4 * 1024 * 1024 * 1024 // 4GB for Azure
+		provider.EndpointFormat = "%s.blob.core.windows.net"
+		return provider
+	}
+
+	// Check for MinIO in non-localhost mode
+	if strings.Contains(endpoint, "minio") {
+		provider.Type = ProviderMinIO
+		provider.Name = "MinIO"
+		provider.SupportsMultipart = true
+		return provider
+	}
+
+	return provider
 }
 
 // Store uploads messages to cloud storage
@@ -888,16 +1028,44 @@ func (cs *CloudStore) GetTopicMessages(topic string) ([]Message, error) {
 	return result, nil
 }
 
-// GetMetrics returns current metrics
+// GetMetrics returns detailed metrics about the cloud store
 func (cs *CloudStore) GetMetrics() map[string]interface{} {
-	return map[string]interface{}{
-		"messages_uploaded":    cs.metrics.messagesUploaded,
-		"messages_fetched":     cs.metrics.messagesFetched,
-		"batches_uploaded":     cs.metrics.batchesUploaded,
-		"upload_errors":        cs.metrics.uploadErrors,
-		"current_batch_size":   cs.metrics.currentBatchSize,
-		"total_bytes_uploaded": cs.metrics.totalBytesUploaded,
+	metrics := make(map[string]interface{})
+
+	// Basic operation metrics
+	metrics["messages_uploaded"] = atomic.LoadUint64(&cs.metrics.messagesUploaded)
+	metrics["messages_fetched"] = atomic.LoadUint64(&cs.metrics.messagesFetched)
+	metrics["batches_uploaded"] = atomic.LoadUint64(&cs.metrics.batchesUploaded)
+	metrics["upload_errors"] = atomic.LoadUint64(&cs.metrics.uploadErrors)
+	metrics["total_bytes_uploaded"] = atomic.LoadUint64(&cs.metrics.totalBytesUploaded)
+
+	// Reliability metrics
+	metrics["retry_attempts"] = atomic.LoadUint64(&cs.metrics.retryAttempts)
+	metrics["retry_success"] = atomic.LoadUint64(&cs.metrics.retrySuccess)
+	metrics["network_errors"] = atomic.LoadUint64(&cs.metrics.networkErrors)
+	metrics["throttling_events"] = atomic.LoadUint64(&cs.metrics.throttlingEvents)
+
+	// Current state
+	metrics["current_batch_size"] = atomic.LoadUint64(&cs.metrics.currentBatchSize)
+
+	// Latency calculation
+	latencySum := atomic.LoadUint64(&cs.metrics.latencySum)
+	latencyCount := atomic.LoadUint64(&cs.metrics.latencyCount)
+	var avgLatency uint64 = 0
+	if latencyCount > 0 {
+		avgLatency = latencySum / latencyCount
 	}
+	metrics["average_latency_ms"] = avgLatency
+
+	// Cache metrics
+	metrics["cache_hits"] = atomic.LoadUint64(&cs.metrics.cacheHits)
+	metrics["cache_misses"] = atomic.LoadUint64(&cs.metrics.cacheMisses)
+
+	// Provider info
+	metrics["provider"] = cs.metrics.providerName
+	metrics["region"] = cs.metrics.regionName
+
+	return metrics
 }
 
 // Close stops the batch uploader and upload workers
@@ -1003,4 +1171,149 @@ func (cs *CloudStore) ListTopics() ([]string, error) {
 	cs.topicIndex.mu.Unlock()
 
 	return topics, nil
+}
+
+// retry is a helper function that implements exponential backoff for S3 operations
+func (cs *CloudStore) retry(operation string, f func() error) error {
+	backoff := 100 * time.Millisecond
+	maxBackoff := 10 * time.Second
+	maxRetries := 5
+	retries := 0
+
+	var err error
+	for retries < maxRetries {
+		startTime := time.Now()
+		err = f()
+		duration := time.Since(startTime)
+
+		// Track operation latency
+		atomic.AddUint64(&cs.metrics.latencySum, uint64(duration.Milliseconds()))
+		atomic.AddUint64(&cs.metrics.latencyCount, 1)
+
+		if err == nil {
+			return nil
+		}
+
+		// Check if the error is retryable
+		if !isRetryableError(err) {
+			log.Printf("[CloudStore] Non-retryable error in %s: %v", operation, err)
+			return err
+		}
+
+		// Track retry metrics
+		atomic.AddUint64(&cs.metrics.retryAttempts, 1)
+
+		// Check for specific error types for metrics
+		if strings.Contains(strings.ToLower(err.Error()), "timeout") ||
+			strings.Contains(strings.ToLower(err.Error()), "connection") {
+			atomic.AddUint64(&cs.metrics.networkErrors, 1)
+		}
+
+		if strings.Contains(strings.ToLower(err.Error()), "throttl") ||
+			strings.Contains(strings.ToLower(err.Error()), "too many requests") ||
+			strings.Contains(strings.ToLower(err.Error()), "rate exceeded") {
+			atomic.AddUint64(&cs.metrics.throttlingEvents, 1)
+		}
+
+		// Log the retry
+		retries++
+		if retries < maxRetries {
+			log.Printf("[CloudStore] Retrying %s after error (attempt %d/%d): %v",
+				operation, retries, maxRetries, err)
+
+			// Apply jitter to backoff to avoid thundering herd
+			jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+			sleepTime := backoff + jitter
+			time.Sleep(sleepTime)
+
+			// Increase backoff for next retry
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+
+	log.Printf("[CloudStore] Failed %s after %d retries: %v", operation, maxRetries, err)
+	return fmt.Errorf("operation %s failed after %d retries: %w", operation, maxRetries, err)
+}
+
+// isRetryableError determines if an error is retryable
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for network errors that are typically temporary
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+
+	// Extract AWS S3 error code if possible
+	var awsErr smithy.APIError
+	if errors.As(err, &awsErr) {
+		// Check if the error code indicates a retryable condition
+		code := awsErr.ErrorCode()
+
+		// Check if the error code indicates a retryable condition
+		retryableCodes := []string{
+			"RequestTimeout", "RequestTimeTooSkewed", "InternalError",
+			"ServiceUnavailable", "ThrottlingException", "ProvisionedThroughputExceeded",
+			"RequestLimitExceeded", "TooManyRequests", "SlowDown",
+		}
+
+		for _, retryableCode := range retryableCodes {
+			if code == retryableCode {
+				return true
+			}
+		}
+	}
+
+	// Check error message for known patterns
+	errMsg := err.Error()
+	retryablePatterns := []string{
+		"timeout", "connection reset", "connection refused", "no such host",
+		"network", "operation timed out", "deadline exceeded", "connection closed",
+		"EOF", "broken pipe", "canceled", "503", "5xx", "429",
+		"status code: 5", "status code: 429",
+	}
+
+	for _, pattern := range retryablePatterns {
+		if strings.Contains(strings.ToLower(errMsg), pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// FetchObject fetches an object from S3/MinIO
+func (cs *CloudStore) FetchObject(objKey string) ([]byte, error) {
+	return cs.fetchObjectWithRetry(objKey)
+}
+
+// fetchObjectWithRetry fetches an object from S3/MinIO with retries
+func (cs *CloudStore) fetchObjectWithRetry(objKey string) ([]byte, error) {
+	var data []byte
+
+	err := cs.retry("FetchObject", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Get object
+		resp, err := cs.client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(cs.config.Bucket),
+			Key:    aws.String(objKey),
+		})
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		// Read response body
+		data, err = io.ReadAll(resp.Body)
+		return err
+	})
+
+	return data, err
 }

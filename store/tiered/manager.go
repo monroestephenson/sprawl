@@ -529,20 +529,12 @@ func (m *Manager) GetDiskTopics() ([]string, error) {
 
 // GetCloudTopics returns the list of topics stored in the cloud tier
 func (m *Manager) GetCloudTopics() ([]string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	if m.cloudStore == nil {
 		return nil, fmt.Errorf("cloud storage not enabled")
 	}
 
 	// Use the improved topic listing method from cloud store
-	topics, err := m.cloudStore.ListTopics()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list topics from cloud store: %w", err)
-	}
-
-	return topics, nil
+	return m.cloudStore.ListTopics()
 }
 
 // GetDiskMessageCount returns the number of messages for a topic in the disk tier
