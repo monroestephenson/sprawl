@@ -529,3 +529,113 @@ func (rs *RocksStore) DeleteMessages(messageIDs []string) error {
 
 	return nil
 }
+
+// QueryFilter defines filtering parameters for message queries
+type QueryFilter struct {
+	Topic           string     // Filter by topic
+	TimestampBefore *time.Time // Messages before this time
+	TimestampAfter  *time.Time // Messages after this time
+	Limit           int        // Max number of messages to return
+	Offset          int        // Offset for pagination
+}
+
+// ListTopics lists all topics in the store
+func (rs *RocksStore) ListTopics() ([]string, error) {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+
+	topics := make(map[string]struct{})
+
+	// Create iterator options
+	readOpts := grocksdb.NewDefaultReadOptions()
+	it := rs.db.NewIterator(readOpts)
+	defer it.Close()
+	defer readOpts.Destroy()
+
+	// Prefix for topic keys
+	prefix := []byte("topic:")
+
+	// Iterate through all keys starting with the topic prefix
+	for it.Seek(prefix); it.Valid(); it.Next() {
+		key := it.Key()
+		keyData := key.Data()
+
+		// Check if key has the topic prefix
+		if bytes.HasPrefix(keyData, prefix) {
+			// Extract topic name from key
+			topicName := string(keyData[len(prefix):])
+			topics[topicName] = struct{}{}
+		}
+
+		key.Free()
+	}
+
+	// Convert map to slice
+	result := make([]string, 0, len(topics))
+	for topic := range topics {
+		result = append(result, topic)
+	}
+
+	return result, nil
+}
+
+// QueryMessages returns messages matching the given filter
+func (rs *RocksStore) QueryMessages(filter *QueryFilter) ([]Message, error) {
+	if filter == nil {
+		return nil, errors.New("filter cannot be nil")
+	}
+
+	// If no topic is specified, return an error
+	if filter.Topic == "" {
+		return nil, errors.New("topic must be specified in filter")
+	}
+
+	// Get all message IDs for the topic
+	messageIDs, err := rs.GetTopicMessages(filter.Topic)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get message IDs for topic: %w", err)
+	}
+
+	// Apply limit and offset
+	limit := len(messageIDs)
+	if filter.Limit > 0 && filter.Limit < limit {
+		limit = filter.Limit
+	}
+
+	offset := filter.Offset
+	if offset >= len(messageIDs) {
+		return []Message{}, nil // Nothing to return
+	}
+
+	// Apply offset and limit
+	end := offset + limit
+	if end > len(messageIDs) {
+		end = len(messageIDs)
+	}
+
+	// Slice to hold filtered messages
+	filteredMessages := make([]Message, 0, end-offset)
+
+	// Retrieve each message and apply time filters
+	for _, msgID := range messageIDs[offset:end] {
+		msg, err := rs.Retrieve(msgID)
+		if err != nil {
+			// Log the error but continue with other messages
+			fmt.Printf("Error retrieving message %s: %v\n", msgID, err)
+			continue
+		}
+
+		// Apply timestamp filters
+		if filter.TimestampBefore != nil && !msg.Timestamp.Before(*filter.TimestampBefore) {
+			continue
+		}
+		if filter.TimestampAfter != nil && !msg.Timestamp.After(*filter.TimestampAfter) {
+			continue
+		}
+
+		// Message passed all filters
+		filteredMessages = append(filteredMessages, *msg)
+	}
+
+	return filteredMessages, nil
+}

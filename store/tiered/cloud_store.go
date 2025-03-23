@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,11 +29,140 @@ type CloudConfig struct {
 	SecretAccessKey       string
 	Bucket                string
 	Region                string
+	UseSSL                bool
 	BatchSize             int
 	BatchTimeout          time.Duration
 	RetentionPeriod       time.Duration
 	UploadWorkers         int
 	EnablePersistentIndex bool
+	IndexPath             string // Path to store persistent index files
+}
+
+// lruNode represents an entry in the LRU cache
+type lruNode struct {
+	key   string
+	value string
+	prev  *lruNode
+	next  *lruNode
+}
+
+// simpleLRU is a simple LRU cache implementation without external dependencies
+type simpleLRU struct {
+	capacity int
+	size     int
+	cache    map[string]*lruNode
+	head     *lruNode // Most recently used
+	tail     *lruNode // Least recently used
+	mu       sync.RWMutex
+}
+
+// newSimpleLRU creates a new LRU cache with the given capacity
+func newSimpleLRU(capacity int) *simpleLRU {
+	return &simpleLRU{
+		capacity: capacity,
+		size:     0,
+		cache:    make(map[string]*lruNode, capacity),
+		head:     nil,
+		tail:     nil,
+	}
+}
+
+// Get retrieves a value from the cache
+func (l *simpleLRU) Get(key string) (string, bool) {
+	l.mu.RLock()
+	node, found := l.cache[key]
+	l.mu.RUnlock()
+
+	if !found {
+		return "", false
+	}
+
+	// Move to front (mark as most recently used)
+	l.mu.Lock()
+	l.moveToFront(node)
+	l.mu.Unlock()
+
+	return node.value, true
+}
+
+// Add adds a new key-value pair to the cache
+func (l *simpleLRU) Add(key, value string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Check if key already exists
+	if node, found := l.cache[key]; found {
+		// Update value and move to front
+		node.value = value
+		l.moveToFront(node)
+		return
+	}
+
+	// Create new node
+	node := &lruNode{
+		key:   key,
+		value: value,
+	}
+
+	// Add to cache
+	l.cache[key] = node
+
+	// If this is the first entry
+	if l.head == nil {
+		l.head = node
+		l.tail = node
+		l.size = 1
+		return
+	}
+
+	// Add to front of list
+	node.next = l.head
+	l.head.prev = node
+	l.head = node
+	l.size++
+
+	// If over capacity, remove least recently used
+	if l.size > l.capacity {
+		// Remove tail
+		delete(l.cache, l.tail.key)
+		l.tail = l.tail.prev
+		if l.tail != nil {
+			l.tail.next = nil
+		}
+		l.size--
+	}
+}
+
+// moveToFront moves a node to the front of the list (marks it as most recently used)
+func (l *simpleLRU) moveToFront(node *lruNode) {
+	// Already at front
+	if node == l.head {
+		return
+	}
+
+	// Remove from current position
+	if node.prev != nil {
+		node.prev.next = node.next
+	}
+	if node.next != nil {
+		node.next.prev = node.prev
+	}
+
+	// If it was the tail, update tail
+	if node == l.tail {
+		l.tail = node.prev
+	}
+
+	// Move to front
+	node.prev = nil
+	node.next = l.head
+	l.head.prev = node
+	l.head = node
+}
+
+// idMappingCache uses LRU cache for ID to object mappings
+type idMappingCache struct {
+	cache *simpleLRU
 }
 
 // CloudStore implements cloud storage using S3/MinIO
@@ -42,7 +173,7 @@ type CloudStore struct {
 	batch      *messageBatch
 	uploadCh   chan []Message
 	doneCh     chan struct{}
-	idMappings *idMappings
+	idMappings *idMappingCache
 	topicIndex *topicIndex
 }
 
@@ -59,11 +190,6 @@ type messageBatch struct {
 	messages []Message
 	size     int64
 	mu       sync.Mutex
-}
-
-type idMappings struct {
-	mappings map[string]string
-	mu       sync.RWMutex
 }
 
 type topicIndex struct {
@@ -142,19 +268,33 @@ func NewCloudStore(cfg CloudConfig) (*CloudStore, error) {
 		}
 	}
 
+	// Set a default index path if not provided
+	if cfg.EnablePersistentIndex && cfg.IndexPath == "" {
+		cfg.IndexPath = "./data/cloud_index"
+	}
+
+	// Initialize LRU cache for ID to object mappings
+	cache := newSimpleLRU(100000) // 100K entries
+
 	cs := &CloudStore{
-		client:   client,
-		config:   cfg,
-		metrics:  &CloudMetrics{},
-		batch:    &messageBatch{},
-		uploadCh: make(chan []Message, cfg.UploadWorkers),
-		doneCh:   make(chan struct{}),
-		idMappings: &idMappings{
-			mappings: make(map[string]string),
-		},
+		client:     client,
+		config:     cfg,
+		metrics:    &CloudMetrics{},
+		batch:      &messageBatch{messages: make([]Message, 0, cfg.BatchSize)},
+		uploadCh:   make(chan []Message, 100),
+		doneCh:     make(chan struct{}),
+		idMappings: &idMappingCache{cache: cache},
 		topicIndex: &topicIndex{
 			topics: make(map[string]struct{}),
 		},
+	}
+
+	// Load existing mappings from disk if persistent index is enabled
+	if cfg.EnablePersistentIndex {
+		if err := cs.loadMappingsFromDisk(); err != nil {
+			// Log but continue - this is non-fatal
+			log.Printf("Warning: Failed to load ID mappings from disk: %v", err)
+		}
 	}
 
 	// Start upload workers
@@ -164,6 +304,11 @@ func NewCloudStore(cfg CloudConfig) (*CloudStore, error) {
 
 	// Start batch uploader
 	go cs.batchUploader()
+
+	// Start periodic persistence if enabled
+	if cfg.EnablePersistentIndex {
+		cs.StartPeriodicPersistence(5 * time.Minute)
+	}
 
 	return cs, nil
 }
@@ -311,15 +456,14 @@ func (cs *CloudStore) Retrieve(id string) (*Message, error) {
 	return nil, fmt.Errorf("message %s not found in cloud storage", id)
 }
 
-// findObjectKeyForMessage tries to find which object contains a message by its ID
+// findObjectKeyForMessage looks up the object key for a message ID
 func (cs *CloudStore) findObjectKeyForMessage(id string) (string, error) {
-	// Check our in-memory cache first
-	cs.idMappings.mu.RLock()
-	if key, exists := cs.idMappings.mappings[id]; exists {
-		cs.idMappings.mu.RUnlock()
-		return key, nil
+	// First check our ID mapping cache
+	objKey, found := cs.idMappings.cache.Get(id)
+
+	if found {
+		return objKey, nil
 	}
-	cs.idMappings.mu.RUnlock()
 
 	// If we have a metadata index, search it
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -412,34 +556,119 @@ func (cs *CloudStore) retrieveMessageFromBatch(objKey string, messageID string) 
 
 // saveIDToObjectMapping saves a mapping from message ID to object key for faster lookups
 func (cs *CloudStore) saveIDToObjectMapping(id string, objKey string) {
-	cs.idMappings.mu.Lock()
-	cs.idMappings.mappings[id] = objKey
-	cs.idMappings.mu.Unlock()
+	cs.idMappings.cache.Add(id, objKey)
 
-	// If we have too many mappings, evict oldest (would use LRU in production)
-	const maxMappings = 100000 // Cap at 100K entries to avoid unbounded growth
-	if len(cs.idMappings.mappings) > maxMappings {
-		// Simple eviction strategy - remove random entries
-		// In production, you'd use an LRU cache or persistence
-		cs.idMappings.mu.Lock()
-		toDelete := len(cs.idMappings.mappings) - maxMappings
-		deleted := 0
-		for k := range cs.idMappings.mappings {
-			if deleted >= toDelete {
-				break
-			}
-			delete(cs.idMappings.mappings, k)
-			deleted++
-		}
-		cs.idMappings.mu.Unlock()
+	// In a production implementation, we would periodically persist this mapping to disk
+	// if the persistent index option is enabled
+	if cs.config.EnablePersistentIndex {
+		go cs.persistMappingsToDisk()
+	}
+}
+
+// persistMappingsToDisk persists the ID-to-object mappings to disk
+func (cs *CloudStore) persistMappingsToDisk() {
+	if !cs.config.EnablePersistentIndex {
+		return
 	}
 
-	// In a production implementation, periodically persist this mapping to disk
-	// or a database to survive restarts. Example:
-	//
-	// if cs.config.EnablePersistentIndex {
-	//     cs.persistMappingsToDisk()
-	// }
+	// Create the directory if it doesn't exist
+	if err := os.MkdirAll(cs.config.IndexPath, 0755); err != nil {
+		log.Printf("Error creating index directory: %v", err)
+		return
+	}
+
+	// Prepare mappings file path
+	mappingsPath := filepath.Join(cs.config.IndexPath, "id_mappings.json")
+	tempPath := mappingsPath + ".tmp"
+
+	// Get a snapshot of the current mappings
+	cs.idMappings.cache.mu.RLock()
+	mappings := make(map[string]string, len(cs.idMappings.cache.cache))
+	for key, node := range cs.idMappings.cache.cache {
+		mappings[key] = node.value
+	}
+	cs.idMappings.cache.mu.RUnlock()
+
+	// Marshal to JSON
+	data, err := json.MarshalIndent(mappings, "", "  ")
+	if err != nil {
+		log.Printf("Error marshaling ID mappings: %v", err)
+		return
+	}
+
+	// Write to temp file first
+	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+		log.Printf("Error writing ID mappings to temp file: %v", err)
+		return
+	}
+
+	// Atomically rename to final file
+	if err := os.Rename(tempPath, mappingsPath); err != nil {
+		log.Printf("Error renaming temp mappings file: %v", err)
+		// Try to clean up
+		os.Remove(tempPath)
+		return
+	}
+
+	log.Printf("Successfully persisted %d ID mappings to disk", len(mappings))
+}
+
+// loadMappingsFromDisk loads ID-to-object mappings from disk
+func (cs *CloudStore) loadMappingsFromDisk() error {
+	if !cs.config.EnablePersistentIndex {
+		return nil
+	}
+
+	mappingsPath := filepath.Join(cs.config.IndexPath, "id_mappings.json")
+
+	// Check if file exists
+	if _, err := os.Stat(mappingsPath); os.IsNotExist(err) {
+		// No file yet, not an error
+		return nil
+	}
+
+	// Read the file
+	data, err := os.ReadFile(mappingsPath)
+	if err != nil {
+		return fmt.Errorf("failed to read mappings file: %w", err)
+	}
+
+	// Unmarshal the data
+	var mappings map[string]string
+	if err := json.Unmarshal(data, &mappings); err != nil {
+		return fmt.Errorf("failed to unmarshal mappings: %w", err)
+	}
+
+	// Load into cache
+	for id, objKey := range mappings {
+		cs.idMappings.cache.Add(id, objKey)
+	}
+
+	log.Printf("Loaded %d ID mappings from disk", len(mappings))
+	return nil
+}
+
+// StartPeriodicPersistence starts a goroutine to periodically persist mappings to disk
+func (cs *CloudStore) StartPeriodicPersistence(interval time.Duration) {
+	if !cs.config.EnablePersistentIndex {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				cs.persistMappingsToDisk()
+			case <-cs.doneCh:
+				// Final persistence before shutdown
+				cs.persistMappingsToDisk()
+				return
+			}
+		}
+	}()
 }
 
 // addTopicToIndex records a topic in our internal index for faster topic listing
@@ -685,4 +914,83 @@ func (cs *CloudStore) Close() error {
 	close(cs.uploadCh)
 
 	return nil
+}
+
+// ListTopics returns a list of all topics stored in the cloud
+func (cs *CloudStore) ListTopics() ([]string, error) {
+	// First, check the in-memory topic index
+	cs.topicIndex.mu.RLock()
+	if len(cs.topicIndex.topics) > 0 {
+		topics := make([]string, 0, len(cs.topicIndex.topics))
+		for topic := range cs.topicIndex.topics {
+			topics = append(topics, topic)
+		}
+		cs.topicIndex.mu.RUnlock()
+		return topics, nil
+	}
+	cs.topicIndex.mu.RUnlock()
+
+	// If our in-memory index is empty, scan the bucket
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Use the S3 client to list the topics (which are prefixes in our storage scheme)
+	// We use the delimiter-based approach to list "directories" (which are our topics)
+	input := &s3.ListObjectsV2Input{
+		Bucket:    &cs.config.Bucket,
+		Delimiter: aws.String("/"),
+	}
+
+	// Keep track of unique topics
+	topicsMap := make(map[string]struct{})
+
+	// Paginate through all results
+	paginator := s3.NewListObjectsV2Paginator(cs.client, input)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list objects in bucket: %w", err)
+		}
+
+		// Common prefixes are our "directories" which represent topics
+		for _, prefix := range page.CommonPrefixes {
+			if prefix.Prefix == nil {
+				continue
+			}
+
+			// Extract topic name (remove the trailing slash)
+			topic := *prefix.Prefix
+			if len(topic) > 0 && topic[len(topic)-1] == '/' {
+				topic = topic[:len(topic)-1]
+			}
+
+			topicsMap[topic] = struct{}{}
+		}
+
+		// Also check objects (for the case where we don't have directories)
+		for _, obj := range page.Contents {
+			if obj.Key == nil {
+				continue
+			}
+
+			// Extract topic from object key (format: topic/batch_timestamp.json)
+			parts := strings.SplitN(*obj.Key, "/", 2)
+			if len(parts) > 0 {
+				topicsMap[parts[0]] = struct{}{}
+			}
+		}
+	}
+
+	// Convert map to slice
+	topics := make([]string, 0, len(topicsMap))
+	for topic := range topicsMap {
+		topics = append(topics, topic)
+
+		// Also update our in-memory cache
+		cs.topicIndex.mu.Lock()
+		cs.topicIndex.topics[topic] = struct{}{}
+		cs.topicIndex.mu.Unlock()
+	}
+
+	return topics, nil
 }

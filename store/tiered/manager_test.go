@@ -154,28 +154,36 @@ func TestManager_MessageRetention(t *testing.T) {
 		t.Fatalf("Failed to create manager: %v", err)
 	}
 
-	// Store old message
+	// Store old message with short TTL (0.1 second)
 	oldMsg := Message{
 		ID:        "old1",
 		Topic:     "test-topic",
 		Payload:   []byte("old message"),
 		Timestamp: time.Now().Add(-100 * time.Millisecond),
-		TTL:       3,
+		TTL:       1, // 1 second TTL - should expire almost immediately
 	}
 	if err := manager.Store(oldMsg); err != nil {
 		t.Errorf("Failed to store old message: %v", err)
 	}
 
-	// Store new message
+	// Store new message with longer TTL
 	newMsg := Message{
 		ID:        "new1",
 		Topic:     "test-topic",
 		Payload:   []byte("new message"),
 		Timestamp: time.Now(),
-		TTL:       3,
+		TTL:       300, // 5 minutes TTL - shouldn't expire during test
 	}
 	if err := manager.Store(newMsg); err != nil {
 		t.Errorf("Failed to store new message: %v", err)
+	}
+
+	// Explicitly wait for TTL to expire
+	time.Sleep(2 * time.Second)
+
+	// Force compaction to clean up expired messages
+	if err := manager.PerformFullCompaction(); err != nil {
+		t.Errorf("Failed to perform compaction: %v", err)
 	}
 
 	// Create error channel for test errors
@@ -200,7 +208,16 @@ func TestManager_MessageRetention(t *testing.T) {
 				}
 				return // Success
 			}
-			time.Sleep(10 * time.Millisecond)
+
+			// Try explicit compaction every few attempts
+			if i > 0 && i%5 == 0 {
+				if err := manager.PerformFullCompaction(); err != nil {
+					errCh <- fmt.Errorf("compaction failed: %v", err)
+					return
+				}
+			}
+
+			time.Sleep(50 * time.Millisecond)
 		}
 		errCh <- fmt.Errorf("old message not deleted after %d attempts", maxAttempts)
 	}()
@@ -213,7 +230,7 @@ func TestManager_MessageRetention(t *testing.T) {
 		}
 	case <-doneCh:
 		// Test completed successfully
-	case <-time.After(300 * time.Millisecond):
+	case <-time.After(3 * time.Second):
 		t.Fatal("Test timed out")
 	}
 

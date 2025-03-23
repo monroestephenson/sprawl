@@ -6,10 +6,12 @@ import (
 	"log"
 	"math"
 	"runtime"
+	"sprawl/store"
 	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
 	psnet "github.com/shirou/gopsutil/v3/net"
 )
@@ -245,9 +247,85 @@ func getMemoryUsage() float64 {
 
 // estimateStorageUsage estimates storage usage
 func estimateStorageUsage() float64 {
-	// In a real implementation, this would query the store
-	// For now, return a synthetic value
-	return 50.0 + float64(time.Now().UnixNano()%20)
+	// Get a reference to the global store
+	store := store.GetGlobalStore()
+	if store == nil {
+		// If store is not available, return a reasonable default
+		log.Println("Warning: Store not available for storage usage estimation")
+		return 50.0
+	}
+
+	// Calculate memory usage percentage
+	var memoryUsedPercent float64
+
+	// Get memory stats
+	memStats := store.GetMemoryUsage()
+	totalMemory := int64(0)
+
+	// Use gopsutil to get total system memory
+	v, err := mem.VirtualMemory()
+	if err == nil {
+		totalMemory = int64(v.Total)
+	} else {
+		// Fallback: use a reasonable default if we can't get system memory
+		totalMemory = 8 * 1024 * 1024 * 1024 // Assume 8GB
+	}
+
+	// Calculate memory usage percentage
+	if totalMemory > 0 {
+		memoryUsedPercent = float64(memStats) / float64(totalMemory) * 100.0
+	} else {
+		memoryUsedPercent = 50.0 // Default if we can't calculate
+	}
+
+	// Get disk storage stats
+	diskStats := store.GetDiskStats()
+	var diskUsedPercent float64
+	if diskStats != nil && diskStats.Enabled {
+		// Get disk space info using gopsutil
+		diskInfo, err := disk.Usage(store.GetTierConfig().DiskPath)
+		if err == nil {
+			diskUsedPercent = diskInfo.UsedPercent
+		} else {
+			// Fallback: estimate based on message count
+			diskUsedPercent = float64(diskStats.MessageCount) / 1000000.0 * 100.0 // Assume 1M messages = 100%
+			if diskUsedPercent > 100.0 {
+				diskUsedPercent = 100.0
+			}
+		}
+	} else {
+		diskUsedPercent = 0.0 // Disk storage not enabled
+	}
+
+	// Get cloud storage stats
+	cloudStats := store.GetCloudStats()
+	var cloudUsedPercent float64
+	if cloudStats != nil && cloudStats.Enabled {
+		// Convert bytes to percentage (assume 10GB max for cloud)
+		cloudMaxBytes := int64(10 * 1024 * 1024 * 1024)
+		cloudUsedPercent = float64(cloudStats.UsedBytes) / float64(cloudMaxBytes) * 100.0
+		if cloudUsedPercent > 100.0 {
+			cloudUsedPercent = 100.0
+		}
+	} else {
+		cloudUsedPercent = 0.0 // Cloud storage not enabled
+	}
+
+	// Calculate weighted average based on which tiers are enabled
+	totalWeight := 1.0 // Memory always enabled
+	weightedSum := memoryUsedPercent
+
+	if diskStats != nil && diskStats.Enabled {
+		totalWeight += 1.0
+		weightedSum += diskUsedPercent
+	}
+
+	if cloudStats != nil && cloudStats.Enabled {
+		totalWeight += 1.0
+		weightedSum += cloudUsedPercent
+	}
+
+	return weightedSum / totalWeight
 }
 
 // estimateNetworkActivity estimates network activity

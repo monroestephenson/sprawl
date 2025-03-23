@@ -1,6 +1,7 @@
 package tiered
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -231,5 +232,168 @@ func TestRocksStore_ConcurrentAccess(t *testing.T) {
 	}
 	if len(msgIDs) != 100 {
 		t.Errorf("Expected 100 messages, got %d", len(msgIDs))
+	}
+}
+
+func TestListTopics(t *testing.T) {
+	// Create a temporary directory for RocksDB
+	tempDir := t.TempDir()
+
+	// Create a new RocksStore
+	store, err := NewRocksStore(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to create RocksStore: %v", err)
+	}
+	defer store.Close()
+
+	// Initially, there should be no topics
+	topics, err := store.ListTopics()
+	if err != nil {
+		t.Fatalf("Error listing topics: %v", err)
+	}
+	if len(topics) != 0 {
+		t.Errorf("Expected 0 topics initially, got %d", len(topics))
+	}
+
+	// Add messages for different topics
+	topicNames := []string{"topic1", "topic2", "topic3"}
+	for i, topicName := range topicNames {
+		msg := Message{
+			ID:        fmt.Sprintf("msg%d", i),
+			Topic:     topicName,
+			Payload:   []byte(fmt.Sprintf("data for %s", topicName)),
+			Timestamp: time.Now(),
+		}
+		if err := store.Store(msg); err != nil {
+			t.Fatalf("Failed to store message: %v", err)
+		}
+	}
+
+	// Now there should be 3 topics
+	topics, err = store.ListTopics()
+	if err != nil {
+		t.Fatalf("Error listing topics after adding messages: %v", err)
+	}
+
+	if len(topics) != 3 {
+		t.Errorf("Expected 3 topics, got %d", len(topics))
+	}
+
+	// Verify all topics are present
+	topicMap := make(map[string]bool)
+	for _, topic := range topics {
+		topicMap[topic] = true
+	}
+
+	for _, expectedTopic := range topicNames {
+		if !topicMap[expectedTopic] {
+			t.Errorf("Expected topic %s not found in results", expectedTopic)
+		}
+	}
+}
+
+func TestQueryMessages(t *testing.T) {
+	// Create a temporary directory for RocksDB
+	tempDir := t.TempDir()
+
+	// Create a new RocksStore
+	store, err := NewRocksStore(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to create RocksStore: %v", err)
+	}
+	defer store.Close()
+
+	// Add messages with different timestamps
+	now := time.Now()
+	topic := "query-topic"
+
+	// Create messages for the past, present, and future
+	messages := []struct {
+		id        string
+		timestamp time.Time
+		payload   string
+	}{
+		{"past1", now.Add(-2 * time.Hour), "past message 1"},
+		{"past2", now.Add(-1 * time.Hour), "past message 2"},
+		{"present1", now, "present message 1"},
+		{"present2", now.Add(time.Second), "present message 2"},
+		{"future1", now.Add(1 * time.Hour), "future message 1"},
+		{"future2", now.Add(2 * time.Hour), "future message 2"},
+	}
+
+	// Store all messages
+	for _, m := range messages {
+		msg := Message{
+			ID:        m.id,
+			Topic:     topic,
+			Payload:   []byte(m.payload),
+			Timestamp: m.timestamp,
+		}
+		if err := store.Store(msg); err != nil {
+			t.Fatalf("Failed to store message %s: %v", m.id, err)
+		}
+	}
+
+	// Query messages before a certain time
+	pastTime := now.Add(-30 * time.Minute)
+	pastFilter := &QueryFilter{
+		Topic:           topic,
+		TimestampBefore: &pastTime,
+	}
+
+	pastResults, err := store.QueryMessages(pastFilter)
+	if err != nil {
+		t.Fatalf("Error querying past messages: %v", err)
+	}
+
+	if len(pastResults) != 2 {
+		t.Errorf("Expected 2 past messages, got %d", len(pastResults))
+	}
+
+	// Query messages after a certain time
+	futureTime := now.Add(30 * time.Minute)
+	futureFilter := &QueryFilter{
+		Topic:          topic,
+		TimestampAfter: &futureTime,
+	}
+
+	futureResults, err := store.QueryMessages(futureFilter)
+	if err != nil {
+		t.Fatalf("Error querying future messages: %v", err)
+	}
+
+	if len(futureResults) != 2 {
+		t.Errorf("Expected 2 future messages, got %d", len(futureResults))
+	}
+
+	// Query with both before and after
+	rangeFilter := &QueryFilter{
+		Topic:           topic,
+		TimestampAfter:  &pastTime,
+		TimestampBefore: &futureTime,
+	}
+
+	rangeResults, err := store.QueryMessages(rangeFilter)
+	if err != nil {
+		t.Fatalf("Error querying range messages: %v", err)
+	}
+
+	if len(rangeResults) != 2 {
+		t.Errorf("Expected 2 present messages in range, got %d", len(rangeResults))
+	}
+
+	// Query with limit
+	limitFilter := &QueryFilter{
+		Topic: topic,
+		Limit: 3,
+	}
+
+	limitResults, err := store.QueryMessages(limitFilter)
+	if err != nil {
+		t.Fatalf("Error querying with limit: %v", err)
+	}
+
+	if len(limitResults) != 3 {
+		t.Errorf("Expected 3 messages with limit, got %d", len(limitResults))
 	}
 }

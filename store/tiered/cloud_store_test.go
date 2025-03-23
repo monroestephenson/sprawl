@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -308,5 +309,158 @@ func TestCloudStore_ConcurrentAccess(t *testing.T) {
 	expected := numPublishers * messagesPerPublisher
 	if len(msgs) != expected {
 		t.Errorf("Expected %d messages, got %d", expected, len(msgs))
+	}
+}
+
+func TestLRUCacheOperations(t *testing.T) {
+	// Create a new LRU cache with small capacity for testing
+	cache := newSimpleLRU(5)
+
+	// Test adding items
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("key%d", i)
+		value := fmt.Sprintf("value%d", i)
+		cache.Add(key, value)
+	}
+
+	// Check all items are in the cache
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("key%d", i)
+		expectedValue := fmt.Sprintf("value%d", i)
+		value, found := cache.Get(key)
+		if !found {
+			t.Errorf("Key %s not found in cache", key)
+		}
+		if value != expectedValue {
+			t.Errorf("Expected value %s for key %s, got %s", expectedValue, key, value)
+		}
+	}
+
+	// Test LRU eviction by adding more items than capacity
+	for i := 5; i < 10; i++ {
+		key := fmt.Sprintf("key%d", i)
+		value := fmt.Sprintf("value%d", i)
+		cache.Add(key, value)
+	}
+
+	// The first items should have been evicted
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("key%d", i)
+		_, found := cache.Get(key)
+		if found {
+			t.Errorf("Key %s should have been evicted but was still in cache", key)
+		}
+	}
+
+	// The newer items should be present
+	for i := 5; i < 10; i++ {
+		key := fmt.Sprintf("key%d", i)
+		expectedValue := fmt.Sprintf("value%d", i)
+		value, found := cache.Get(key)
+		if !found {
+			t.Errorf("Key %s not found in cache", key)
+		}
+		if value != expectedValue {
+			t.Errorf("Expected value %s for key %s, got %s", expectedValue, key, value)
+		}
+	}
+
+	// Test that accessing an item makes it most recently used
+	// First access key7 to make it most recently used
+	cache.Get("key7")
+
+	// Then add a new item to trigger eviction of least recently used
+	cache.Add("key10", "value10")
+
+	// key5 should be evicted as it's now the least recently used
+	_, found := cache.Get("key5")
+	if found {
+		t.Errorf("Key key5 should have been evicted but was still in cache")
+	}
+
+	// key7 should still be present
+	_, found = cache.Get("key7")
+	if !found {
+		t.Errorf("Key key7 should still be in cache but was evicted")
+	}
+}
+
+func TestPersistentMappings(t *testing.T) {
+	// Create a temporary directory for testing
+	tempDir, err := os.MkdirTemp("", "cloud-store-test-")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create config with persistence enabled
+	cfg := CloudConfig{
+		EnablePersistentIndex: true,
+		IndexPath:             tempDir,
+		Bucket:                "test-bucket",
+		Region:                "us-east-1",
+		UploadWorkers:         1,
+		BatchSize:             10,
+		BatchTimeout:          time.Second,
+	}
+
+	// Create a mock for the S3 client
+	// In a real test, we'd use minio-go test server or a mock implementation
+	// For this test, we'll just verify the file operations
+
+	// Create a store with an empty mappings cache
+	store := &CloudStore{
+		config:     cfg,
+		idMappings: &idMappingCache{cache: newSimpleLRU(100)},
+		doneCh:     make(chan struct{}),
+		metrics:    &CloudMetrics{},
+		topicIndex: &topicIndex{topics: make(map[string]struct{})},
+		batch:      &messageBatch{},
+	}
+
+	// Add some mappings
+	testMappings := map[string]string{
+		"msg1": "topic1/batch_123.json",
+		"msg2": "topic1/batch_124.json",
+		"msg3": "topic2/batch_125.json",
+	}
+
+	for id, objKey := range testMappings {
+		store.idMappings.cache.Add(id, objKey)
+	}
+
+	// Persist mappings to disk
+	store.persistMappingsToDisk()
+
+	// Verify the file was created
+	mappingsFile := filepath.Join(tempDir, "id_mappings.json")
+	if _, err := os.Stat(mappingsFile); os.IsNotExist(err) {
+		t.Errorf("Mappings file was not created at %s", mappingsFile)
+	}
+
+	// Create a new store and load the mappings
+	newStore := &CloudStore{
+		config:     cfg,
+		idMappings: &idMappingCache{cache: newSimpleLRU(100)},
+		doneCh:     make(chan struct{}),
+		metrics:    &CloudMetrics{},
+		topicIndex: &topicIndex{topics: make(map[string]struct{})},
+		batch:      &messageBatch{},
+	}
+
+	// Load mappings from disk
+	err = newStore.loadMappingsFromDisk()
+	if err != nil {
+		t.Fatalf("Failed to load mappings: %v", err)
+	}
+
+	// Verify the mappings were loaded correctly
+	for id, expectedKey := range testMappings {
+		objKey, found := newStore.idMappings.cache.Get(id)
+		if !found {
+			t.Errorf("Expected mapping for %s not found", id)
+		} else if objKey != expectedKey {
+			t.Errorf("Expected object key %s for message %s, got %s", expectedKey, id, objKey)
+		}
 	}
 }

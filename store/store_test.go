@@ -553,3 +553,272 @@ func TestGetTopicsImplementation(t *testing.T) {
 	topics = store.GetTopics()
 	t.Logf("Topics after second subscription: %v", topics)
 }
+
+func TestSubscriberCountQueries(t *testing.T) {
+	// Create a new store
+	store := NewStore()
+
+	// Test with no subscribers
+	if count := store.GetSubscriberCountForTopic("test-topic"); count != 0 {
+		t.Errorf("Expected 0 subscribers for non-existent topic, got %d", count)
+	}
+
+	// Add a single subscriber
+	callbackOne := func(msg Message) {
+		// Do nothing in test
+	}
+	store.Subscribe("test-topic", callbackOne)
+
+	// Test with one subscriber
+	if count := store.GetSubscriberCountForTopic("test-topic"); count != 1 {
+		t.Errorf("Expected 1 subscriber for test-topic, got %d", count)
+	}
+
+	// Add multiple subscribers
+	callbacks := make([]SubscriberFunc, 5)
+	for i := 0; i < 5; i++ {
+		callbacks[i] = func(msg Message) {
+			// Do nothing
+		}
+		store.Subscribe("test-topic", callbacks[i])
+	}
+
+	// Test with multiple subscribers
+	if count := store.GetSubscriberCountForTopic("test-topic"); count != 6 {
+		t.Errorf("Expected 6 subscribers for test-topic, got %d", count)
+	}
+
+	// Test different topics
+	anotherCallback := func(msg Message) {
+		// Do nothing
+	}
+	store.Subscribe("another-topic", anotherCallback)
+
+	if count := store.GetSubscriberCountForTopic("another-topic"); count != 1 {
+		t.Errorf("Expected 1 subscriber for another-topic, got %d", count)
+	}
+
+	// Test after unsubscribe
+	thirdCallback := func(msg Message) {
+		// Do nothing
+	}
+	store.Subscribe("third-topic", thirdCallback)
+
+	if count := store.GetSubscriberCountForTopic("third-topic"); count != 1 {
+		t.Errorf("Expected 1 subscriber for third-topic, got %d", count)
+	}
+
+	err := store.Unsubscribe("third-topic", thirdCallback)
+	if err != nil {
+		t.Errorf("Error unsubscribing from third-topic: %v", err)
+	}
+
+	if count := store.GetSubscriberCountForTopic("third-topic"); count != 0 {
+		t.Errorf("Expected 0 subscribers after unsubscribe, got %d", count)
+	}
+}
+
+func TestTimestampQueries(t *testing.T) {
+	// Create a new store
+	store := NewStore()
+
+	// Test with no messages
+	if info := store.GetTopicTimestamps("test-topic"); info != nil {
+		t.Errorf("Expected nil timestamps for empty topic, got %+v", info)
+	}
+
+	// Add a single message
+	now := time.Now()
+	msg := Message{
+		ID:        "msg1",
+		Topic:     "test-topic",
+		Payload:   []byte("test payload"),
+		Timestamp: now,
+		TTL:       3600,
+	}
+	err := store.Publish(msg)
+	if err != nil {
+		t.Fatalf("Failed to publish message: %v", err)
+	}
+
+	// Test with one message
+	info := store.GetTopicTimestamps("test-topic")
+	if info == nil {
+		t.Fatalf("Expected timestamp info, got nil")
+	}
+	if !info.Oldest.Equal(now) || !info.Newest.Equal(now) {
+		t.Errorf("Expected oldest and newest to be %v, got oldest=%v, newest=%v",
+			now, info.Oldest, info.Newest)
+	}
+
+	// Add older message
+	oldTime := now.Add(-1 * time.Hour)
+	oldMsg := Message{
+		ID:        "msg2",
+		Topic:     "test-topic",
+		Payload:   []byte("old message"),
+		Timestamp: oldTime,
+		TTL:       3600,
+	}
+	err = store.Publish(oldMsg)
+	if err != nil {
+		t.Fatalf("Failed to publish old message: %v", err)
+	}
+
+	// Add newer message
+	newTime := now.Add(1 * time.Hour)
+	newMsg := Message{
+		ID:        "msg3",
+		Topic:     "test-topic",
+		Payload:   []byte("new message"),
+		Timestamp: newTime,
+		TTL:       3600,
+	}
+	err = store.Publish(newMsg)
+	if err != nil {
+		t.Fatalf("Failed to publish new message: %v", err)
+	}
+
+	// Test with multiple messages
+	info = store.GetTopicTimestamps("test-topic")
+	if info == nil {
+		t.Fatalf("Expected timestamp info, got nil")
+	}
+	if !info.Oldest.Equal(oldTime) {
+		t.Errorf("Expected oldest to be %v, got %v", oldTime, info.Oldest)
+	}
+	if !info.Newest.Equal(newTime) {
+		t.Errorf("Expected newest to be %v, got %v", newTime, info.Newest)
+	}
+
+	// Test different topic
+	otherMsg := Message{
+		ID:        "other1",
+		Topic:     "other-topic",
+		Payload:   []byte("other topic"),
+		Timestamp: now,
+		TTL:       3600,
+	}
+	err = store.Publish(otherMsg)
+	if err != nil {
+		t.Fatalf("Failed to publish to other-topic: %v", err)
+	}
+
+	info = store.GetTopicTimestamps("other-topic")
+	if info == nil {
+		t.Fatalf("Expected timestamp info for other-topic, got nil")
+	}
+	if !info.Oldest.Equal(now) || !info.Newest.Equal(now) {
+		t.Errorf("Expected oldest and newest to be %v for other-topic, got oldest=%v, newest=%v",
+			now, info.Oldest, info.Newest)
+	}
+}
+
+func TestTopicTimestampsWithTieredStorage(t *testing.T) {
+	// Skip if tiered storage isn't configured in the test environment
+	t.Skip("Tiered storage tests require proper environment setup")
+
+	// This test would create a store with tiered storage
+	// and test the GetTopicTimestamps function across all tiers
+
+	// It would:
+	// 1. Create a store with tiered storage
+	// 2. Add messages to memory
+	// 3. Verify timestamps
+	// 4. Move some messages to disk tier
+	// 5. Verify timestamps include both tiers
+	// 6. Move some messages to cloud tier
+	// 7. Verify timestamps include all tiers
+}
+
+func TestCompaction(t *testing.T) {
+	// Create a new store
+	store := NewStore()
+
+	// Add messages with different TTLs
+	now := time.Now()
+
+	// Message with short TTL (will expire soon)
+	shortTTLMsg := Message{
+		ID:        "short1",
+		Topic:     "ttl-topic",
+		Payload:   []byte("short ttl message"),
+		Timestamp: now.Add(-10 * time.Second),
+		TTL:       1, // 1 second (already expired)
+	}
+
+	// Message with long TTL (won't expire yet)
+	longTTLMsg := Message{
+		ID:        "long1",
+		Topic:     "ttl-topic",
+		Payload:   []byte("long ttl message"),
+		Timestamp: now,
+		TTL:       3600, // 1 hour
+	}
+
+	// Message with no TTL (won't expire)
+	noTTLMsg := Message{
+		ID:        "no1",
+		Topic:     "ttl-topic",
+		Payload:   []byte("no ttl message"),
+		Timestamp: now,
+		TTL:       0, // No TTL
+	}
+
+	// Publish all messages
+	if err := store.Publish(shortTTLMsg); err != nil {
+		t.Fatalf("Failed to publish short TTL message: %v", err)
+	}
+	if err := store.Publish(longTTLMsg); err != nil {
+		t.Fatalf("Failed to publish long TTL message: %v", err)
+	}
+	if err := store.Publish(noTTLMsg); err != nil {
+		t.Fatalf("Failed to publish no TTL message: %v", err)
+	}
+
+	// Verify we have 3 messages initially
+	messages, err := store.GetTopicMessages("ttl-topic")
+	if err != nil {
+		t.Fatalf("Error getting messages: %v", err)
+	}
+	if len(messages) != 3 {
+		t.Errorf("Expected 3 messages before compaction, got %d", len(messages))
+	}
+
+	// Run compaction
+	if err := store.Compact(); err != nil {
+		t.Fatalf("Error during compaction: %v", err)
+	}
+
+	// Wait a bit for the background goroutine to finish
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify expired messages were removed
+	messages, err = store.GetTopicMessages("ttl-topic")
+	if err != nil {
+		t.Fatalf("Error getting messages after compaction: %v", err)
+	}
+
+	if len(messages) != 2 {
+		t.Errorf("Expected 2 messages after compaction, got %d", len(messages))
+	}
+
+	// Check that the right messages were kept
+	var foundLongTTL, foundNoTTL bool
+	for _, msg := range messages {
+		if msg.ID == longTTLMsg.ID {
+			foundLongTTL = true
+		} else if msg.ID == noTTLMsg.ID {
+			foundNoTTL = true
+		} else if msg.ID == shortTTLMsg.ID {
+			t.Errorf("Found expired message with ID %s after compaction", shortTTLMsg.ID)
+		}
+	}
+
+	if !foundLongTTL {
+		t.Errorf("Long TTL message was missing after compaction")
+	}
+	if !foundNoTTL {
+		t.Errorf("No TTL message was missing after compaction")
+	}
+}

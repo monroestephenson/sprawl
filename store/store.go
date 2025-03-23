@@ -73,7 +73,7 @@ func GetGlobalStore() *Store {
 	return globalStore
 }
 
-// NewStore creates a new Store
+// NewStore creates a new message store
 func NewStore() *Store {
 	store := &Store{
 		messages:    make(map[string][]Message),
@@ -81,14 +81,19 @@ func NewStore() *Store {
 		metrics:     NewMetrics(),
 	}
 
-	// Initialize tiered storage if enabled by environment variables
-	store.initTieredStorage()
+	// Initialize tiered storage if configured
+	if err := store.initTieredStorage(); err != nil {
+		log.Printf("[Store] Error initializing tiered storage: %v", err)
+	}
+
+	// Start periodic compaction to clean up expired messages
+	go store.startPeriodicCompaction(1 * time.Minute) // Run compaction every minute
 
 	return store
 }
 
 // initTieredStorage initializes tiered storage based on environment variables
-func (s *Store) initTieredStorage() {
+func (s *Store) initTieredStorage() error {
 	// Check storage type from environment variable
 	storageType := os.Getenv("SPRAWL_STORAGE_TYPE")
 
@@ -103,7 +108,7 @@ func (s *Store) initTieredStorage() {
 	// If neither is enabled, return early
 	if !diskEnabled && !cloudEnabled {
 		log.Println("[Store] Tiered storage not enabled")
-		return
+		return nil
 	}
 
 	// Parse memory storage settings
@@ -187,7 +192,7 @@ func (s *Store) initTieredStorage() {
 		// Fallback to basic memory store
 		s.diskEnabled = false
 		s.cloudEnabled = false
-		return
+		return nil
 	}
 
 	s.tieredManager = manager
@@ -200,6 +205,8 @@ func (s *Store) initTieredStorage() {
 	if s.cloudEnabled {
 		log.Println("[Store] Cloud tier enabled")
 	}
+
+	return nil
 }
 
 // Publish a message to a topic
@@ -341,12 +348,13 @@ type TimestampInfo struct {
 
 // TierConfig represents the configuration for storage tiers
 type TierConfig struct {
-	DiskEnabled                bool  `json:"disk_enabled"`
-	CloudEnabled               bool  `json:"cloud_enabled"`
-	MemoryToDiskThresholdBytes int64 `json:"memory_to_disk_threshold_bytes"`
-	MemoryToDiskAgeSeconds     int64 `json:"memory_to_disk_age_seconds"`
-	DiskToCloudAgeSeconds      int64 `json:"disk_to_cloud_age_seconds"`
-	DiskToCloudThresholdBytes  int64 `json:"disk_to_cloud_threshold_bytes"`
+	DiskEnabled                bool   `json:"disk_enabled"`
+	CloudEnabled               bool   `json:"cloud_enabled"`
+	MemoryToDiskThresholdBytes int64  `json:"memory_to_disk_threshold_bytes"`
+	MemoryToDiskAgeSeconds     int64  `json:"memory_to_disk_age_seconds"`
+	DiskToCloudAgeSeconds      int64  `json:"disk_to_cloud_age_seconds"`
+	DiskToCloudThresholdBytes  int64  `json:"disk_to_cloud_threshold_bytes"`
+	DiskPath                   string `json:"disk_path"`
 }
 
 // GetMemoryUsage returns the estimated memory usage in bytes
@@ -589,11 +597,20 @@ func (s *Store) GetTierConfig() TierConfig {
 		}
 	}
 
+	// Get disk size
 	diskSize := int64(1073741824) // Default: 1GB
 	if envSize := os.Getenv("SPRAWL_STORAGE_DISK_MAX_SIZE"); envSize != "" {
 		if size, err := strconv.ParseInt(envSize, 10, 64); err == nil && size > 0 {
 			diskSize = size
 		}
+	}
+
+	// Get disk path
+	diskPath := "/data/rocksdb" // Default path
+	if envPath := os.Getenv("SPRAWL_STORAGE_DISK_PATH"); envPath != "" {
+		diskPath = envPath
+	} else if envPath := os.Getenv("SPRAWL_STORAGE_PATH"); envPath != "" {
+		diskPath = envPath
 	}
 
 	return TierConfig{
@@ -603,14 +620,42 @@ func (s *Store) GetTierConfig() TierConfig {
 		MemoryToDiskAgeSeconds:     memToAge,
 		DiskToCloudAgeSeconds:      diskToAge,
 		DiskToCloudThresholdBytes:  diskSize,
+		DiskPath:                   diskPath,
 	}
 }
 
 // Compact triggers a compaction of the storage tiers
 func (s *Store) Compact() error {
 	if s.tieredManager == nil {
-		// No tiered storage, just log the action
-		log.Println("[Store] Compaction requested (no-op implementation)")
+		// No tiered storage, perform memory compaction only
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		// Remove expired messages based on TTL
+		now := time.Now()
+		for topic, messages := range s.messages {
+			var validMessages []Message
+			for _, msg := range messages {
+				// Check if message has expired
+				if msg.TTL > 0 {
+					expiryTime := msg.Timestamp.Add(time.Duration(msg.TTL) * time.Second)
+					if expiryTime.Before(now) {
+						// Skip expired message
+						log.Printf("[Store] Removing expired message %s from topic %s", msg.ID, topic)
+						continue
+					}
+				}
+				validMessages = append(validMessages, msg)
+			}
+
+			// Update messages list with only valid messages
+			if len(validMessages) < len(messages) {
+				s.messages[topic] = validMessages
+				log.Printf("[Store] Compacted %d expired messages from topic %s", len(messages)-len(validMessages), topic)
+			}
+		}
+
+		log.Println("[Store] Memory compaction completed")
 		return nil
 	}
 
@@ -624,6 +669,35 @@ func (s *Store) Compact() error {
 	if tm == nil {
 		return fmt.Errorf("tiered storage manager is not available")
 	}
+
+	// Run memory compaction first (in a separate goroutine to avoid blocking)
+	go func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		// Remove expired messages
+		now := time.Now()
+		for topic, messages := range s.messages {
+			var validMessages []Message
+			for _, msg := range messages {
+				// Check if message has expired
+				if msg.TTL > 0 {
+					expiryTime := msg.Timestamp.Add(time.Duration(msg.TTL) * time.Second)
+					if expiryTime.Before(now) {
+						// Skip expired message
+						continue
+					}
+				}
+				validMessages = append(validMessages, msg)
+			}
+
+			// Update messages list with only valid messages
+			if len(validMessages) < len(messages) {
+				s.messages[topic] = validMessages
+				log.Printf("[Store] Compacted %d expired messages from topic %s", len(messages)-len(validMessages), topic)
+			}
+		}
+	}()
 
 	// Trigger archive operation on the tiered manager
 	// This will move data from memory to disk and from disk to cloud if configured
@@ -677,33 +751,100 @@ func (s *Store) GetMessageCountForTopic(topic string) int {
 
 // GetSubscriberCountForTopic returns the number of subscribers for a specific topic
 func (s *Store) GetSubscriberCountForTopic(topic string) int {
-	// In a real implementation, this would query the subscription registry
-	// For now, return 1 if we have any subscribers, 0 otherwise
-	if s.HasSubscribers(topic) {
-		return 1
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	subs, exists := s.subscribers[topic]
+	if !exists {
+		return 0
 	}
-	return 0
+
+	return len(subs)
 }
 
 // GetTopicTimestamps returns timestamp information for a topic
 func (s *Store) GetTopicTimestamps(topic string) *TimestampInfo {
-	// In a real implementation, this would query all tiers
-	// For now, return nil if no messages for this topic
+	var oldest, newest time.Time
+	var found bool
+
+	// Query memory tier
+	s.mu.RLock()
 	msgs, exists := s.messages[topic]
-	if !exists || len(msgs) == 0 {
-		return nil
+	if exists && len(msgs) > 0 {
+		oldest = msgs[0].Timestamp
+		newest = msgs[0].Timestamp
+		for _, msg := range msgs {
+			if msg.Timestamp.Before(oldest) {
+				oldest = msg.Timestamp
+			}
+			if msg.Timestamp.After(newest) {
+				newest = msg.Timestamp
+			}
+		}
+		found = true
+	}
+	s.mu.RUnlock()
+
+	// Check if tiered storage is available
+	if s.tieredManager != nil {
+		// Query disk tier if enabled
+		if s.diskEnabled {
+			diskMessages, err := s.tieredManager.GetTopicMessages(topic)
+			if err == nil && len(diskMessages) > 0 {
+				// If we haven't found messages yet, initialize timestamps
+				if !found {
+					oldest = time.Unix(1<<63-1, 0) // Max time
+					newest = time.Unix(0, 0)       // Min time
+					found = true
+				}
+
+				// Compare with disk timestamps
+				for _, id := range diskMessages {
+					msg, err := s.tieredManager.Retrieve(id)
+					if err == nil {
+						if msg.Timestamp.Before(oldest) {
+							oldest = msg.Timestamp
+						}
+						if msg.Timestamp.After(newest) {
+							newest = msg.Timestamp
+						}
+					}
+				}
+			}
+		}
+
+		// Query cloud tier if enabled
+		if s.cloudEnabled {
+			cloudStats := s.GetCloudStats()
+			if cloudStats != nil {
+				// If cloud tier has this topic
+				for _, cloudTopic := range cloudStats.Topics {
+					if cloudTopic == topic {
+						// If we haven't found messages yet, initialize timestamps
+						if !found {
+							if !cloudStats.OldestMessage.IsZero() {
+								oldest = cloudStats.OldestMessage
+								newest = cloudStats.NewestMessage
+								found = true
+							}
+						} else {
+							// Compare with cloud timestamps
+							if !cloudStats.OldestMessage.IsZero() && cloudStats.OldestMessage.Before(oldest) {
+								oldest = cloudStats.OldestMessage
+							}
+							if !cloudStats.NewestMessage.After(newest) {
+								newest = cloudStats.NewestMessage
+							}
+						}
+						break
+					}
+				}
+			}
+		}
 	}
 
-	// Find oldest and newest messages
-	oldest := msgs[0].Timestamp
-	newest := msgs[0].Timestamp
-	for _, msg := range msgs {
-		if msg.Timestamp.Before(oldest) {
-			oldest = msg.Timestamp
-		}
-		if msg.Timestamp.After(newest) {
-			newest = msg.Timestamp
-		}
+	if !found {
+		return nil
 	}
 
 	return &TimestampInfo{
@@ -950,4 +1091,35 @@ func (s *Store) GetMessages(topic string) []Message {
 	result := make([]Message, len(messages))
 	copy(result, messages)
 	return result
+}
+
+// GetTopicMessages returns all messages for a specific topic
+func (s *Store) GetTopicMessages(topic string) ([]Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Get messages from memory first
+	messages, exists := s.messages[topic]
+	if !exists {
+		// If topic doesn't exist, return empty slice
+		return []Message{}, nil
+	}
+
+	// Return a copy of the messages to avoid concurrent modification issues
+	result := make([]Message, len(messages))
+	copy(result, messages)
+
+	return result, nil
+}
+
+// startPeriodicCompaction runs the compaction process at regular intervals
+func (s *Store) startPeriodicCompaction(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if err := s.Compact(); err != nil {
+			log.Printf("[Store] Error during periodic compaction: %v", err)
+		}
+	}
 }

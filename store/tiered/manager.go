@@ -200,54 +200,209 @@ func (m *Manager) handleMemoryPressure(level int32) {
 	}
 }
 
+// cleanupExpiredMessages checks for and removes messages with expired TTLs
+func (m *Manager) cleanupExpiredMessages() {
+	now := time.Now()
+	deleted := 0
+
+	// Check disk store for expired messages
+	if m.diskStore != nil {
+		// Get all topic IDs
+		topicIDs, err := m.diskStore.ListAllTopicIDs()
+		if err != nil {
+			log.Printf("Failed to list topics for TTL cleanup: %v", err)
+			return
+		}
+
+		// Collect messages to delete
+		var messagesToDelete []string
+
+		// Check messages in each topic
+		for _, topicInfo := range topicIDs {
+			for _, msgID := range topicInfo.IDs {
+				// Get the message
+				msg, err := m.diskStore.Retrieve(msgID)
+				if err != nil {
+					continue
+				}
+
+				// Check if TTL is set and expired
+				if msg.TTL > 0 && msg.Timestamp.Add(time.Duration(msg.TTL)*time.Second).Before(now) {
+					messagesToDelete = append(messagesToDelete, msgID)
+				}
+			}
+		}
+
+		// Delete all expired messages
+		if len(messagesToDelete) > 0 {
+			if err := m.diskStore.DeleteMessages(messagesToDelete); err != nil {
+				log.Printf("Failed to delete expired messages: %v", err)
+			} else {
+				atomic.AddUint64(&m.metrics.messagesOnDisk, ^uint64(0)&uint64(len(messagesToDelete)))
+				deleted += len(messagesToDelete)
+				log.Printf("TTL cleanup: Deleted %d expired messages from disk", len(messagesToDelete))
+			}
+		}
+	}
+
+	// Also check memory store
+	if m.memoryStore != nil {
+		// We can't enumerate all messages in the ring buffer,
+		// but we'll check old messages that would be moved to disk anyway
+		oldMessages, err := m.memoryStore.GetOldestMessages(1000, 0) // Get oldest without time filter
+		if err == nil && len(oldMessages) > 0 {
+			for _, msg := range oldMessages {
+				// Check if TTL is set and expired
+				if msg.TTL > 0 && msg.Timestamp.Add(time.Duration(msg.TTL)*time.Second).Before(now) {
+					// Delete the message
+					if m.memoryStore.Delete(msg.ID) {
+						atomic.AddUint64(&m.metrics.messagesInMemory, ^uint64(0)) // Decrement
+						deleted++
+					}
+				}
+			}
+		}
+	}
+
+	if deleted > 0 {
+		log.Printf("TTL cleanup: Deleted %d expired messages total", deleted)
+	}
+}
+
 // archiveLoop periodically checks for messages to archive
 func (m *Manager) archiveLoop() {
-	// Ensure archive interval is positive
+	defer close(m.done)
+
+	// Use default interval if not set or negative
 	interval := m.policy.ArchiveInterval
 	if interval <= 0 {
-		interval = time.Minute // Default to 1 minute if not set or negative
+		interval = time.Minute
 	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	defer close(m.done)
 
 	for {
 		select {
 		case <-m.stopCh:
+			// Final cleanup before exit
+			m.cleanupExpiredMessages()
+			m.archiveOldMessages()
 			return
 		case <-ticker.C:
+			// First clean up expired messages based on TTL
+			m.cleanupExpiredMessages()
+			// Then perform regular archival based on retention
 			m.archiveOldMessages()
 		}
 	}
 }
 
-// archiveOldMessages moves old messages between tiers based on policy
+// archiveOldMessages archives old messages based on policy
 func (m *Manager) archiveOldMessages() {
-	// Don't hold the main lock during the entire archival process
-	if m.policy.DiskRetention > 0 {
-		// Use a read lock to check if we should proceed
-		m.mu.RLock()
-		if m.diskStore == nil {
-			m.mu.RUnlock()
+	// Process TTL cleanup immediately
+	now := time.Now()
+
+	// Process memory to disk archival
+	if m.memoryStore != nil && m.diskStore != nil {
+		oldMemoryMessages, err := m.memoryStore.GetOldestMessages(1000, m.policy.MemoryRetention)
+		if err != nil {
+			log.Printf("Failed to get old memory messages: %v", err)
+		} else if len(oldMemoryMessages) > 0 {
+			log.Printf("Moving %d old messages from memory to disk", len(oldMemoryMessages))
+
+			for _, msg := range oldMemoryMessages {
+				// Skip any messages that have expired based on TTL
+				if msg.TTL > 0 && msg.Timestamp.Add(time.Duration(msg.TTL)*time.Second).Before(now) {
+					// Delete expired message
+					m.memoryStore.Delete(msg.ID)
+					atomic.AddUint64(&m.metrics.messagesInMemory, ^uint64(0)) // Decrement
+					continue
+				}
+
+				// Store on disk
+				if err := m.diskStore.Store(msg); err != nil {
+					log.Printf("Failed to move message %s to disk: %v", msg.ID, err)
+					continue
+				}
+
+				// Delete from memory
+				m.memoryStore.Delete(msg.ID)
+
+				// Update metrics
+				atomic.AddUint64(&m.metrics.memoryOffloads, 1)
+			}
+		}
+	}
+
+	// Process disk to cloud archival
+	if m.diskStore != nil && m.cloudStore != nil {
+		// List all topic IDs from disk
+		topicIDs, err := m.diskStore.ListAllTopicIDs()
+		if err != nil {
+			log.Printf("Failed to list topic IDs for archival: %v", err)
 			return
 		}
-		m.mu.RUnlock()
 
-		// Move old messages to cloud if configured
-		if m.cloudStore != nil {
-			// Get messages older than half the disk retention period
-			// Implementation note: This would require adding a method to list old messages
-			// For now, we rely on the Store method to handle cloud storage
+		diskRetentionCutoff := now.Add(-m.policy.DiskRetention)
+		messagesToMove := make(map[string][]Message)
+		messagesToDelete := make([]string, 0)
 
-			// Update metrics
-			atomic.AddUint64(&m.metrics.cloudOffloads, 1)
+		// Find messages to archive by topic
+		for _, topicInfo := range topicIDs {
+			for _, msgID := range topicInfo.IDs {
+				msg, err := m.diskStore.Retrieve(msgID)
+				if err != nil {
+					continue
+				}
+
+				// First check TTL
+				if msg.TTL > 0 && msg.Timestamp.Add(time.Duration(msg.TTL)*time.Second).Before(now) {
+					// Message is expired, add to delete list
+					messagesToDelete = append(messagesToDelete, msgID)
+					continue
+				}
+
+				// Check if message exceeds disk retention
+				if msg.Timestamp.Before(diskRetentionCutoff) {
+					// Message is older than retention period, add to move list
+					messagesToMove[topicInfo.Topic] = append(messagesToMove[topicInfo.Topic], *msg)
+					messagesToDelete = append(messagesToDelete, msgID)
+				}
+			}
 		}
 
-		// Delete old messages from disk
-		if err := m.diskStore.DeleteOldMessages(m.policy.DiskRetention); err != nil {
-			// Log error but continue
-			fmt.Printf("Failed to delete old messages: %v\n", err)
+		// First process TTL-expired messages
+		if len(messagesToDelete) > 0 {
+			if err := m.diskStore.DeleteMessages(messagesToDelete); err != nil {
+				log.Printf("Failed to delete old/expired messages: %v", err)
+			} else {
+				atomic.AddUint64(&m.metrics.messagesOnDisk, ^uint64(0)&uint64(len(messagesToDelete)))
+				log.Printf("Deleted %d old/expired messages from disk", len(messagesToDelete))
+			}
+		}
+
+		// Process topic by topic for cloud storage
+		moveCount := 0
+		for topic, messages := range messagesToMove {
+			if len(messages) == 0 {
+				continue
+			}
+
+			// First store in cloud
+			if err := m.cloudStore.Store(topic, messages); err != nil {
+				log.Printf("Failed to archive messages for topic %s: %v", topic, err)
+				continue
+			}
+
+			// Update metrics
+			atomic.AddUint64(&m.metrics.messagesInCloud, uint64(len(messages)))
+			atomic.AddUint64(&m.metrics.diskOffloads, uint64(len(messages)))
+			moveCount += len(messages)
+		}
+
+		if moveCount > 0 {
+			log.Printf("Moved %d messages from disk to cloud", moveCount)
 		}
 	}
 }
@@ -331,100 +486,12 @@ func (m *Manager) PerformFullCompaction() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	log.Printf("Starting full compaction across all storage tiers")
+	// First clean up expired messages
+	m.cleanupExpiredMessages()
 
-	// Step 1: Handle memory to disk transfer if disk storage is available
-	if m.diskStore != nil {
-		// Get messages from memory store to move to disk
-		if m.memoryStore != nil {
-			oldMessages, err := m.memoryStore.GetOldestMessages(m.policy.BatchSize, m.policy.MemoryRetention)
-			if err != nil {
-				return fmt.Errorf("failed to get old messages from memory: %w", err)
-			}
+	// Then perform regular archival
+	m.archiveOldMessages()
 
-			for _, msg := range oldMessages {
-				// Store in disk
-				if err := m.diskStore.Store(msg); err != nil {
-					log.Printf("Failed to move message %s to disk: %v", msg.ID, err)
-					continue
-				}
-
-				// Remove from memory after confirming it's on disk
-				m.memoryStore.Delete(msg.ID)
-
-				// Update metrics
-				atomic.AddUint64(&m.metrics.memoryOffloads, 1)
-			}
-
-			log.Printf("Moved %d messages from memory to disk", len(oldMessages))
-		}
-	}
-
-	// Step 2: Handle disk to cloud transfer if cloud storage is available
-	if m.cloudStore != nil && m.diskStore != nil {
-		// Find messages older than the configured threshold
-		cutoff := time.Now().Add(-m.policy.DiskRetention / 2) // Use half the retention time as threshold
-
-		// List all messages to find old ones
-		// This is a simplification - in a real implementation we would use a more efficient method
-		topicIds, err := m.diskStore.ListAllTopicIDs()
-		if err != nil {
-			return fmt.Errorf("failed to list topics from disk: %w", err)
-		}
-
-		// Group messages by topic for batch upload to cloud
-		topicMessages := make(map[string][]Message)
-		movedCount := 0
-
-		for _, topicInfo := range topicIds {
-			topic := topicInfo.Topic
-			for _, id := range topicInfo.IDs {
-				// Retrieve the message to check its timestamp
-				msg, err := m.diskStore.Retrieve(id)
-				if err != nil {
-					log.Printf("Failed to retrieve message %s: %v", id, err)
-					continue
-				}
-
-				if msg.Timestamp.Before(cutoff) {
-					// Group by topic for batch upload
-					topicMessages[topic] = append(topicMessages[topic], *msg)
-					movedCount++
-				}
-			}
-		}
-
-		// Upload messages to cloud by topic
-		for topic, messages := range topicMessages {
-			if len(messages) > 0 {
-				// Store batch in cloud
-				if err := m.cloudStore.Store(topic, messages); err != nil {
-					log.Printf("Failed to move messages for topic %s to cloud: %v", topic, err)
-					continue
-				}
-
-				// Update metrics
-				atomic.AddUint64(&m.metrics.diskOffloads, uint64(len(messages)))
-			}
-		}
-
-		// Now delete the moved messages
-		if err := m.diskStore.DeleteOldMessages(m.policy.DiskRetention / 2); err != nil {
-			log.Printf("Warning: Failed to delete old messages from disk: %v", err)
-		}
-
-		log.Printf("Moved approximately %d messages from disk to cloud", movedCount)
-	}
-
-	// Step 3: Trigger database compaction to reclaim space
-	if m.diskStore != nil {
-		if err := m.diskStore.ForceCompaction(); err != nil {
-			return fmt.Errorf("failed to compact disk store: %w", err)
-		}
-		log.Printf("Completed disk store compaction")
-	}
-
-	log.Printf("Full compaction completed successfully")
 	return nil
 }
 
@@ -460,37 +527,14 @@ func (m *Manager) GetDiskTopics() ([]string, error) {
 	return topics, nil
 }
 
-// GetCloudTopics returns a list of topics stored in the cloud tier
+// GetCloudTopics returns the list of topics stored in the cloud tier
 func (m *Manager) GetCloudTopics() ([]string, error) {
 	if m.cloudStore == nil {
 		return nil, fmt.Errorf("cloud storage not enabled")
 	}
 
-	// The actual implementation would query the cloud store for all topics
-	// This might be a costly operation depending on the cloud provider
-
-	// Let's assume we can list "directories" in the cloud store
-	// where each directory represents a topic
-
-	// For now, we'll use a simple approach by querying list of
-	// distinct topics from cloud storage
-
-	// Since the CloudStore doesn't have a direct method to list topics,
-	// we'll implement a fallback that scans for known topics
-
-	// Try to get metrics from cloud store which might have topic information
-	metrics := m.cloudStore.GetMetrics()
-
-	// If metrics contains a topics list, use it
-	if topicsInterface, exists := metrics["topics"]; exists {
-		if topicsSlice, ok := topicsInterface.([]string); ok && len(topicsSlice) > 0 {
-			return topicsSlice, nil
-		}
-	}
-
-	// Fallback: without a direct listing method, return an empty list
-	// In a real implementation, we would scan the bucket for topic prefixes
-	return []string{}, nil
+	// Use the improved topic listing method from cloud store
+	return m.cloudStore.ListTopics()
 }
 
 // GetDiskMessageCount returns the number of messages for a topic in the disk tier
