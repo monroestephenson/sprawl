@@ -17,7 +17,7 @@ func main() {
 	// Create an AI engine instance with default options
 	options := ai.DefaultEngineOptions()
 	options.SampleInterval = 10 * time.Second // Faster sampling for testing
-	engine := ai.NewEngine(options)
+	engine := ai.NewEngine(options, nil)
 	fmt.Println("AI Data Generator started...")
 
 	// Generate data for the past 7 days

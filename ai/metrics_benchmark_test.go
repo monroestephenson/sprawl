@@ -58,7 +58,7 @@ func BenchmarkCollectSystemMetrics(b *testing.B) {
 		EnablePredictor: false, // Disable predictor for pure metrics performance
 	}
 
-	engine := NewEngine(options)
+	engine := NewEngine(options, nil)
 	engine.Start()
 
 	// Let the engine initialize
@@ -100,7 +100,7 @@ func BenchmarkCollectEngineMetrics(b *testing.B) {
 				EnablePredictor: false,
 			}
 
-			engine := NewEngine(options)
+			engine := NewEngine(options, nil)
 
 			// Reset timer to exclude setup
 			b.ResetTimer()
@@ -197,7 +197,7 @@ func BenchmarkMetricsWithSimulation(b *testing.B) {
 				EnablePredictor: false,
 			}
 
-			engine := NewEngine(options)
+			engine := NewEngine(options, nil)
 			engine.Start()
 
 			// Let the engine initialize

@@ -513,7 +513,7 @@ func calculatePatternPeriodicity(data []TimeSeriesPoint) float64 {
 	}
 
 	for lag := 2; lag <= maxLag; lag++ {
-		autocorr := calculateAutocorrelation(values, lag)
+		autocorr := calculateTimeSeriesAutocorrelation(values, lag)
 		if autocorr > maxAutocorr {
 			maxAutocorr = autocorr
 		}

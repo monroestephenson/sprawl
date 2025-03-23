@@ -119,8 +119,8 @@ func NewNode(opts *Options) (*Node, error) {
 	balancer := balancer.NewLoadBalancer(dht)
 	metrics := metrics.NewMetrics()
 
-	// Create the AI Engine with default options
-	aiEngine := ai.NewEngine(ai.DefaultEngineOptions())
+	// Create the AI Engine with default options and store
+	aiEngine := ai.NewEngine(ai.DefaultEngineOptions(), store)
 
 	// Create registry for subscribers
 	reg := registry.NewRegistry(nodeID)

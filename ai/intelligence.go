@@ -353,7 +353,7 @@ func getMemoryUsage() float64 {
 	return v.UsedPercent
 }
 
-// estimateStorageUsage estimates storage usage
+// estimateStorageUsage returns actual storage usage from the store
 func estimateStorageUsage() float64 {
 	// Get a reference to the global store
 	store := store.GetGlobalStore()

@@ -33,6 +33,7 @@ type Engine struct {
 	predictionModels map[string]bool
 	enabled          bool
 	stopCh           chan struct{}
+	store            *store.Store
 }
 
 // EngineOptions holds configuration options for the AI Engine
@@ -202,7 +203,7 @@ func getNetworkStats() NetworkStats {
 }
 
 // NewEngine creates a new AI Engine
-func NewEngine(options EngineOptions) *Engine {
+func NewEngine(options EngineOptions, storeInstance *store.Store) *Engine {
 	engine := &Engine{
 		loadPredictor:    prediction.NewLoadPredictor(options.MaxDataPoints),
 		metrics:          make(map[string]float64),
@@ -210,6 +211,7 @@ func NewEngine(options EngineOptions) *Engine {
 		predictionModels: make(map[string]bool),
 		enabled:          true,
 		stopCh:           make(chan struct{}),
+		store:            storeInstance,
 	}
 
 	// Initialize pattern matcher if enabled
@@ -314,7 +316,7 @@ func (e *Engine) collectMetrics() {
 	}
 
 	// Collect store metrics if available
-	storeMetrics := getStoreMetrics()
+	storeMetrics := e.getStoreMetrics()
 	for topic, messageCount := range storeMetrics.MessageCounts {
 		e.RecordMetric(MetricKindMessageRate, topic, float64(messageCount), map[string]string{
 			"source": "store",
@@ -383,18 +385,10 @@ func getMemoryUsagePercent() float64 {
 	return v.UsedPercent
 }
 
-// StoreMetrics contains metrics from the message store
-type StoreMetrics struct {
-	TotalMessages int
-	MessageCounts map[string]int
-	Topics        []string
-}
-
 // getStoreMetrics collects metrics from the message store
-func getStoreMetrics() StoreMetrics {
-	// Get a reference to the global store
-	globalStore := store.GetGlobalStore()
-	if globalStore == nil {
+func (e *Engine) getStoreMetrics() StoreMetrics {
+	// Use the store instance directly instead of the global store
+	if e.store == nil {
 		log.Println("Warning: Store not available for metrics collection, using simulated data")
 		return simulateStoreMetrics()
 	}
@@ -405,32 +399,96 @@ func getStoreMetrics() StoreMetrics {
 	}
 
 	// Get list of topics from the store
-	topics := globalStore.GetTopics()
+	topics := e.store.GetTopics()
 
 	metrics.Topics = topics
 	totalMessages := 0
 
-	// Collect message counts for each topic
+	// Collect message counts and detailed metrics for each topic
 	for _, topic := range topics {
-		// Get messages from store to count them
-		messages, err := globalStore.GetTopicMessages(topic)
-		if err != nil {
-			log.Printf("Error getting messages for topic %s: %v", topic, err)
-			continue
-		}
-
-		// Count total messages
-		messageCount := len(messages)
+		// Get message count for the topic
+		messageCount := e.store.GetMessageCountForTopic(topic)
 		metrics.MessageCounts[topic] = messageCount
 		totalMessages += messageCount
 
-		// Get subscriber count - using the method that exists in the store
-		subsCount := globalStore.GetSubscriberCountForTopic(topic)
-		log.Printf("Topic %s has %d subscribers", topic, subsCount)
+		// Get subscriber count
+		subsCount := e.store.GetSubscriberCountForTopic(topic)
+		log.Printf("Topic %s has %d messages and %d subscribers",
+			topic, messageCount, subsCount)
+
+		// Get topic timestamps to analyze activity patterns
+		timestamps := e.store.GetTopicTimestamps(topic)
+		if timestamps != nil {
+			// Log the most recent activity
+			mostRecent := timestamps.Newest
+			if !mostRecent.IsZero() {
+				timeSinceLastMessage := time.Since(mostRecent)
+				log.Printf("Topic %s last activity: %v (%v ago)",
+					topic, mostRecent.Format(time.RFC3339), timeSinceLastMessage)
+			}
+		}
 	}
 
+	// Calculate overall statistics
 	metrics.TotalMessages = totalMessages
+
+	// Get tiered storage metrics
+	metrics.MemoryUsage = float64(e.store.GetMemoryUsage())
+
+	// Get disk tier stats
+	diskStats := e.store.GetDiskStats()
+	if diskStats != nil {
+		metrics.DiskEnabled = diskStats.Enabled
+		metrics.DiskUsageBytes = diskStats.UsedBytes
+		metrics.DiskMessageCount = diskStats.MessageCount
+	}
+
+	// Get cloud tier stats
+	cloudStats := e.store.GetCloudStats()
+	if cloudStats != nil {
+		metrics.CloudEnabled = cloudStats.Enabled
+		metrics.CloudUsageBytes = cloudStats.UsedBytes
+		metrics.CloudMessageCount = cloudStats.MessageCount
+	}
+
+	// Get tier configuration
+	tierConfig := e.store.GetTierConfig()
+	metrics.MemoryToDiskThreshold = tierConfig.MemoryToDiskThresholdBytes
+	metrics.DiskToCloudThreshold = tierConfig.DiskToCloudThresholdBytes
+
 	return metrics
+}
+
+// Extend StoreMetrics to include detailed tier statistics
+type TierMetrics struct {
+	MessageCount       int
+	BytesUsed          uint64
+	MaxCapacity        uint64
+	UtilizationPercent float64
+}
+
+// StoreMetrics contains information about message store
+type StoreMetrics struct {
+	TotalMessages int
+	MessageCounts map[string]int
+	Topics        []string
+
+	// Memory tier metrics
+	MemoryUsage float64
+
+	// Disk tier metrics
+	DiskEnabled      bool
+	DiskUsageBytes   int64
+	DiskMessageCount int
+
+	// Cloud tier metrics
+	CloudEnabled      bool
+	CloudUsageBytes   int64
+	CloudMessageCount int
+
+	// Tier thresholds
+	MemoryToDiskThreshold int64
+	DiskToCloudThreshold  int64
 }
 
 // simulateStoreMetrics returns simulated store metrics

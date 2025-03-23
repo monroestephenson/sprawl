@@ -172,13 +172,8 @@ func calculateMean(data []float64) float64 {
 }
 
 func calculateStdDev(data []float64, mean float64) float64 {
-	sumSquaredDiff := 0.0
-	for _, val := range data {
-		diff := val - mean
-		sumSquaredDiff += diff * diff
-	}
-	variance := sumSquaredDiff / float64(len(data))
-	return math.Sqrt(variance)
+	// Use the shared implementation from timeseries.go
+	return calculateSeriesStdDev(data, mean)
 }
 
 func calculateAutocorrelation(data []float64, lag int) float64 {
