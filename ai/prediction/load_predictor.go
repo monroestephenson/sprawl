@@ -150,11 +150,8 @@ func (lp *LoadPredictor) AddDataPoint(point LoadDataPoint) {
 	lp.updateModels(point)
 }
 
-// updateModels updates prediction models with new data
-func (lp *LoadPredictor) updateModels(point LoadDataPoint) {
-	resource := point.Resource
-	identifier := point.NodeID
-
+// ensureInitialized ensures all maps are initialized for a resource and identifier
+func (lp *LoadPredictor) ensureInitialized(resource ResourceType, identifier string) {
 	// Initialize time series models if needed
 	if _, exists := lp.timeSeriesModels[resource]; !exists {
 		lp.timeSeriesModels[resource] = make(map[string]timeSeriesModel)
@@ -170,106 +167,152 @@ func (lp *LoadPredictor) updateModels(point LoadDataPoint) {
 		lp.weightedPredictors[resource] = make(map[string][]weightedPredictor)
 	}
 
-	// Update time series model
-	if model, exists := lp.timeSeriesModels[resource][identifier]; exists {
-		// If we have an existing model, update it
-		if !model.lastUpdated.IsZero() {
-			// Calculate time since last update
-			elapsed := point.Timestamp.Sub(model.lastUpdated)
+	// Initialize history data if needed
+	if _, exists := lp.historyData[resource]; !exists {
+		lp.historyData[resource] = make(map[string][]LoadDataPoint)
+	}
 
-			// Apply exponential smoothing
-			alpha := 0.3 // Default smoothing factor
-			beta := 0.1  // Default trend smoothing factor
+	// Initialize the slice for this identifier if needed
+	if _, exists := lp.historyData[resource][identifier]; !exists {
+		lp.historyData[resource][identifier] = []LoadDataPoint{}
+	}
+}
 
-			// Adjust alpha based on time elapsed (increase for longer gaps)
-			if elapsed > time.Hour {
-				alpha = math.Min(0.8, alpha*(1.0+elapsed.Hours()/24.0))
-			}
+// getIdentifier creates a unique identifier from node ID and resource
+func getIdentifier(nodeID string, resource ResourceType) string {
+	return nodeID + ":" + string(resource)
+}
 
-			// Calculate prediction error
-			predictionError := point.Value - model.lastForecast
+func (lp *LoadPredictor) updateModels(point LoadDataPoint) {
+	// Ensure we have maps for this resource
+	resource := point.Resource
+	identifier := getIdentifier(point.NodeID, point.Resource)
 
-			// Update trend
-			model.trend = beta*(point.Value-model.lastValue) + (1-beta)*model.trend
+	lp.ensureInitialized(resource, identifier)
 
-			// Update value with smoothing
-			model.lastValue = point.Value
-			model.lastForecast = alpha*point.Value + (1-alpha)*(model.lastForecast+model.trend)
+	// Add to history
+	if historyData, exists := lp.historyData[resource][identifier]; exists {
+		lp.historyData[resource][identifier] = append(historyData, point)
 
-			// Store error for model evaluation (would be used in a more complete implementation)
-			_ = predictionError
-		} else {
-			// First data point for this model
-			model.lastValue = point.Value
-			model.lastForecast = point.Value
-			model.trend = 0.0
-		}
-
-		model.lastUpdated = point.Timestamp
-		lp.timeSeriesModels[resource][identifier] = model
-	} else {
-		// Create new model
-		lp.timeSeriesModels[resource][identifier] = timeSeriesModel{
-			alpha:        0.3,
-			beta:         0.1,
-			lastValue:    point.Value,
-			lastForecast: point.Value,
-			trend:        0.0,
-			lastUpdated:  point.Timestamp,
+		// Limit history size
+		if len(lp.historyData[resource][identifier]) > lp.maxHistoryPoints {
+			lp.historyData[resource][identifier] = lp.historyData[resource][identifier][1:]
 		}
 	}
 
+	// Update time series model using double exponential smoothing
+	if model, exists := lp.timeSeriesModels[resource][identifier]; exists {
+		// Calculate time since last update to adjust alpha
+		timeSinceLast := point.Timestamp.Sub(model.lastUpdated)
+
+		// Dynamically adjust alpha based on time since last update
+		// The longer the gap, the less weight we give to the previous forecast
+		adjustedAlpha := model.alpha
+		if timeSinceLast > time.Hour {
+			// Increase alpha (more weight to new observation) for longer gaps
+			adjustedAlpha = math.Min(0.8, model.alpha*2.0)
+		}
+
+		// Extract features that might influence the prediction
+		features := extractTimeFeatures(point.Timestamp)
+		hourOfDay := features["hour_of_day"]
+		isWeekend := features["is_weekend"]
+
+		// Apply seasonal adjustment if we have a seasonalModel
+		seasonalAdjustment := 1.0
+		if seasonalModel, hasSeasonalModel := lp.seasonalModels[resource][identifier]; hasSeasonalModel {
+			// Adjust based on hour of day (hourly seasonality)
+			hour := int(hourOfDay)
+			if hour < len(seasonalModel.seasonalIndices) {
+				seasonalAdjustment = seasonalModel.seasonalIndices[hour]
+			}
+
+			// Additional weekend adjustment if applicable
+			if isWeekend > 0.5 { // Weekend
+				// WeekendAdjustment would be calculated based on historical pattern differences
+				weekendAdjustment := getWeekendAdjustment(lp.historyData[resource][identifier])
+				seasonalAdjustment *= weekendAdjustment
+			}
+		}
+
+		// Adjust the value based on seasonal factors
+		seasonallyAdjustedValue := point.Value
+		if seasonalAdjustment != 0 {
+			seasonallyAdjustedValue = point.Value / seasonalAdjustment
+		}
+
+		// Calculate prediction error from previous forecast
+		// Store for model evaluation and possible adaptive parameter tuning
+		_ = seasonallyAdjustedValue - model.lastForecast
+
+		// Update level (intercept) with exponential smoothing
+		newLevel := adjustedAlpha*seasonallyAdjustedValue + (1-adjustedAlpha)*(model.lastValue+model.trend)
+
+		// Update trend (slope) with exponential smoothing
+		newTrend := model.beta*(newLevel-model.lastValue) + (1-model.beta)*model.trend
+
+		// Update the model
+		newModel := timeSeriesModel{
+			alpha:        model.alpha, // Keep original alpha for next time
+			lastValue:    newLevel,
+			lastForecast: newLevel + newTrend,
+			trend:        newTrend,
+			beta:         model.beta,
+			lastUpdated:  point.Timestamp,
+		}
+
+		// Store the updated model
+		lp.timeSeriesModels[resource][identifier] = newModel
+	}
+
 	// Update seasonal model if we have enough data
-	// This is simplified - a real implementation would be more complex
+	// Handle seasonality by properly capturing patterns
 	if dataPoints, exists := lp.historyData[resource][identifier]; exists && len(dataPoints) >= 24 {
-		// Try to update seasonal model with 24-hour seasonality
+		// Initialize or update seasonal model
 		if model, exists := lp.seasonalModels[resource][identifier]; exists {
 			// Extract hour of day for seasonal indexing
 			hour := point.Timestamp.Hour()
 
-			// Update seasonal index for this hour
-			if hour < len(model.seasonalIndices) {
-				// Simple update: average of old value and new normalized value
-				normalized := point.Value / model.baseValue
-				model.seasonalIndices[hour] = (model.seasonalIndices[hour] + normalized) / 2.0
+			// Calculate the detrended value
+			baseValue := model.baseValue
+			if baseValue == 0 {
+				baseValue = 1.0 // Avoid division by zero
+			}
 
-				// Update base value with slight weight to new value
+			// Calculate ratio of actual value to expected baseline
+			normalized := point.Value / baseValue
+
+			// Exponential smoothing for seasonal index
+			smoothingFactor := 0.1 // Low smoothing factor for seasonal components
+
+			if hour < len(model.seasonalIndices) {
+				// Update seasonal index for this hour with exponential smoothing
+				oldIndex := model.seasonalIndices[hour]
+				model.seasonalIndices[hour] = smoothingFactor*normalized + (1-smoothingFactor)*oldIndex
+
+				// Rebalance indices to ensure they average to 1.0
+				rebalanceSeasonalIndices(model.seasonalIndices)
+
+				// Update base value with slight weight to new value (detrended)
 				model.baseValue = 0.95*model.baseValue + 0.05*point.Value
 
 				lp.seasonalModels[resource][identifier] = model
 			}
 		} else if len(dataPoints) >= 48 { // Need at least 2 days of data to initialize
-			// Initialize a new seasonal model
-			seasonalIndices := make([]float64, 24) // 24 hours in a day
+			// Calculate seasonal indices based on historical data
+			seasonalIndices := calculateSeasonalIndices(dataPoints, 24)
 
-			// Calculate average value as base
+			// Calculate base value (average)
 			sum := 0.0
 			for _, dp := range dataPoints {
 				sum += dp.Value
 			}
 			baseValue := sum / float64(len(dataPoints))
-
-			// Initialize seasonal indices
-			hourCounts := make([]int, 24)
-			hourSums := make([]float64, 24)
-
-			// Calculate sum and count for each hour
-			for _, dp := range dataPoints {
-				hour := dp.Timestamp.Hour()
-				hourSums[hour] += dp.Value / baseValue
-				hourCounts[hour]++
+			if baseValue == 0 {
+				baseValue = 1.0 // Avoid division by zero
 			}
 
-			// Calculate average for each hour
-			for i := 0; i < 24; i++ {
-				if hourCounts[i] > 0 {
-					seasonalIndices[i] = hourSums[i] / float64(hourCounts[i])
-				} else {
-					seasonalIndices[i] = 1.0 // Default: no seasonal effect
-				}
-			}
-
-			// Store the model
+			// Initialize seasonal model
 			lp.seasonalModels[resource][identifier] = seasonalModel{
 				seasonLength:    24,
 				seasonalIndices: seasonalIndices,
@@ -277,6 +320,106 @@ func (lp *LoadPredictor) updateModels(point LoadDataPoint) {
 			}
 		}
 	}
+}
+
+// rebalanceSeasonalIndices ensures seasonal indices average to 1.0
+func rebalanceSeasonalIndices(indices []float64) {
+	// Calculate sum of indices
+	sum := 0.0
+	for _, idx := range indices {
+		sum += idx
+	}
+
+	// If sum is zero, set all to 1.0
+	if sum == 0 {
+		for i := range indices {
+			indices[i] = 1.0
+		}
+		return
+	}
+
+	// Calculate average
+	avg := sum / float64(len(indices))
+
+	// Rebalance
+	for i := range indices {
+		indices[i] = indices[i] / avg
+	}
+}
+
+// getWeekendAdjustment calculates how weekend values differ from weekday values
+func getWeekendAdjustment(data []LoadDataPoint) float64 {
+	if len(data) < 48 { // Need enough data to calculate pattern
+		return 1.0
+	}
+
+	// Count weekend and weekday points
+	var weekendSum, weekdaySum float64
+	var weekendCount, weekdayCount int
+
+	for _, point := range data {
+		dayOfWeek := point.Timestamp.Weekday()
+		if dayOfWeek == time.Saturday || dayOfWeek == time.Sunday {
+			weekendSum += point.Value
+			weekendCount++
+		} else {
+			weekdaySum += point.Value
+			weekdayCount++
+		}
+	}
+
+	// Calculate averages
+	weekendAvg := 1.0
+	weekdayAvg := 1.0
+
+	if weekendCount > 0 {
+		weekendAvg = weekendSum / float64(weekendCount)
+	}
+
+	if weekdayCount > 0 {
+		weekdayAvg = weekdaySum / float64(weekdayCount)
+	}
+
+	// Calculate adjustment factor
+	if weekdayAvg == 0 {
+		return 1.0 // Avoid division by zero
+	}
+
+	return weekendAvg / weekdayAvg
+}
+
+// extractTimeFeatures extracts relevant time features for prediction
+func extractTimeFeatures(timestamp time.Time) map[string]float64 {
+	features := make(map[string]float64)
+
+	// Basic time features
+	features["hour_of_day"] = float64(timestamp.Hour())
+	features["day_of_week"] = float64(timestamp.Weekday())
+	features["month"] = float64(timestamp.Month())
+	features["day_of_month"] = float64(timestamp.Day())
+
+	// Derived features
+	features["is_weekend"] = 0.0
+	if timestamp.Weekday() == time.Saturday || timestamp.Weekday() == time.Sunday {
+		features["is_weekend"] = 1.0
+	}
+
+	features["is_business_hours"] = 0.0
+	hour := timestamp.Hour()
+	if hour >= 9 && hour <= 17 && features["is_weekend"] == 0 {
+		features["is_business_hours"] = 1.0
+	}
+
+	// Cyclic encoding of hour (to capture circular nature of time)
+	features["hour_sin"] = math.Sin(2 * math.Pi * float64(hour) / 24.0)
+	features["hour_cos"] = math.Cos(2 * math.Pi * float64(hour) / 24.0)
+
+	// Cyclic encoding of day of week
+	dayOfWeek := float64(timestamp.Weekday())
+	features["day_sin"] = math.Sin(2 * math.Pi * dayOfWeek / 7.0)
+	features["day_cos"] = math.Cos(2 * math.Pi * dayOfWeek / 7.0)
+
+	return features
 }
 
 // Train builds prediction models from historical data
@@ -509,220 +652,347 @@ func (lp *LoadPredictor) TrainForResource(resource ResourceType, nodeID string, 
 	return nil
 }
 
-// calculateSeasonalIndices calculates seasonal indices from historical data
-func calculateSeasonalIndices(points []LoadDataPoint, seasonLength int) []float64 {
-	if len(points) < seasonLength {
-		// Not enough data, return neutral indices
-		indices := make([]float64, seasonLength)
+// calculateSeasonalIndices computes seasonal indices for a given period length
+func calculateSeasonalIndices(dataPoints []LoadDataPoint, periodLength int) []float64 {
+	if len(dataPoints) < periodLength*2 {
+		// Default to no seasonality if we don't have enough data
+		indices := make([]float64, periodLength)
 		for i := range indices {
 			indices[i] = 1.0
 		}
 		return indices
 	}
 
-	// Group data by hour (or whatever seasonal period we're using)
-	seasonalGroups := make(map[int][]float64)
-	for _, point := range points {
-		hour := point.Timestamp.Hour()
-		seasonalGroups[hour] = append(seasonalGroups[hour], point.Value)
+	// Calculate the average value to use as a baseline
+	sum := 0.0
+	for _, dp := range dataPoints {
+		sum += dp.Value
+	}
+	avgValue := sum / float64(len(dataPoints))
+	if avgValue == 0 {
+		avgValue = 1.0 // Avoid division by zero
 	}
 
-	// Calculate the average for each hour
-	seasonalAverages := make([]float64, seasonLength)
-	for hour, values := range seasonalGroups {
-		if hour >= seasonLength {
-			continue
-		}
+	// Initialize counters and sums for each period position
+	periodSums := make([]float64, periodLength)
+	periodCounts := make([]int, periodLength)
 
-		sum := 0.0
-		for _, value := range values {
-			sum += value
-		}
-		seasonalAverages[hour] = sum / float64(len(values))
+	// Group data by period position and calculate sums and counts
+	for _, dp := range dataPoints {
+		// Determine position in the seasonal cycle
+		// For hourly data with 24-hour periodicity, this would be the hour of day
+		position := dp.Timestamp.Hour() % periodLength
+
+		// Add normalized value to the sum for this position
+		periodSums[position] += dp.Value / avgValue
+		periodCounts[position]++
 	}
 
-	// Calculate the overall average
-	overallSum := 0.0
-	validHours := 0
-	for _, avg := range seasonalAverages {
-		if avg > 0 {
-			overallSum += avg
-			validHours++
-		}
-	}
-
-	overallAverage := 1.0
-	if validHours > 0 {
-		overallAverage = overallSum / float64(validHours)
-	}
-
-	// Calculate the seasonal indices
-	seasonalIndices := make([]float64, seasonLength)
-	for i, avg := range seasonalAverages {
-		if avg > 0 {
-			seasonalIndices[i] = avg / overallAverage
+	// Calculate average for each position in the cycle
+	indices := make([]float64, periodLength)
+	for i := 0; i < periodLength; i++ {
+		if periodCounts[i] > 0 {
+			indices[i] = periodSums[i] / float64(periodCounts[i])
 		} else {
-			seasonalIndices[i] = 1.0 // Neutral index for hours with no data
+			indices[i] = 1.0 // Default for positions with no data
 		}
 	}
 
-	return seasonalIndices
+	// Normalize indices to ensure they average to 1.0
+	rebalanceSeasonalIndices(indices)
+
+	return indices
 }
 
-// Predict forecasts future resource usage
-func (lp *LoadPredictor) Predict(resource ResourceType, nodeID string, futureTime time.Time) (PredictionResult, error) {
+// Predict forecasts resource usage for a future timestamp
+func (lp *LoadPredictor) Predict(resource ResourceType, nodeID string, futureTime time.Time, interval PredictionInterval) (PredictionResult, error) {
 	lp.mu.RLock()
 	defer lp.mu.RUnlock()
 
+	// Validate inputs
+	if !lp.trained && len(lp.historyData) == 0 {
+		return PredictionResult{}, errors.New("prediction model has not been trained")
+	}
+
+	identifier := getIdentifier(nodeID, resource)
+
+	// Check if we have models for this resource
+	if _, exists := lp.timeSeriesModels[resource]; !exists {
+		return PredictionResult{}, fmt.Errorf("no models available for resource %s", resource)
+	}
+
+	// Check if we have models for this identifier
+	if _, exists := lp.timeSeriesModels[resource][identifier]; !exists {
+		// Try to find similar nodes to use as a fallback
+		similarIdentifier := lp.findSimilarNode(resource, nodeID)
+		if similarIdentifier == "" {
+			return PredictionResult{}, fmt.Errorf("no models available for node %s and resource %s", nodeID, resource)
+		}
+		identifier = similarIdentifier
+	}
+
+	// Initialize prediction output
 	result := PredictionResult{
-		Resource:      resource,
-		NodeID:        nodeID,
-		Timestamp:     futureTime,
-		PredictedVal:  0.0,
-		LowerBound:    0.0,
-		UpperBound:    0.0,
-		Confidence:    0.5,
-		ProbBurstRisk: 0.1,
+		Resource:     resource,
+		NodeID:       nodeID,
+		Timestamp:    futureTime,
+		PredictedVal: 0.0,
+		Confidence:   0.0,
 	}
 
-	// Check if we have predictors for this resource and node
-	predictors, ok := lp.weightedPredictors[resource][nodeID]
-	if !ok || len(predictors) == 0 {
-		return result, errors.New("no prediction models available")
+	// Get time series model
+	var tsModel timeSeriesModel
+	var hasTSModel bool
+	if model, exists := lp.timeSeriesModels[resource][identifier]; exists {
+		tsModel = model
+		hasTSModel = true
 	}
 
-	// Get model weights
-	weights, ok := lp.modelWeights[nodeID+string(resource)]
-	if !ok || len(weights) != len(predictors) {
-		// Default to equal weights
-		weights = make([]float64, len(predictors))
-		for i := range weights {
-			weights[i] = 1.0 / float64(len(weights))
-		}
+	// Get seasonal model
+	var seasonModel seasonalModel
+	var hasSeasonalModel bool
+	if model, exists := lp.seasonalModels[resource][identifier]; exists {
+		seasonModel = model
+		hasSeasonalModel = true
 	}
 
-	// Make prediction by combining multiple models
-	weightedSum := 0.0
-	totalWeight := 0.0
-	predictions := make([]float64, len(predictors))
+	// Calculate base prediction using time series model
+	if hasTSModel {
+		// Time difference in hours (can be fractional)
+		timeDiffHours := futureTime.Sub(tsModel.lastUpdated).Hours()
 
-	// Get predictions from each model and combine
-	for i, predictor := range predictors {
-		predictions[i] = predictor.predictFn(futureTime)
-		weightedSum += predictions[i] * weights[i]
-		totalWeight += weights[i]
-	}
+		// Apply trend projection based on time difference
+		baseProjection := tsModel.lastValue + tsModel.trend*timeDiffHours
 
-	if totalWeight > 0 {
-		result.PredictedVal = weightedSum / totalWeight
-	}
-
-	// Calculate prediction bounds
-	// In a real implementation, this would be more sophisticated
-	varianceSum := 0.0
-	for i, pred := range predictions {
-		diff := pred - result.PredictedVal
-		varianceSum += diff * diff * weights[i]
-	}
-
-	// Standard deviation of predictions
-	stdDev := math.Sqrt(varianceSum / totalWeight)
-
-	// Set confidence interval (roughly 95% confidence)
-	result.LowerBound = result.PredictedVal - 1.96*stdDev
-	if result.LowerBound < 0 {
-		result.LowerBound = 0 // Ensure non-negative
-	}
-	result.UpperBound = result.PredictedVal + 1.96*stdDev
-
-	// Calculate confidence based on consistency between models
-	// High variance = lower confidence
-	result.Confidence = 1.0 - math.Min(1.0, stdDev/result.PredictedVal)
-	if result.Confidence < 0.1 {
-		result.Confidence = 0.1 // Minimum confidence
-	}
-
-	// Burst risk calculation (simplified)
-	// Check if we have sufficient history for this resource
-	if data, exists := lp.historyData[resource][nodeID]; exists && len(data) > 10 {
-		// Look for spikes in recent history
-		recentData := data
-		if len(data) > 100 {
-			recentData = data[len(data)-100:]
+		// For long-term predictions, dampen the trend to avoid unrealistic forecasts
+		if timeDiffHours > 24 {
+			dampingFactor := math.Exp(-0.05 * (timeDiffHours - 24.0)) // Exponential damping
+			dampedTrend := tsModel.trend * dampingFactor
+			baseProjection = tsModel.lastValue + dampedTrend*timeDiffHours
 		}
 
-		// Calculate recent volatility
-		sum := 0.0
-		for _, point := range recentData {
-			sum += point.Value
-		}
-		avg := sum / float64(len(recentData))
+		result.PredictedVal = baseProjection
 
-		varianceSum = 0.0
-		maxJump := 0.0
+		// Apply seasonal adjustment if available
+		if hasSeasonalModel {
+			hour := futureTime.Hour()
+			if hour < len(seasonModel.seasonalIndices) {
+				seasonalFactor := seasonModel.seasonalIndices[hour]
 
-		for i := 1; i < len(recentData); i++ {
-			diff := recentData[i].Value - avg
-			varianceSum += diff * diff
+				// Check for weekend effects
+				features := extractTimeFeatures(futureTime)
+				if features["is_weekend"] > 0.5 && len(lp.historyData[resource][identifier]) >= 48 {
+					weekendAdjustment := getWeekendAdjustment(lp.historyData[resource][identifier])
+					seasonalFactor *= weekendAdjustment
+				}
 
-			// Calculate largest jump between consecutive points
-			jump := math.Abs(recentData[i].Value - recentData[i-1].Value)
-			if jump > maxJump {
-				maxJump = jump
+				// Apply seasonal factor to the base projection
+				result.PredictedVal = baseProjection * seasonalFactor
 			}
 		}
 
-		volatility := math.Sqrt(varianceSum / float64(len(recentData)-1))
-		jumpRatio := maxJump / avg
+		// Determine prediction bounds based on historical error and forecast horizon
+		if historyData, hasHistory := lp.historyData[resource][identifier]; hasHistory && len(historyData) > 10 {
+			// Calculate prediction error statistics from recent history
+			var errors []float64
+			var sumSquaredErrors float64
 
-		// Higher volatility and jump ratio indicate higher burst risk
-		result.ProbBurstRisk = math.Min(0.95, (volatility/avg)*0.5+jumpRatio*0.5)
+			// Use last 20 data points or as many as available
+			historySize := len(historyData)
+			startIdx := max(0, historySize-20)
+
+			for i := startIdx; i < historySize-1; i++ {
+				// Calculate the error between actual and what would have been predicted
+				current := historyData[i]
+				next := historyData[i+1]
+				timeDiff := next.Timestamp.Sub(current.Timestamp).Hours()
+
+				// Simple projection from current point to next point
+				projected := current.Value + tsModel.trend*timeDiff
+
+				// Apply seasonal adjustments if available
+				if hasSeasonalModel {
+					currentHour := current.Timestamp.Hour()
+					nextHour := next.Timestamp.Hour()
+
+					if currentHour < len(seasonModel.seasonalIndices) && nextHour < len(seasonModel.seasonalIndices) {
+						seasonalChange := seasonModel.seasonalIndices[nextHour] / seasonModel.seasonalIndices[currentHour]
+						projected *= seasonalChange
+					}
+				}
+
+				// Calculate prediction error
+				error := next.Value - projected
+				errors = append(errors, error)
+				sumSquaredErrors += error * error
+			}
+
+			// Mean squared error
+			mse := 0.0
+			if len(errors) > 0 {
+				mse = sumSquaredErrors / float64(len(errors))
+			}
+
+			// Standard deviation of errors
+			stdDevError := math.Sqrt(mse)
+
+			// Widen prediction interval for longer forecast horizons
+			forecastHorizonFactor := math.Sqrt(timeDiffHours / 24.0)
+			if forecastHorizonFactor < 1.0 {
+				forecastHorizonFactor = 1.0
+			}
+
+			// Calculate confidence interval (95% CI is roughly ±2 standard deviations)
+			marginOfError := 2.0 * stdDevError * forecastHorizonFactor
+
+			// Set bounds
+			result.LowerBound = result.PredictedVal - marginOfError
+			if result.LowerBound < 0 && resource != ResourceNetwork { // Allow negative for network (can represent outbound)
+				result.LowerBound = 0
+			}
+			result.UpperBound = result.PredictedVal + marginOfError
+
+			// Calculate confidence (higher for shorter forecasts, lower for longer ones)
+			confidenceFactor := 1.0 / (1.0 + forecastHorizonFactor*0.5)
+			result.Confidence = math.Max(0.5, math.Min(0.95, confidenceFactor))
+
+			// Calculate burst risk probability based on historical volatility and trend
+			if len(errors) > 0 {
+				// Estimate volatility as coefficient of variation
+				meanValue := 0.0
+				for _, dp := range historyData[startIdx:] {
+					meanValue += dp.Value
+				}
+				meanValue /= float64(historySize - startIdx)
+
+				if meanValue > 0 {
+					volatility := stdDevError / meanValue
+					trendStrength := math.Abs(tsModel.trend) / meanValue
+
+					// Higher volatility and strong upward trends increase burst risk
+					result.ProbBurstRisk = math.Min(0.95, volatility*0.5+trendStrength*0.5)
+				}
+			}
+		} else {
+			// Without enough history, use wider bounds and lower confidence
+			result.LowerBound = result.PredictedVal * 0.5
+			result.UpperBound = result.PredictedVal * 1.5
+			result.Confidence = 0.5
+			result.ProbBurstRisk = 0.5
+		}
+	} else {
+		// Fallback: use average of historical data if available
+		if historyData, exists := lp.historyData[resource][identifier]; exists && len(historyData) > 0 {
+			// Calculate simple average
+			sum := 0.0
+			for _, point := range historyData {
+				sum += point.Value
+			}
+			avg := sum / float64(len(historyData))
+
+			result.PredictedVal = avg
+			result.LowerBound = avg * 0.5
+			result.UpperBound = avg * 1.5
+			result.Confidence = 0.3    // Low confidence for this simple method
+			result.ProbBurstRisk = 0.5 // Medium risk without trend information
+		} else {
+			// No data at all, return error
+			return PredictionResult{}, fmt.Errorf("insufficient data for prediction")
+		}
 	}
 
 	return result, nil
 }
 
+// findSimilarNode attempts to find a node with similar patterns for the given resource
+func (lp *LoadPredictor) findSimilarNode(resource ResourceType, nodeID string) string {
+	// If no data for this exact node, try to find a similar node
+	if resourceData, exists := lp.historyData[resource]; exists {
+		// For now, just return any other node we have data for
+		for otherID := range resourceData {
+			if otherID != nodeID && len(resourceData[otherID]) > 0 {
+				return otherID
+			}
+		}
+	}
+	return "" // No similar node found
+}
+
+// Helper function for min/max operations
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // PredictMultiStep generates predictions for multiple time steps ahead
-func (lp *LoadPredictor) PredictMultiStep(resource ResourceType, nodeID string, startTime time.Time, steps int, interval time.Duration) ([]PredictionResult, error) {
+func (lp *LoadPredictor) PredictMultiStep(resource ResourceType, nodeID string, startTime time.Time, interval time.Duration, steps int) ([]PredictionResult, error) {
+	lp.mu.RLock()
+	defer lp.mu.RUnlock()
+
 	if steps <= 0 {
-		return nil, errors.New("number of steps must be positive")
+		return nil, errors.New("steps must be positive")
+	}
+
+	// Convert the interval duration to a PredictionInterval
+	var predInterval PredictionInterval
+	if interval.Hours() >= 24 {
+		predInterval = Interval24Hour
+	} else if interval.Hours() >= 1 {
+		predInterval = Interval1Hour
+	} else if interval.Minutes() >= 15 {
+		predInterval = Interval15Min
+	} else {
+		predInterval = Interval5Min
 	}
 
 	results := make([]PredictionResult, steps)
 
-	// Generate multi-step forecast
+	// Generate predictions for each time step
 	for i := 0; i < steps; i++ {
 		timePoint := startTime.Add(time.Duration(i) * interval)
-		prediction, err := lp.Predict(resource, nodeID, timePoint)
+		prediction, err := lp.Predict(resource, nodeID, timePoint, predInterval)
 		if err != nil {
 			// Initialize with increasing uncertainty
-			prediction = PredictionResult{
-				Resource:     resource,
-				NodeID:       nodeID,
-				Timestamp:    timePoint,
-				PredictedVal: 0.0,
-				Confidence:   math.Max(0.1, 0.7-float64(i)*0.05), // Decreasing confidence
+			predictedVal := 0.0
+			if i > 0 {
+				// Use the last valid prediction with increased uncertainty
+				predictedVal = results[i-1].PredictedVal
+			}
+
+			// Dummy prediction with high uncertainty
+			results[i] = PredictionResult{
+				Resource:      resource,
+				NodeID:        nodeID,
+				Timestamp:     timePoint,
+				PredictedVal:  predictedVal,
+				LowerBound:    predictedVal * 0.5,
+				UpperBound:    predictedVal * 2.0,
+				Confidence:    0.2,
+				ProbBurstRisk: 0.5,
+			}
+		} else {
+			results[i] = prediction
+
+			// Increase uncertainty for further predictions
+			if i > 0 {
+				// Lower confidence for future predictions
+				scaleFactor := 1.0 - float64(i)/float64(steps*2)
+				if scaleFactor < 0.3 {
+					scaleFactor = 0.3
+				}
+				results[i].Confidence *= scaleFactor
+
+				// Widen prediction intervals
+				margin := results[i].UpperBound - results[i].PredictedVal
+				results[i].UpperBound = results[i].PredictedVal + margin*(1.0+float64(i)*0.1)
+				results[i].LowerBound = results[i].PredictedVal - margin*(1.0+float64(i)*0.1)
+				if results[i].LowerBound < 0 && resource != ResourceNetwork {
+					results[i].LowerBound = 0
+				}
 			}
 		}
-
-		// For long-term predictions, increase uncertainty
-		if i > 0 {
-			// Widen prediction interval
-			intervalWidth := prediction.UpperBound - prediction.LowerBound
-			growthFactor := 1.0 + float64(i)*0.05
-			halfWidth := intervalWidth * growthFactor / 2.0
-
-			prediction.LowerBound = prediction.PredictedVal - halfWidth
-			if prediction.LowerBound < 0 {
-				prediction.LowerBound = 0
-			}
-			prediction.UpperBound = prediction.PredictedVal + halfWidth
-
-			// Reduce confidence for farther predictions
-			prediction.Confidence = math.Max(0.1, prediction.Confidence-float64(i)*0.02)
-		}
-
-		results[i] = prediction
 	}
 
 	return results, nil

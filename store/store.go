@@ -35,6 +35,44 @@ type Message struct {
 // SubscriberFunc is a callback function for message delivery
 type SubscriberFunc func(msg Message)
 
+// Global store instance for system-wide access
+var globalStore *Store
+var globalStoreMu sync.RWMutex
+
+// topicTierMapping maps topics to their assigned storage tiers
+type topicTierMapping struct {
+	mu    sync.RWMutex
+	tiers map[string]string // topic -> tier
+}
+
+// Initialize global tier mapping
+var globalTopicTiers = &topicTierMapping{
+	tiers: make(map[string]string),
+}
+
+// GetGlobalStore returns the global store instance, creating it if needed
+func GetGlobalStore() *Store {
+	globalStoreMu.RLock()
+	if globalStore != nil {
+		defer globalStoreMu.RUnlock()
+		return globalStore
+	}
+	globalStoreMu.RUnlock()
+
+	// Need to acquire write lock to initialize
+	globalStoreMu.Lock()
+	defer globalStoreMu.Unlock()
+
+	// Double-check under write lock
+	if globalStore != nil {
+		return globalStore
+	}
+
+	// Initialize global store
+	globalStore = NewStore()
+	return globalStore
+}
+
 // NewStore creates a new Store
 func NewStore() *Store {
 	store := &Store{
@@ -311,7 +349,7 @@ type TierConfig struct {
 	DiskToCloudThresholdBytes  int64 `json:"disk_to_cloud_threshold_bytes"`
 }
 
-// GetMemoryUsage returns the current memory usage in bytes
+// GetMemoryUsage returns the estimated memory usage in bytes
 func (s *Store) GetMemoryUsage() int64 {
 	if s.tieredManager != nil {
 		metrics := s.tieredManager.GetMetrics()
@@ -321,8 +359,65 @@ func (s *Store) GetMemoryUsage() int64 {
 			}
 		}
 	}
-	// Fallback to placeholder implementation
-	return 2048
+
+	// Calculate actual memory usage by estimating message size
+	var totalBytes int64
+
+	// Get message count per topic
+	topicMap := make(map[string]int)
+	s.mu.RLock()
+	for topic, messages := range s.messages {
+		topicMap[topic] = len(messages)
+	}
+	s.mu.RUnlock()
+
+	// Calculate approximate memory usage
+	for topic, count := range topicMap {
+		// Get average message size (or use estimate)
+		avgSize := s.getAverageMessageSize(topic)
+		if avgSize == 0 {
+			avgSize = 256 // Default average size estimate if no data
+		}
+
+		// Add memory for message contents plus overhead
+		totalBytes += int64(count) * (int64(avgSize) + 64) // 64 bytes for message metadata
+	}
+
+	// Add overhead for topic structures
+	totalBytes += int64(len(topicMap)) * 256 // Approximate overhead per topic
+
+	return totalBytes
+}
+
+// getAverageMessageSize calculates average message size for a topic
+// by sampling messages if available
+func (s *Store) getAverageMessageSize(topic string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	messages, exists := s.messages[topic]
+	if !exists || len(messages) == 0 {
+		return 0
+	}
+
+	// Sample up to 10 messages to estimate average size
+	sampleSize := min(10, len(messages))
+	totalSize := 0
+
+	// Calculate average size from sampled messages
+	for i := 0; i < sampleSize; i++ {
+		totalSize += len(messages[i].Payload)
+	}
+
+	return totalSize / sampleSize
+}
+
+// min returns the smaller of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // GetMessageCount returns the total number of messages across all topics
@@ -337,22 +432,59 @@ func (s *Store) GetMessageCount() int {
 
 // GetTopics returns a list of all topics in the store
 func (s *Store) GetTopics() []string {
-	// In a real implementation, this would query all tiers and aggregate topics
-	// For now, use the metrics topic list if available
-	topics := []string{}
-	if s.metrics != nil {
-		topics = s.metrics.GetTopics()
+	// Query all storage tiers and aggregate topics
+	topics := make(map[string]struct{}) // Use map to deduplicate topics
+
+	// First, get topics from memory (always available)
+	s.mu.RLock()
+	for topic := range s.messages {
+		topics[topic] = struct{}{}
 	}
 
-	// If we don't have topics from metrics, include at least the test-topic if subscribed
-	if len(topics) == 0 {
-		// Check if we have subscribers for test-topic
-		if s.HasSubscribers("test-topic") {
-			topics = append(topics, "test-topic")
+	// Get topics from subscribers too
+	for topic := range s.subscribers {
+		topics[topic] = struct{}{}
+	}
+	s.mu.RUnlock()
+
+	// If tiered storage is enabled, query other tiers
+	if s.tieredManager != nil {
+		// Check if we can access disk store
+		if s.diskEnabled {
+			diskTopics, err := s.tieredManager.GetDiskTopics()
+			if err == nil && len(diskTopics) > 0 {
+				for _, topic := range diskTopics {
+					topics[topic] = struct{}{}
+				}
+			}
+		}
+
+		// Check if we can access cloud store
+		if s.cloudEnabled {
+			cloudTopics, err := s.tieredManager.GetCloudTopics()
+			if err == nil && len(cloudTopics) > 0 {
+				for _, topic := range cloudTopics {
+					topics[topic] = struct{}{}
+				}
+			}
 		}
 	}
 
-	return topics
+	// Convert map keys to slice
+	result := make([]string, 0, len(topics))
+	for topic := range topics {
+		result = append(result, topic)
+	}
+
+	// Update the metrics if available
+	if s.metrics != nil {
+		// Note: This approach has a limitation as it only updates metrics
+		// when this method is called. A more robust approach would continuously
+		// update metrics as messages are added/removed.
+		s.metrics.(*MetricsImpl).UpdateTopics(result)
+	}
+
+	return result
 }
 
 // GetDiskStats returns statistics for the disk storage tier
@@ -482,19 +614,65 @@ func (s *Store) Compact() error {
 		return nil
 	}
 
-	// TODO: Implement compaction for tiered storage
-	log.Println("[Store] Compaction requested for tiered storage")
+	log.Println("[Store] Starting compaction for tiered storage")
+
+	// First, check if we can access the tiered manager
+	s.mu.RLock()
+	tm := s.tieredManager
+	s.mu.RUnlock()
+
+	if tm == nil {
+		return fmt.Errorf("tiered storage manager is not available")
+	}
+
+	// Trigger archive operation on the tiered manager
+	// This will move data from memory to disk and from disk to cloud if configured
+	err := tm.PerformFullCompaction()
+	if err != nil {
+		log.Printf("[Store] Compaction failed: %v", err)
+		return fmt.Errorf("compaction failed: %w", err)
+	}
+
+	log.Println("[Store] Compaction completed successfully")
 	return nil
 }
 
 // GetMessageCountForTopic returns the number of messages for a specific topic
 func (s *Store) GetMessageCountForTopic(topic string) int {
-	// In a real implementation, this would query all tiers
-	// For now, return 0 or a value from metrics if available
-	if s.metrics != nil {
-		return int(s.metrics.GetMessageCountForTopic(topic))
+	count := 0
+
+	// First, count messages in memory
+	s.mu.RLock()
+	if messages, exists := s.messages[topic]; exists {
+		count += len(messages)
 	}
-	return 0
+	s.mu.RUnlock()
+
+	// If tiered storage is enabled, query other tiers
+	if s.tieredManager != nil {
+		// Check disk tier
+		if s.diskEnabled {
+			diskCount, err := s.tieredManager.GetDiskMessageCount(topic)
+			if err == nil {
+				count += diskCount
+			}
+		}
+
+		// Check cloud tier
+		if s.cloudEnabled {
+			cloudCount, err := s.tieredManager.GetCloudMessageCount(topic)
+			if err == nil {
+				count += cloudCount
+			}
+		}
+	}
+
+	// Update metrics
+	if s.metrics != nil {
+		s.metrics.(*MetricsImpl).UpdateTopicMessageCount(topic, int64(count))
+	}
+
+	return count
 }
 
 // GetSubscriberCountForTopic returns the number of subscribers for a specific topic
@@ -505,13 +683,6 @@ func (s *Store) GetSubscriberCountForTopic(topic string) int {
 		return 1
 	}
 	return 0
-}
-
-// GetStorageTierForTopic returns the current storage tier for a topic
-func (s *Store) GetStorageTierForTopic(topic string) string {
-	// In a real implementation, this would determine which tier contains the topic
-	// For now, always return "memory"
-	return "memory"
 }
 
 // GetTopicTimestamps returns timestamp information for a topic
@@ -568,4 +739,215 @@ func (s *Store) GetStorageType() string {
 		return "disk"
 	}
 	return "memory"
+}
+
+// SetStorageTierForTopic assigns a topic to a specific storage tier
+// tier must be one of: "memory", "disk", or "cloud"
+func (s *Store) SetStorageTierForTopic(topic string, tier string) error {
+	// Validate tier
+	if tier != "memory" && tier != "disk" && tier != "cloud" {
+		return fmt.Errorf("invalid tier: %s, must be 'memory', 'disk', or 'cloud'", tier)
+	}
+
+	// Check if tiered storage is enabled
+	if s.tieredManager == nil {
+		// If tiered storage is not enabled and trying to use disk or cloud
+		if tier != "memory" {
+			return fmt.Errorf("tiered storage is not enabled, only 'memory' tier is available")
+		}
+		// Memory tier is always available
+		return nil
+	}
+
+	// Check if disk tier is enabled if requesting disk
+	if tier == "disk" && !s.diskEnabled {
+		return fmt.Errorf("disk tier is not enabled")
+	}
+
+	// Check if cloud tier is enabled if requesting cloud
+	if tier == "cloud" && !s.cloudEnabled {
+		return fmt.Errorf("cloud tier is not enabled")
+	}
+
+	// Store the tier preference for this topic in our global mapping
+	globalTopicTiers.mu.Lock()
+	globalTopicTiers.tiers[topic] = tier
+	globalTopicTiers.mu.Unlock()
+
+	// Log the tier assignment
+	log.Printf("[Store] Topic %s assigned to %s tier", topic, tier)
+
+	// Handle immediate migration if necessary
+	if err := s.migrateTopicToTier(topic, tier); err != nil {
+		log.Printf("[Store] Warning: could not fully migrate topic %s to tier %s: %v",
+			topic, tier, err)
+		// We don't return the error here because the tier assignment is still recorded
+		// and data will gradually move to the correct tier through normal compaction
+	}
+
+	return nil
+}
+
+// migrateTopicToTier moves existing topic messages to the appropriate tier
+func (s *Store) migrateTopicToTier(topic string, tier string) error {
+	// Only attempty migration if tiered manager is available
+	if s.tieredManager == nil {
+		return nil
+	}
+
+	switch tier {
+	case "memory":
+		// Nothing to do - existing messages will stay in their current tiers
+		// New messages will be written to memory
+		return nil
+
+	case "disk":
+		// If messages should be in disk tier, move any in-memory messages to disk
+		s.mu.RLock()
+		messages, exists := s.messages[topic]
+		s.mu.RUnlock()
+
+		if !exists || len(messages) == 0 {
+			return nil // No messages to migrate
+		}
+
+		// Copy the messages slice to avoid concurrent modification issues
+		messagesToMigrate := make([]Message, len(messages))
+		copy(messagesToMigrate, messages)
+
+		// Move messages to disk tier
+		moved := 0
+		for _, msg := range messagesToMigrate {
+			// Convert store.Message to tiered.Message
+			tieredMsg := tiered.Message{
+				ID:        msg.ID,
+				Topic:     msg.Topic,
+				Payload:   msg.Payload,
+				Timestamp: msg.Timestamp,
+				TTL:       msg.TTL,
+			}
+			if err := s.tieredManager.MoveMessageToDisk(tieredMsg); err != nil {
+				log.Printf("[Store] Error moving message %s to disk: %v", msg.ID, err)
+				continue
+			}
+			moved++
+
+			// Remove from memory after confirming it's on disk
+			s.mu.Lock()
+			// Re-get messages list in case it changed
+			if currentMessages, exists := s.messages[topic]; exists {
+				for i, currentMsg := range currentMessages {
+					if currentMsg.ID == msg.ID {
+						// Remove this message
+						s.messages[topic] = append(currentMessages[:i], currentMessages[i+1:]...)
+						break
+					}
+				}
+			}
+			s.mu.Unlock()
+		}
+
+		log.Printf("[Store] Migrated %d/%d messages for topic %s to disk tier",
+			moved, len(messagesToMigrate), topic)
+
+	case "cloud":
+		// If messages should be in cloud tier, move any in-memory or disk messages to cloud
+		// Start with memory tier
+		s.mu.RLock()
+		memoryMessages, exists := s.messages[topic]
+		s.mu.RUnlock()
+
+		if exists && len(memoryMessages) > 0 {
+			// Copy to avoid concurrent modification
+			messagesToMigrate := make([]Message, len(memoryMessages))
+			copy(messagesToMigrate, memoryMessages)
+
+			// Handle in batches
+			batchSize := 100
+			for i := 0; i < len(messagesToMigrate); i += batchSize {
+				end := i + batchSize
+				if end > len(messagesToMigrate) {
+					end = len(messagesToMigrate)
+				}
+
+				batch := messagesToMigrate[i:end]
+				// Convert slice of store.Message to slice of tiered.Message
+				tieredBatch := make([]tiered.Message, len(batch))
+				for i, msg := range batch {
+					tieredBatch[i] = tiered.Message{
+						ID:        msg.ID,
+						Topic:     msg.Topic,
+						Payload:   msg.Payload,
+						Timestamp: msg.Timestamp,
+						TTL:       msg.TTL,
+					}
+				}
+				if err := s.tieredManager.MoveMessagesToCloud(topic, tieredBatch); err != nil {
+					log.Printf("[Store] Error moving batch to cloud: %v", err)
+					continue
+				}
+
+				// Remove migrated messages from memory
+				for _, msg := range batch {
+					s.mu.Lock()
+					if currentMessages, exists := s.messages[topic]; exists {
+						for i, currentMsg := range currentMessages {
+							if currentMsg.ID == msg.ID {
+								s.messages[topic] = append(currentMessages[:i], currentMessages[i+1:]...)
+								break
+							}
+						}
+					}
+					s.mu.Unlock()
+				}
+			}
+		}
+
+		// Also move any messages from disk to cloud
+		if s.diskEnabled {
+			if err := s.tieredManager.MoveDiskTopicToCloud(topic); err != nil {
+				log.Printf("[Store] Error migrating disk messages to cloud: %v", err)
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// GetStorageTierForTopic returns the configured storage tier for a topic
+func (s *Store) GetStorageTierForTopic(topic string) string {
+	// Check if there's a specific tier assignment for this topic
+	globalTopicTiers.mu.RLock()
+	tier, exists := globalTopicTiers.tiers[topic]
+	globalTopicTiers.mu.RUnlock()
+
+	if exists {
+		return tier
+	}
+
+	// If no specific assignment, return the default tier
+	if s.tieredManager == nil {
+		return "memory" // Only memory tier is available without tiered storage
+	}
+
+	// Default to memory tier
+	return "memory"
+}
+
+// GetMessages returns all messages for a specific topic
+func (s *Store) GetMessages(topic string) []Message {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Return a copy of the messages to avoid concurrent modification issues
+	messages, exists := s.messages[topic]
+	if !exists {
+		return []Message{}
+	}
+
+	// Make a copy to avoid any potential race conditions
+	result := make([]Message, len(messages))
+	copy(result, messages)
+	return result
 }

@@ -2,7 +2,10 @@ package node
 
 import (
 	"testing"
+	"time"
 
+	"sprawl/ai"
+	"sprawl/ai/prediction"
 	"sprawl/store"
 
 	"github.com/google/uuid"
@@ -17,6 +20,8 @@ type GossipManagerInterface interface {
 	GetNodeName() string
 	GetMemberCount() int
 	Members() []string
+	GetMembers() []string
+	JoinCluster(seeds []string) error
 	SendReliable(msg []byte, to string) error
 	SendBroadcast(msg []byte) error
 }
@@ -58,6 +63,41 @@ func (e *TestAIEngine) GetSimpleAnomalies() []map[string]interface{} {
 			"confidence": 0.9,
 		},
 	}
+}
+
+// RecordMetric records a metric for the test AI engine
+func (e *TestAIEngine) RecordMetric(metricKind ai.MetricKind, entityID string, value float64, labels map[string]string) {
+	// Do nothing for tests
+}
+
+// GetRecommendations returns test scaling recommendations
+func (e *TestAIEngine) GetRecommendations() []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"resource":        "cpu",
+			"current_value":   70.5,
+			"predicted_value": 85.2,
+			"recommendation":  "scale_up",
+			"confidence":      0.85,
+			"timestamp":       time.Now().Format(time.RFC3339),
+			"reason":          "High CPU utilization predicted in next 30 minutes",
+		},
+		{
+			"resource":        "memory",
+			"current_value":   50.3,
+			"predicted_value": 48.7,
+			"recommendation":  "maintain",
+			"confidence":      0.92,
+			"timestamp":       time.Now().Format(time.RFC3339),
+			"reason":          "Memory utilization stable",
+		},
+	}
+}
+
+// TrainResourceModel mocks the training functionality for tests
+func (e *TestAIEngine) TrainResourceModel(resource prediction.ResourceType, nodeID string, lookback time.Duration) error {
+	// Just return nil for tests
+	return nil
 }
 
 // TestHashTopic provides a consistent hash function for testing
@@ -114,6 +154,16 @@ func (m *MockGossipManager) Members() []string {
 	return []string{m.nodeID}
 }
 
+// GetMembers for the GossipManagerInterface
+func (m *MockGossipManager) GetMembers() []string {
+	return []string{m.nodeID}
+}
+
+// JoinCluster for the GossipManagerInterface
+func (m *MockGossipManager) JoinCluster(seeds []string) error {
+	return nil
+}
+
 // SendReliable method for the mock
 func (m *MockGossipManager) SendReliable(msg []byte, to string) error {
 	return nil
@@ -135,7 +185,7 @@ func CreateSimpleNode(t *testing.T) *Node {
 	// Create test AI engine
 	testAI := &TestAIEngine{}
 
-	// Create a node with minimal components
+	// Create a node with minimal components - leave Gossip as nil
 	node := &Node{
 		ID:        nodeID,
 		Store:     testStore,

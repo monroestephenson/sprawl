@@ -3,6 +3,7 @@ package tiered
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -389,4 +390,142 @@ func (rs *RocksStore) Close() {
 		rs.db.Close()
 		rs.db = nil
 	}
+}
+
+// ListAllTopicIDs returns a list of all topics and their message IDs
+func (rs *RocksStore) ListAllTopicIDs() ([]TopicIDs, error) {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+
+	result := make([]TopicIDs, 0)
+
+	// Get iterator with prefix "topic:" to find all topics
+	prefix := []byte("topic:")
+	iter := rs.db.NewIterator(rs.readOpts)
+	defer iter.Close()
+
+	// Seek to the beginning of topics
+	iter.Seek(prefix)
+
+	// Process all topic entries
+	for ; iter.Valid(); iter.Next() {
+		key := iter.Key()
+		keyData := key.Data()
+
+		// Check if still in the "topic:" prefix
+		if !bytes.HasPrefix(keyData, prefix) {
+			key.Free()
+			break
+		}
+
+		// Extract topic name (after prefix)
+		topic := string(keyData[len(prefix):])
+
+		// Get all IDs for this topic
+		ids, err := rs.GetTopicMessages(topic)
+		if err != nil {
+			key.Free()
+			return nil, fmt.Errorf("failed to get messages for topic %s: %w", topic, err)
+		}
+
+		if len(ids) > 0 {
+			result = append(result, TopicIDs{
+				Topic: topic,
+				IDs:   ids,
+			})
+		}
+
+		key.Free()
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("iterator error: %w", err)
+	}
+
+	return result, nil
+}
+
+// ForceCompaction triggers a manual compaction of the database
+func (rs *RocksStore) ForceCompaction() error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	if rs.compacting {
+		return errors.New("compaction already in progress")
+	}
+
+	rs.compacting = true
+	defer func() {
+		rs.compacting = false
+	}()
+
+	// Increment the compaction count
+	rs.metrics.compactions++
+
+	// Trigger compaction from the beginning to the end of the database
+	// This is a synchronous operation and may take some time for large databases
+	startKey := []byte{0}        // Start of keyspace
+	endKey := []byte{0xFF, 0xFF} // End of keyspace
+
+	// Compact the entire database
+	// The CompactRange method might have different names in different versions of grocksdb
+	// Using the currently documented method
+	rs.db.CompactRange(grocksdb.Range{
+		Start: startKey,
+		Limit: endKey,
+	})
+
+	return nil
+}
+
+// DeleteMessages removes specific messages by ID
+func (rs *RocksStore) DeleteMessages(messageIDs []string) error {
+	if rs.db == nil {
+		return fmt.Errorf("database not open")
+	}
+
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	// Create a set of the message IDs for faster lookup
+	toDelete := make(map[string]struct{}, len(messageIDs))
+	for _, id := range messageIDs {
+		toDelete[id] = struct{}{}
+	}
+
+	// Create a new write batch
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+
+	// Find all keys for these messages
+	for _, id := range messageIDs {
+		// Get the message metadata to find the key
+		messageKey := fmt.Sprintf("msg:%s", id)
+		data, err := rs.db.Get(rs.readOpts, []byte(messageKey))
+
+		if err != nil || data == nil || !data.Exists() {
+			// Skip if message doesn't exist
+			if data != nil {
+				data.Free()
+			}
+			continue
+		}
+
+		// Delete the message metadata
+		batch.Delete([]byte(messageKey))
+		data.Free()
+
+		// Also delete the actual message data
+		dataKey := fmt.Sprintf("data:%s", id)
+		batch.Delete([]byte(dataKey))
+	}
+
+	// Commit the batch
+	err := rs.db.Write(rs.writeOpts, batch)
+	if err != nil {
+		return fmt.Errorf("failed to delete messages: %w", err)
+	}
+
+	return nil
 }

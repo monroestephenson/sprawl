@@ -491,8 +491,8 @@ func (e *Engine) PredictLoad(resource prediction.ResourceType, nodeID string, fu
 	}
 
 	// Determine appropriate interval based on prediction horizon
-	var interval prediction.PredictionInterval
-	timeDiff := time.Until(futureTime)
+	interval := prediction.Interval1Hour
+	timeDiff := futureTime.Sub(time.Now())
 
 	if timeDiff >= 24*time.Hour {
 		interval = prediction.Interval24Hour
@@ -1003,4 +1003,78 @@ func (e *Engine) HasExcessiveResourceUsage(nodeID string, resource prediction.Re
 
 	// Check if predicted value exceeds threshold
 	return predResult.PredictedVal > threshold, predResult.PredictedVal, nil
+}
+
+// DetectResourceOutliers identifies nodes with outlier resource usage patterns
+func (e *Engine) DetectResourceOutliers(resource prediction.ResourceType, maxOutliers int) ([]string, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.loadPredictor == nil {
+		return nil, fmt.Errorf("load predictor not initialized")
+	}
+
+	// Get all nodes with data for this resource
+	nodes := e.getNodesForResource(resource)
+	if len(nodes) < 2 {
+		return nil, nil // Need at least 2 nodes to find outliers
+	}
+
+	// Collect current predictions for each node
+	predictions := make(map[string]float64, len(nodes))
+	for _, nodeID := range nodes {
+		future := time.Now().Add(15 * time.Minute)
+		pred, err := e.loadPredictor.Predict(resource, nodeID, future, prediction.Interval15Min)
+		if err != nil {
+			continue
+		}
+		predictions[nodeID] = pred.PredictedVal
+	}
+
+	// Find outliers (simple approach: nodes with values > 2 std deviations from mean)
+	outliers := findOutliers(predictions, maxOutliers)
+	return outliers, nil
+}
+
+// PredictResourceConstraints identifies potential future resource constraints
+func (e *Engine) PredictResourceConstraints(resource prediction.ResourceType, horizon time.Duration, threshold float64) ([]ResourceConstraint, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.loadPredictor == nil {
+		return nil, fmt.Errorf("load predictor not initialized")
+	}
+
+	// Get all nodes with data for this resource
+	nodes := e.getNodesForResource(resource)
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+
+	constraints := make([]ResourceConstraint, 0)
+	futureTime := time.Now().Add(horizon)
+
+	// For each node, predict future resource usage
+	for _, nodeID := range nodes {
+		pred, err := e.loadPredictor.Predict(resource, nodeID, futureTime, prediction.Interval1Hour)
+		if err != nil {
+			continue
+		}
+
+		// If predicted value exceeds threshold, add to constraints
+		if pred.PredictedVal > threshold {
+			constraint := ResourceConstraint{
+				NodeID:          nodeID,
+				Resource:        resource,
+				PredictedValue:  pred.PredictedVal,
+				Threshold:       threshold,
+				PredictedTime:   futureTime,
+				ConstraintLevel: calculateConstraintLevel(pred.PredictedVal, threshold),
+				Confidence:      pred.Confidence,
+			}
+			constraints = append(constraints, constraint)
+		}
+	}
+
+	return constraints, nil
 }

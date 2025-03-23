@@ -1,10 +1,13 @@
 package metrics
 
 import (
+	"log"
 	"math"
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/shirou/gopsutil/v3/cpu"
 )
 
 type Metrics struct {
@@ -88,19 +91,19 @@ func (m *Metrics) collectSystemMetrics() {
 				m.MemorySamples = m.MemorySamples[1:]
 			}
 
-			// Simulated CPU usage (real implementation would use OS-specific methods)
-			// This simulates CPU usage based on goroutines, memory allocation, and time since last collection
-			timeSpent := time.Since(m.lastCPUTime).Seconds()
-			// Very simple simulation - in a real implementation, you'd use OS-specific methods
-			// to get actual CPU usage
-			cpuEstimate := float64(m.GoroutineCount) * 0.01 // 1% per goroutine as a rough estimate
-			// Factor in memory allocation rate
-			allocRate := float64(memStats.TotalAlloc-m.TotalAllocatedBytes) / (1024 * 1024 * timeSpent) // MB/s
-			cpuFromAlloc := math.Min(allocRate*0.2, 50)                                                 // 0.2% per MB/s, max 50%
-
-			// Combine factors and add some randomness for realism
-			rand := float64(time.Now().UnixNano()%1000) / 10000.0
-			m.CPUUsage = math.Min(cpuEstimate+cpuFromAlloc+rand, 100.0)
+			// Get real CPU usage (using gopsutil library)
+			percent, err := cpu.Percent(0, false) // Get total CPU usage (not per CPU)
+			if err != nil {
+				log.Printf("Error getting CPU usage: %v", err)
+				// Fallback to our estimation if there's an error
+				timeSpent := time.Since(m.lastCPUTime).Seconds()
+				cpuEstimate := float64(m.GoroutineCount) * 0.01
+				allocRate := float64(memStats.TotalAlloc-m.TotalAllocatedBytes) / (1024 * 1024 * timeSpent)
+				cpuFromAlloc := math.Min(allocRate*0.2, 50)
+				m.CPUUsage = math.Min(cpuEstimate+cpuFromAlloc, 100.0)
+			} else if len(percent) > 0 {
+				m.CPUUsage = percent[0] // Use the first value which represents overall CPU usage
+			}
 
 			// Store CPU samples for trends
 			m.CPUSamples = append(m.CPUSamples, m.CPUUsage)
@@ -110,7 +113,7 @@ func (m *Metrics) collectSystemMetrics() {
 
 			// Calculate message rate (messages per second)
 			currentMessageCount := m.MessagesSent + m.MessagesReceived
-			m.MessageRate = float64(currentMessageCount-m.lastMessageCount) / timeSpent
+			m.MessageRate = float64(currentMessageCount-m.lastMessageCount) / time.Since(m.lastUpdate).Seconds()
 			m.lastMessageCount = currentMessageCount
 
 			m.lastCPUTime = time.Now()
@@ -218,4 +221,33 @@ func (m *Metrics) GetSnapshot() map[string]interface{} {
 		"cpu_trend":             m.GetTrend("cpu"),
 		"memory_trend":          m.GetTrend("memory"),
 	}
+}
+
+// GetSystemMetrics returns current system metrics (CPU usage, memory usage, goroutine count)
+func GetSystemMetrics() (float64, float64, int) {
+	// Get memory stats from Go runtime
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	// Calculate memory usage as percentage of total allocated memory
+	// to system memory
+	memoryUsagePercent := float64(memStats.Alloc) / float64(memStats.Sys) * 100.0
+
+	// Get goroutine count
+	goroutines := runtime.NumGoroutine()
+
+	// Get real CPU usage using gopsutil
+	cpuUsage := 0.0
+	percent, err := cpu.Percent(500*time.Millisecond, false) // Get total CPU usage with a 500ms sample
+	if err != nil {
+		log.Printf("Error getting CPU usage: %v", err)
+		// Fallback to estimation if real metrics are unavailable
+		cpuEstimate := float64(goroutines) * 0.01
+		allocRate := float64(memStats.TotalAlloc) / float64(memStats.Sys) * 40.0
+		cpuUsage = math.Min(cpuEstimate+allocRate, 100.0)
+	} else if len(percent) > 0 {
+		cpuUsage = percent[0] // Use the first value which represents overall CPU usage
+	}
+
+	return cpuUsage, memoryUsagePercent, goroutines
 }

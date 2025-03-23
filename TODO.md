@@ -221,3 +221,177 @@ Documentation:
 Add more examples for the new features
 Include performance tuning guidelines
 Add troubleshooting guides for common issues
+
+# Sprawl Implementation TODO List
+
+This document catalogs all placeholder implementations and unfinished features that need to be properly implemented for a production-ready system.
+
+## System Metrics Collection
+
+- [ ] **Replace simulated CPU metrics with real host metrics**
+  - File: `ai/engine.go:233`
+  - Comment: `// In a real implementation, we would use the host's CPU metrics`
+  - Description: Replace the current synthetic CPU usage calculation with real OS-level metrics using a library like gopsutil
+
+- [ ] **Implement real memory usage tracking**
+  - File: `ai/engine.go:219`
+  - Comment: `// This is a simple implementation; a production version would use the host's CPU metrics`
+  - Description: Update memory usage tracking to measure actual system memory usage instead of just Go runtime memory
+
+- [ ] **Replace network activity estimation**
+  - File: `ai/intelligence.go:233`
+  - Comment: `// In a real implementation, this would measure actual network traffic`
+  - Description: Implement actual network throughput measurement instead of synthetic estimation based on goroutine count
+
+## Storage Package
+
+- [ ] **Implement proper subscriber count querying**
+  - File: `store/store.go:679`
+  - Comment: `// In a real implementation, this would query the subscription registry`
+  - Description: Update `GetSubscriberCountForTopic` to query the subscription registry instead of returning hardcoded values
+
+- [ ] **Implement topic aggregation across all tiers**
+  - File: `store/store.go:689`
+  - Comment: `// In a real implementation, this would query all tiers`
+  - Description: Enhance `GetTopicTimestamps` to aggregate data from all storage tiers
+
+- [ ] **Replace no-op compaction implementation**
+  - File: `store/store.go:612`
+  - Comment: `log.Println("[Store] Compaction requested (no-op implementation)")`
+  - Description: Implement actual storage compaction to manage disk space and optimize performance
+
+- [ ] **Implement real storage usage estimation**
+  - File: `ai/intelligence.go:226`
+  - Comment: `// In a real implementation, this would query the store`
+  - Description: Replace synthetic storage usage with actual store querying
+
+- [ ] **Replace simplified methods in tiered manager**
+  - File: `store/tiered/manager.go:368`
+  - Comment: `// This is a simplification - in a real implementation we would use a more efficient method`
+  - Description: Optimize message lookup methods for better performance
+
+- [ ] **Implement bucket scanning for topics**
+  - File: `store/tiered/manager.go:491`
+  - Comment: `// In a real implementation, we would scan the bucket for topic prefixes`
+  - Description: Add proper RocksDB bucket scanning to efficiently list topics
+
+## Cloud Storage
+
+- [ ] **Implement LRU cache for ID-to-object mappings**
+  - File: `store/tiered/cloud_store.go:418`
+  - Comment: `// If we have too many mappings, evict oldest (would use LRU in production)`
+  - Description: Replace the simple randomized eviction with a proper LRU implementation
+
+- [ ] **Add persistent index support for CloudStore**
+  - File: `store/tiered/cloud_store.go:426-429`
+  - Comment: `// In a production implementation, periodically persist this mapping to disk...`
+  - Description: Implement persistence for the ID-to-object mappings to survive restarts
+
+- [ ] **Implement efficient topic listing in cloud storage**
+  - File: `store/tiered/manager.go:468`
+  - Comment: `// The actual implementation would query the cloud store for all topics`
+  - Description: Add proper topic listing in cloud storage without requiring full scans
+
+## AI and Analytics
+
+- [ ] **Replace synthetic data with real metrics**
+  - File: `ai/intelligence.go:227-228`
+  - Comment: `// For now, return a synthetic value`
+  - Description: Connect to actual metrics sources instead of generating synthetic values
+
+- [ ] **Improve pattern detection algorithms**
+  - File: `ai/analytics/patterns.go:397-399`
+  - Comment: `// This would be a more sophisticated algorithm in a real implementation`
+  - Description: Replace simplified pattern matching with more robust signal processing
+
+- [ ] **Implement proper sort methods**
+  - File: `ai/analytics/patterns.go:745`
+  - Comment: `// In a real implementation, we would use sort.Slice from the sort package`
+  - Description: Replace manual insertion sort with proper Go sort functions
+
+- [ ] **Replace simplified time series analysis**
+  - File: `ai/analytics/timeseries.go:145`
+  - Comment: `// Simplified implementation for now`
+  - Description: Implement robust time series analysis with proper statistical methods
+
+- [ ] **Implement proper signal processing for pattern detection**
+  - File: `ai/analytics/traffic.go:229`
+  - Comment: `// This would be more sophisticated in a real implementation`
+  - Description: Add real signal processing techniques for pattern detection
+
+- [ ] **Add store integration for AI engine**
+  - File: `ai/engine.go:309`
+  - Comment: `// In a real implementation, the store would be injected or accessible`
+  - Description: Add proper store integration to allow the AI engine to query real data
+
+## Message Handling
+
+- [ ] **Add message tracking in gossip manager**
+  - File: `node/gossip.go:378`
+  - Comment: `// In a real implementation, we would track message counts`
+  - Description: Implement message tracking in the gossip system for better debugging and metrics
+
+- [ ] **Implement proper RPC calls for message replication**
+  - File: `node/consensus/replication.go:191`
+  - Comment: `// In a real implementation, this would be an RPC call`
+  - Description: Replace placeholder with proper RPC implementation for replication
+
+- [ ] **Add proper TTL enforcement**
+  - File: `store/store_test.go:208`
+  - Comment: `// Note: In a real implementation with TTL enforcement, we would verify the past`
+  - Description: Implement TTL check and cleanup mechanisms
+
+- [ ] **Implement graceful delivery prevention on shutdown**
+  - File: `store/store_test.go:351`
+  - Comment: `// In a real implementation, the shutdown might prevent delivery`
+  - Description: Ensure messages aren't delivered during system shutdown
+
+## Performance and Scaling
+
+- [ ] **Move message publishing to background goroutine**
+  - File: `store/store.go:242`
+  - Comment: `// In a production system, this would likely be done in a goroutine`
+  - Description: Implement non-blocking publish operations with background processing
+
+- [ ] **Implement continuous background tier migration**
+  - File: `store/store.go:481`
+  - Comment: `// A more robust approach would continuously...`
+  - Description: Add background job to migrate messages between tiers
+
+- [ ] **Add real metrics collection from all nodes**
+  - File: `ai/engine.go:670`
+  - Comment: `// In a real system, we would iterate over all nodes`
+  - Description: Implement cluster-wide metrics collection
+
+- [ ] **Replace hard-coded thresholds**
+  - File: `ai/engine.go:608`
+  - Comment: `// Thresholds would depend on system capacity`
+  - Description: Make thresholds configurable based on actual system capacity
+
+## Architecture Improvements
+
+- [ ] **Implement proper dependency injection**
+  - File: `ai/engine.go:350`
+  - Comment: `// In a real implementation, the metrics would be injected or accessible`
+  - Description: Use proper DI for components like metrics and store
+
+- [ ] **Implement proper error handling**
+  - File: `ai/predictor.go:134`
+  - Comment: `// Global instance for intelligence - would be initialized by the application`
+  - Description: Add proper error handling and initialization checks
+
+- [ ] **Add proper shutdown sequence**
+  - File: Various
+  - Description: Ensure all components have proper shutdown sequences to prevent data loss
+
+## Testing Improvements
+
+- [ ] **Replace test mocks with more realistic implementations**
+  - File: `node/test_util.go:26`
+  - Comment: `// TestAIEngine is a simplified AI Engine for testing purposes`
+  - Description: Create more realistic test doubles that better represent production behavior
+
+## Progress
+- Total items: 30
+- Completed: 0
+- Remaining: 30

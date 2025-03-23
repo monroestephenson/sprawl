@@ -2,6 +2,7 @@ package tiered
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -319,6 +320,360 @@ func (m *Manager) Close() error {
 			return fmt.Errorf("failed to close cloud store: %w", err)
 		}
 		m.cloudStore = nil
+	}
+
+	return nil
+}
+
+// PerformFullCompaction performs a full compaction across all storage tiers
+// It moves data from memory to disk, and from disk to cloud if configured
+func (m *Manager) PerformFullCompaction() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	log.Printf("Starting full compaction across all storage tiers")
+
+	// Step 1: Handle memory to disk transfer if disk storage is available
+	if m.diskStore != nil {
+		// Get messages from memory store to move to disk
+		if m.memoryStore != nil {
+			oldMessages, err := m.memoryStore.GetOldestMessages(m.policy.BatchSize, m.policy.MemoryRetention)
+			if err != nil {
+				return fmt.Errorf("failed to get old messages from memory: %w", err)
+			}
+
+			for _, msg := range oldMessages {
+				// Store in disk
+				if err := m.diskStore.Store(msg); err != nil {
+					log.Printf("Failed to move message %s to disk: %v", msg.ID, err)
+					continue
+				}
+
+				// Remove from memory after confirming it's on disk
+				m.memoryStore.Delete(msg.ID)
+
+				// Update metrics
+				atomic.AddUint64(&m.metrics.memoryOffloads, 1)
+			}
+
+			log.Printf("Moved %d messages from memory to disk", len(oldMessages))
+		}
+	}
+
+	// Step 2: Handle disk to cloud transfer if cloud storage is available
+	if m.cloudStore != nil && m.diskStore != nil {
+		// Find messages older than the configured threshold
+		cutoff := time.Now().Add(-m.policy.DiskRetention / 2) // Use half the retention time as threshold
+
+		// List all messages to find old ones
+		// This is a simplification - in a real implementation we would use a more efficient method
+		topicIds, err := m.diskStore.ListAllTopicIDs()
+		if err != nil {
+			return fmt.Errorf("failed to list topics from disk: %w", err)
+		}
+
+		// Group messages by topic for batch upload to cloud
+		topicMessages := make(map[string][]Message)
+		movedCount := 0
+
+		for _, topicInfo := range topicIds {
+			topic := topicInfo.Topic
+			for _, id := range topicInfo.IDs {
+				// Retrieve the message to check its timestamp
+				msg, err := m.diskStore.Retrieve(id)
+				if err != nil {
+					log.Printf("Failed to retrieve message %s: %v", id, err)
+					continue
+				}
+
+				if msg.Timestamp.Before(cutoff) {
+					// Group by topic for batch upload
+					topicMessages[topic] = append(topicMessages[topic], *msg)
+					movedCount++
+				}
+			}
+		}
+
+		// Upload messages to cloud by topic
+		for topic, messages := range topicMessages {
+			if len(messages) > 0 {
+				// Store batch in cloud
+				if err := m.cloudStore.Store(topic, messages); err != nil {
+					log.Printf("Failed to move messages for topic %s to cloud: %v", topic, err)
+					continue
+				}
+
+				// Update metrics
+				atomic.AddUint64(&m.metrics.diskOffloads, uint64(len(messages)))
+			}
+		}
+
+		// Now delete the moved messages
+		if err := m.diskStore.DeleteOldMessages(m.policy.DiskRetention / 2); err != nil {
+			log.Printf("Warning: Failed to delete old messages from disk: %v", err)
+		}
+
+		log.Printf("Moved approximately %d messages from disk to cloud", movedCount)
+	}
+
+	// Step 3: Trigger database compaction to reclaim space
+	if m.diskStore != nil {
+		if err := m.diskStore.ForceCompaction(); err != nil {
+			return fmt.Errorf("failed to compact disk store: %w", err)
+		}
+		log.Printf("Completed disk store compaction")
+	}
+
+	log.Printf("Full compaction completed successfully")
+	return nil
+}
+
+// ListAllTopicIDs is a helper struct for PerformFullCompaction
+type TopicIDs struct {
+	Topic string
+	IDs   []string
+}
+
+// GetDiskTopics returns a list of topics stored in the disk tier
+func (m *Manager) GetDiskTopics() ([]string, error) {
+	if m.diskStore == nil {
+		return nil, fmt.Errorf("disk storage not enabled")
+	}
+
+	// Get all topic IDs from disk
+	topicIDs, err := m.diskStore.ListAllTopicIDs()
+	if err != nil {
+		return nil, err
+	}
+
+	// Extract unique topic names
+	topics := make([]string, 0, len(topicIDs))
+	topicMap := make(map[string]struct{})
+
+	for _, topicInfo := range topicIDs {
+		if _, exists := topicMap[topicInfo.Topic]; !exists {
+			topicMap[topicInfo.Topic] = struct{}{}
+			topics = append(topics, topicInfo.Topic)
+		}
+	}
+
+	return topics, nil
+}
+
+// GetCloudTopics returns a list of topics stored in the cloud tier
+func (m *Manager) GetCloudTopics() ([]string, error) {
+	if m.cloudStore == nil {
+		return nil, fmt.Errorf("cloud storage not enabled")
+	}
+
+	// The actual implementation would query the cloud store for all topics
+	// This might be a costly operation depending on the cloud provider
+
+	// Let's assume we can list "directories" in the cloud store
+	// where each directory represents a topic
+
+	// For now, we'll use a simple approach by querying list of
+	// distinct topics from cloud storage
+
+	// Since the CloudStore doesn't have a direct method to list topics,
+	// we'll implement a fallback that scans for known topics
+
+	// Try to get metrics from cloud store which might have topic information
+	metrics := m.cloudStore.GetMetrics()
+
+	// If metrics contains a topics list, use it
+	if topicsInterface, exists := metrics["topics"]; exists {
+		if topicsSlice, ok := topicsInterface.([]string); ok && len(topicsSlice) > 0 {
+			return topicsSlice, nil
+		}
+	}
+
+	// Fallback: without a direct listing method, return an empty list
+	// In a real implementation, we would scan the bucket for topic prefixes
+	return []string{}, nil
+}
+
+// GetDiskMessageCount returns the number of messages for a topic in the disk tier
+func (m *Manager) GetDiskMessageCount(topic string) (int, error) {
+	if m.diskStore == nil {
+		return 0, fmt.Errorf("disk storage not enabled")
+	}
+
+	// RocksStore doesn't have a direct method to count messages by topic,
+	// so we'll use a fallback approach
+
+	// Get metrics to see if count information is available
+	metrics := m.diskStore.GetMetrics()
+
+	// Check if message count by topic is available in metrics
+	topicCountsKey := "topic_counts"
+	if countsInterface, exists := metrics[topicCountsKey]; exists {
+		if countMap, ok := countsInterface.(map[string]int); ok {
+			if count, found := countMap[topic]; found {
+				return count, nil
+			}
+		}
+	}
+
+	// Fallback: get all message IDs for this topic
+	// This is not efficient for large topics, but works as a fallback
+	topicIDs, err := m.diskStore.ListAllTopicIDs()
+	if err != nil {
+		return 0, err
+	}
+
+	// Count messages for this topic
+	count := 0
+	for _, topicInfo := range topicIDs {
+		if topicInfo.Topic == topic {
+			count += len(topicInfo.IDs)
+		}
+	}
+
+	return count, nil
+}
+
+// GetCloudMessageCount returns the number of messages for a topic in the cloud tier
+func (m *Manager) GetCloudMessageCount(topic string) (int, error) {
+	if m.cloudStore == nil {
+		return 0, fmt.Errorf("cloud storage not enabled")
+	}
+
+	// CloudStore doesn't have a direct method to count messages by topic,
+	// so we'll use a fallback approach
+
+	// Try to get metrics from cloud store which might have count information
+	metrics := m.cloudStore.GetMetrics()
+
+	// If metrics contains a counts map, use it
+	topicCountsKey := "topic_message_counts"
+	if countsInterface, exists := metrics[topicCountsKey]; exists {
+		if countMap, ok := countsInterface.(map[string]int); ok {
+			if count, found := countMap[topic]; found {
+				return count, nil
+			}
+		}
+	}
+
+	// Fallback: try to get messages for this topic and count them
+	// This can be expensive for large topics
+	messages, err := m.cloudStore.GetTopicMessages(topic)
+	if err != nil {
+		// If the topic doesn't exist or there's another error,
+		// just return 0 count
+		return 0, nil
+	}
+
+	return len(messages), nil
+}
+
+// MoveMessageToDisk moves a single message from memory to disk tier
+func (m *Manager) MoveMessageToDisk(msg Message) error {
+	if m.diskStore == nil {
+		return fmt.Errorf("disk storage not enabled")
+	}
+
+	// Store the message in disk
+	if err := m.diskStore.Store(msg); err != nil {
+		return fmt.Errorf("failed to store message on disk: %w", err)
+	}
+
+	// Update metrics
+	atomic.AddUint64(&m.metrics.memoryOffloads, 1)
+
+	return nil
+}
+
+// MoveMessagesToCloud moves a batch of messages to the cloud tier
+func (m *Manager) MoveMessagesToCloud(topic string, messages []Message) error {
+	if m.cloudStore == nil {
+		return fmt.Errorf("cloud storage not enabled")
+	}
+
+	// Store the messages in cloud storage
+	if err := m.cloudStore.Store(topic, messages); err != nil {
+		return fmt.Errorf("failed to store messages in cloud: %w", err)
+	}
+
+	// Update metrics
+	atomic.AddUint64(&m.metrics.memoryOffloads, uint64(len(messages)))
+
+	return nil
+}
+
+// MoveDiskTopicToCloud moves all messages for a topic from disk to cloud
+func (m *Manager) MoveDiskTopicToCloud(topic string) error {
+	if m.diskStore == nil {
+		return fmt.Errorf("disk storage not enabled")
+	}
+
+	if m.cloudStore == nil {
+		return fmt.Errorf("cloud storage not enabled")
+	}
+
+	// Find all message IDs for this topic
+	topicIDs, err := m.diskStore.ListAllTopicIDs()
+	if err != nil {
+		return fmt.Errorf("failed to list messages from disk: %w", err)
+	}
+
+	// Process each topic
+	for _, topicInfo := range topicIDs {
+		if topicInfo.Topic != topic {
+			continue
+		}
+
+		// If no IDs, nothing to do
+		if len(topicInfo.IDs) == 0 {
+			continue
+		}
+
+		// Get messages in batches
+		batchSize := 100
+		for i := 0; i < len(topicInfo.IDs); i += batchSize {
+			end := i + batchSize
+			if end > len(topicInfo.IDs) {
+				end = len(topicInfo.IDs)
+			}
+
+			batchIDs := topicInfo.IDs[i:end]
+
+			// Retrieve each message in the batch
+			messages := make([]Message, 0, len(batchIDs))
+			for _, id := range batchIDs {
+				msg, err := m.diskStore.Retrieve(id)
+				if err != nil {
+					log.Printf("Failed to retrieve message %s: %v", id, err)
+					continue
+				}
+
+				messages = append(messages, *msg)
+			}
+
+			// Store batch in cloud
+			if len(messages) > 0 {
+				if err := m.cloudStore.Store(topic, messages); err != nil {
+					return fmt.Errorf("failed to store messages in cloud: %w", err)
+				}
+
+				// Update metrics
+				atomic.AddUint64(&m.metrics.diskOffloads, uint64(len(messages)))
+
+				// Delete from disk after confirming they're in cloud
+				// Since RocksStore doesn't have a single message delete method,
+				// we'll need to track IDs and use a more specialized approach
+				messageIDs := make([]string, len(messages))
+				for i, msg := range messages {
+					messageIDs[i] = msg.ID
+				}
+
+				// Use a custom deletion approach by simulating them as old messages
+				// Create a temporary DB batch and delete these specific message keys
+				if err := m.diskStore.DeleteMessages(messageIDs); err != nil {
+					log.Printf("Failed to delete messages from disk: %v", err)
+				}
+			}
+		}
 	}
 
 	return nil

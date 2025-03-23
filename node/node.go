@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sprawl/ai"
+	"sprawl/ai/prediction"
 	"sprawl/node/balancer"
 	"sprawl/node/consensus"
 	"sprawl/node/dht"
@@ -38,6 +39,9 @@ type AIEngine interface {
 	GetStatus() map[string]interface{}
 	GetPrediction(resource string) (float64, float64)
 	GetSimpleAnomalies() []map[string]interface{}
+
+	// Metrics methods
+	RecordMetric(metricKind ai.MetricKind, entityID string, value float64, labels map[string]string)
 }
 
 // Node represents a node in the Sprawl cluster
@@ -243,26 +247,32 @@ func (n *Node) handleAIAnomalies(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// HandleGetStore handles requests to get store information (currently unused)
-/*
+// handleGetStore handles requests to get store information
 func (n *Node) handleGetStore(w http.ResponseWriter, r *http.Request) {
-	// Get basic store status
+	// Ensure request is GET
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get memory store information
 	memoryInfo := map[string]interface{}{
-		"enabled":      true,
-		"messages":     n.Store.GetMessageCount(),
-		"bytes_used":   50, // Placeholder value
-		"max_messages": 1000,
+		"enabled":    true,
+		"messages":   n.Store.GetMessageCount(),
+		"bytes_used": n.Store.GetMemoryUsage(),
+		"topics":     n.Store.GetTopics(),
 	}
 
-	diskInfo := map[string]interface{}{
-		"enabled":    false,
-		"path":       "",
-		"bytes_used": 0,
-	}
+	// Get disk and cloud stats
+	diskStats := n.Store.GetDiskStats()
+	cloudStats := n.Store.GetCloudStats()
 
+	// Create complete store info response
 	storeInfo := map[string]interface{}{
-		"memory": memoryInfo,
-		"disk":   diskInfo,
+		"memory":       memoryInfo,
+		"disk":         diskStats,
+		"cloud":        cloudStats,
+		"storage_type": n.Store.GetStorageType(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -271,7 +281,6 @@ func (n *Node) handleGetStore(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Node %s] Error encoding store info: %v", truncateID(n.ID), err)
 	}
 }
-*/
 
 // StartHTTP starts the HTTP server for publish/subscribe endpoints
 func (n *Node) StartHTTP() {
@@ -689,8 +698,13 @@ func (n *Node) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"node_id": n.ID,
 		"router":  routerMetrics,
 		"system":  systemMetrics,
-		"cluster": n.Gossip.GetMembers(),
+		"cluster": []string{}, // Default empty cluster
 		"storage": storageMetrics,
+	}
+
+	// Add cluster members if Gossip is available
+	if n.Gossip != nil {
+		metrics["cluster"] = n.Gossip.GetMembers()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -711,8 +725,11 @@ func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
 		leader = n.Replication.GetLeader()
 	}
 
-	// Get actual live members from the gossip manager
-	members := n.Gossip.GetMembers()
+	// Get actual live members from the gossip manager (default to empty)
+	members := []string{n.ID} // Always include self
+	if n.Gossip != nil {
+		members = n.Gossip.GetMembers()
+	}
 
 	status := map[string]interface{}{
 		"node_id":         n.ID,
@@ -729,8 +746,7 @@ func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleHealth handles health check requests (currently unused)
-/*
+// handleHealth handles health check requests
 func (n *Node) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// Log health check request for debugging
 	log.Printf("[Node %s] Health check request from %s (path: %s)",
@@ -740,17 +756,27 @@ func (n *Node) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 
-	resp := map[string]string{
-		"status": "ok",
-		"nodeId": n.ID,
-		"uptime": time.Since(startTime).String(),
+	// Default cluster size for tests or when gossip is not initialized
+	clusterSize := 1
+
+	// Get actual cluster size if gossip is available
+	if n.Gossip != nil {
+		clusterSize = len(n.Gossip.GetMembers())
+	}
+
+	resp := map[string]interface{}{
+		"status":       "ok",
+		"nodeId":       n.ID,
+		"uptime":       time.Since(startTime).String(),
+		"version":      "1.0.0", // Add version info
+		"cluster_size": clusterSize,
+		"timestamp":    time.Now().Format(time.RFC3339),
 	}
 
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("[Node %s] Error encoding health response: %v", n.ID[:8], err)
 	}
 }
-*/
 
 // JoinCluster attempts to join an existing cluster
 func (n *Node) JoinCluster(seeds []string) error {
@@ -841,46 +867,8 @@ func (n *Node) Handler() http.Handler {
 
 	// Health check endpoints
 	log.Printf("[Node %s] Registering health endpoints at /health and /healthz", n.ID[:8])
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		// Log health check request for debugging
-		log.Printf("[Node %s] Health check request from %s (path: %s)",
-			n.ID[:8], r.RemoteAddr, r.URL.Path)
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-
-		resp := map[string]string{
-			"status": "ok",
-			"nodeId": n.ID,
-			"uptime": time.Since(startTime).String(),
-		}
-
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			log.Printf("[Node %s] Error encoding health response: %v", n.ID[:8], err)
-		}
-
-		log.Printf("[Node %s] Health check responded successfully", n.ID[:8])
-	})
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		// Log health check request for debugging
-		log.Printf("[Node %s] Health check request from %s (path: %s)",
-			n.ID[:8], r.RemoteAddr, r.URL.Path)
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-
-		resp := map[string]string{
-			"status": "ok",
-			"nodeId": n.ID,
-			"uptime": time.Since(startTime).String(),
-		}
-
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			log.Printf("[Node %s] Error encoding health response: %v", n.ID[:8], err)
-		}
-
-		log.Printf("[Node %s] Health check responded successfully", n.ID[:8])
-	})
+	mux.HandleFunc("/health", n.handleHealth)
+	mux.HandleFunc("/healthz", n.handleHealth)
 
 	// Regular API endpoints
 	mux.HandleFunc("/publish", n.handlePublish)
@@ -890,7 +878,7 @@ func (n *Node) Handler() http.Handler {
 
 	// DHT and storage management endpoints
 	mux.HandleFunc("/dht", n.handleDHT)
-	mux.HandleFunc("/store", n.handleStore)
+	mux.HandleFunc("/store", n.handleGetStore)
 	mux.HandleFunc("/store/tiers", n.handleStorageTiers)
 	mux.HandleFunc("/store/compact", n.handleStorageCompact)
 
@@ -924,56 +912,603 @@ func truncateID(id string) string {
 
 // feedMetricsToAI periodically sends metrics to the AI engine for analysis
 func (n *Node) feedMetricsToAI() {
-	// Simplified implementation to fix linter errors
 	log.Printf("[Node %s] Started metrics feed to AI engine", n.ID[:8])
+
+	// Create ticker for periodic metrics collection
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-n.stopCh:
+			log.Printf("[Node %s] Stopping metrics feed to AI engine", n.ID[:8])
+			return
+		case <-ticker.C:
+			// Collect and feed metrics to AI engine
+			n.collectAndSendMetrics()
+		}
+	}
 }
 
-// Basic stub implementations for the missing handler functions
+// collectAndSendMetrics gathers node metrics and sends them to AI engine
+func (n *Node) collectAndSendMetrics() {
+	// Skip if AI engine is not available
+	if n.AI == nil {
+		return
+	}
+
+	// Get current timestamp
+	now := time.Now()
+
+	// Collect DHT metrics
+	if n.DHT != nil {
+		// Get node count from the topic map
+		var nodeCount int
+		if nodes := n.DHT.GetTopicMap(); nodes != nil {
+			// Count unique nodes across all topics
+			uniqueNodes := make(map[string]struct{})
+			for _, nodeIDs := range nodes {
+				for _, nodeID := range nodeIDs {
+					uniqueNodes[nodeID] = struct{}{}
+				}
+			}
+			nodeCount = len(uniqueNodes)
+		}
+
+		n.AI.RecordMetric(ai.MetricKindTopicActivity, n.ID, float64(nodeCount), map[string]string{
+			"node_id": n.ID,
+			"source":  "dht",
+		})
+
+		// Get topic count
+		topicCount := 0
+		if topicMap := n.DHT.GetTopicMap(); topicMap != nil {
+			topicCount = len(topicMap)
+		}
+
+		n.AI.RecordMetric(ai.MetricKindQueueDepth, n.ID, float64(topicCount), map[string]string{
+			"node_id": n.ID,
+			"source":  "dht",
+		})
+	}
+
+	// Collect gossip metrics
+	if n.Gossip != nil {
+		// Get member count (nodes in cluster)
+		members := n.Gossip.GetMembers()
+		memberCount := len(members)
+
+		n.AI.RecordMetric(ai.MetricKindSubscriberCount, n.ID, float64(memberCount), map[string]string{
+			"node_id": n.ID,
+			"source":  "gossip",
+		})
+	}
+
+	// Collect store metrics
+	if n.Store != nil {
+		// Get topic list
+		topics := n.Store.GetTopics()
+
+		n.AI.RecordMetric(ai.MetricKindTopicActivity, n.ID+"-store", float64(len(topics)), map[string]string{
+			"node_id": n.ID,
+			"source":  "store",
+		})
+
+		// Get message counts for each topic
+		for _, topic := range topics {
+			msgCount := n.Store.GetMessageCountForTopic(topic)
+			n.AI.RecordMetric(ai.MetricKindMessageRate, topic, float64(msgCount), map[string]string{
+				"node_id": n.ID,
+				"topic":   topic,
+				"source":  "store",
+			})
+		}
+	}
+
+	// Collect system metrics using the metrics package
+	cpuUsage, memUsage, goroutineCount := metrics.GetSystemMetrics()
+
+	n.AI.RecordMetric(ai.MetricKindCPUUsage, n.ID, cpuUsage, map[string]string{
+		"node_id": n.ID,
+		"source":  "system",
+	})
+
+	n.AI.RecordMetric(ai.MetricKindMemoryUsage, n.ID, memUsage, map[string]string{
+		"node_id": n.ID,
+		"source":  "system",
+	})
+
+	// Record goroutine count as a custom metric
+	n.AI.RecordMetric(ai.MetricKindNetworkTraffic, n.ID+"-goroutines", float64(goroutineCount), map[string]string{
+		"node_id": n.ID,
+		"source":  "system",
+		"type":    "goroutines",
+	})
+
+	// Include network traffic estimation based on message rate
+	if n.Metrics != nil {
+		messageRate := n.Metrics.MessageRate
+		n.AI.RecordMetric(ai.MetricKindNetworkTraffic, n.ID, messageRate*1024, map[string]string{
+			"node_id": n.ID,
+			"source":  "metrics",
+			"unit":    "bytes_per_second",
+		})
+	}
+
+	log.Printf("[Node %s] Sent metrics to AI engine at %s", n.ID[:8], now.Format(time.RFC3339))
+}
 
 // handleDHT handles requests for DHT status
 func (n *Node) handleDHT(w http.ResponseWriter, r *http.Request) {
-	// Simplified stub
-	w.WriteHeader(http.StatusOK)
-}
+	// Ensure request is GET
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-// handleStore handles requests for storage statistics
-func (n *Node) handleStore(w http.ResponseWriter, r *http.Request) {
-	// Simplified stub
+	// Get DHT information
+	dhtInfo := map[string]interface{}{
+		"node_id":    n.ID,
+		"topic_map":  n.DHT.GetTopicMap(),
+		"node_count": len(n.DHT.GetTopicMap()),
+	}
+
+	// Get all node information if detailed=true
+	if r.URL.Query().Get("detailed") == "true" {
+		var nodes []interface{}
+		for _, nodeInfo := range n.Gossip.GetMembers() {
+			info := n.DHT.GetNodeInfoByID(nodeInfo)
+			if info != nil {
+				nodes = append(nodes, info)
+			}
+		}
+		dhtInfo["nodes"] = nodes
+	}
+
+	// Return as JSON
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(dhtInfo); err != nil {
+		log.Printf("[Node %s] Error encoding DHT status: %v", truncateID(n.ID), err)
+	}
 }
 
 // handleStorageTiers handles requests for storage tier configuration
 func (n *Node) handleStorageTiers(w http.ResponseWriter, r *http.Request) {
-	// Simplified stub
-	w.WriteHeader(http.StatusOK)
+	// Handle GET requests for configuration
+	if r.Method == http.MethodGet {
+		// Get storage tier configuration
+		tierConfig := n.Store.GetTierConfig()
+
+		// Return as JSON
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(tierConfig); err != nil {
+			log.Printf("[Node %s] Error encoding storage tier config: %v", truncateID(n.ID), err)
+		}
+		return
+	}
+
+	// Handle POST requests for topic tier assignment
+	if r.Method == http.MethodPost {
+		var request struct {
+			Topic string `json:"topic"`
+			Tier  string `json:"tier"` // "memory", "disk", or "cloud"
+		}
+
+		// Read and parse the request
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		// Validate topic and tier
+		if request.Topic == "" {
+			http.Error(w, "Topic is required", http.StatusBadRequest)
+			return
+		}
+
+		if request.Tier == "" {
+			http.Error(w, "Tier is required", http.StatusBadRequest)
+			return
+		}
+
+		// Set the storage tier for the topic using our store implementation
+		err := n.Store.SetStorageTierForTopic(request.Topic, request.Tier)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to set storage tier: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// Return success response
+		result := map[string]string{
+			"status": "success",
+			"topic":  request.Topic,
+			"tier":   request.Tier,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(result); err != nil {
+			log.Printf("[Node %s] Error encoding storage tier response: %v", truncateID(n.ID), err)
+		}
+		return
+	}
+
+	// Method not allowed
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
 // handleStorageCompact handles requests to compact storage
 func (n *Node) handleStorageCompact(w http.ResponseWriter, r *http.Request) {
-	// Simplified stub
-	w.WriteHeader(http.StatusOK)
+	// Ensure request is POST
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Try to compact storage
+	err := n.Store.Compact()
+
+	// Build response
+	response := map[string]interface{}{
+		"success": err == nil,
+	}
+
+	if err != nil {
+		response["error"] = err.Error()
+		w.WriteHeader(http.StatusInternalServerError)
+	} else {
+		response["message"] = "Storage compaction completed successfully"
+		w.WriteHeader(http.StatusOK)
+	}
+
+	// Return as JSON
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("[Node %s] Error encoding compact response: %v", truncateID(n.ID), err)
+	}
 }
 
 // handleTopics handles requests for topic listing
 func (n *Node) handleTopics(w http.ResponseWriter, r *http.Request) {
-	// Simplified stub
+	// Ensure request is GET
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get topic information from the store
+	topics := n.Store.GetTopics()
+
+	// Build topic data with message counts
+	topicData := make([]map[string]interface{}, 0, len(topics))
+	for _, topic := range topics {
+		messageCount := n.Store.GetMessageCountForTopic(topic)
+		subscriberCount := n.Store.GetSubscriberCountForTopic(topic)
+
+		// Get nodes hosting this topic
+		nodes := n.DHT.GetNodesForTopic(topic)
+		nodeIDs := make([]string, 0, len(nodes))
+		for _, node := range nodes {
+			nodeIDs = append(nodeIDs, node.ID)
+		}
+
+		// Get storage tier for this topic
+		storageTier := n.Store.GetStorageTierForTopic(topic)
+
+		// Add topic data
+		topicData = append(topicData, map[string]interface{}{
+			"name":             topic,
+			"message_count":    messageCount,
+			"subscriber_count": subscriberCount,
+			"nodes":            nodeIDs,
+			"storage_tier":     storageTier,
+			"has_subscribers":  n.Store.HasSubscribers(topic),
+		})
+	}
+
+	// Build complete response
+	response := map[string]interface{}{
+		"topics": topicData,
+		"count":  len(topics),
+	}
+
+	// Return as JSON
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("[Node %s] Error encoding topics response: %v", truncateID(n.ID), err)
+	}
 }
 
 // handleAI handles requests for AI insights and predictions
 func (n *Node) handleAI(w http.ResponseWriter, r *http.Request) {
-	// Simplified stub
+	// Ensure request is GET
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get status from AI engine
+	status := n.AI.GetStatus()
+
+	// Add summary of available endpoints
+	endpoints := []string{
+		"/ai/status",
+		"/ai/predictions",
+		"/ai/anomalies",
+		"/ai/recommendations",
+		"/ai/train",
+	}
+
+	// Build response with all AI info
+	response := map[string]interface{}{
+		"status":    status,
+		"endpoints": endpoints,
+	}
+
+	// Return as JSON
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("[Node %s] Error encoding AI response: %v", truncateID(n.ID), err)
+	}
 }
 
 // handleAIRecommendations handles requests for AI-based scaling recommendations
 func (n *Node) handleAIRecommendations(w http.ResponseWriter, r *http.Request) {
-	// Simplified stub
+	// Ensure request is GET
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get recommendations from the AI engine
+	var recommendations []map[string]interface{}
+
+	// Try to get recommendations from the production AI engine
+	aiEngine, ok := n.AI.(*ai.Engine)
+	if ok {
+		// Get scaling recommendations from the AI engine
+		scalingRecs := aiEngine.GetScalingRecommendations("local")
+
+		// Convert to map format for JSON response
+		recommendations = make([]map[string]interface{}, 0, len(scalingRecs))
+		for _, rec := range scalingRecs {
+			recommendations = append(recommendations, map[string]interface{}{
+				"resource":        rec.Resource,
+				"current_value":   rec.CurrentValue,
+				"predicted_value": rec.PredictedValue,
+				"recommendation":  rec.RecommendedAction,
+				"confidence":      rec.Confidence,
+				"timestamp":       rec.Timestamp.Format(time.RFC3339),
+				"reason":          rec.Reason,
+			})
+		}
+		log.Printf("[Node %s] Got %d AI recommendations from engine", n.ID[:8], len(recommendations))
+	} else {
+		// Try to use test engine if available
+		testEngine, ok := n.AI.(*TestAIEngine)
+		if ok {
+			recommendations = testEngine.GetRecommendations()
+			log.Printf("[Node %s] Got %d AI recommendations from test engine", n.ID[:8], len(recommendations))
+		} else {
+			// If we couldn't get recommendations from any AI engine, log a warning
+			log.Printf("[Node %s] Warning: Could not get AI recommendations, AI engine unavailable", n.ID[:8])
+			recommendations = []map[string]interface{}{}
+		}
+	}
+
+	// Build response
+	response := map[string]interface{}{
+		"recommendations": recommendations,
+		"timestamp":       time.Now().Format(time.RFC3339),
+		"node_id":         n.ID,
+	}
+
+	// Return as JSON
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("[Node %s] Error encoding AI recommendations: %v", truncateID(n.ID), err)
+	}
 }
 
 // handleAITrain handles requests to manually train the AI models
 func (n *Node) handleAITrain(w http.ResponseWriter, r *http.Request) {
-	// Simplified stub
+	// Only allow POST method for training endpoint
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse training parameters from request body
+	var params struct {
+		Resource string `json:"resource"` // cpu, memory, network, disk, message_rate
+		LookBack int    `json:"lookback"` // lookback period in hours
+		NodeID   string `json:"node_id"`  // optional node ID to train for
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Validate parameters
+	if params.Resource == "" {
+		http.Error(w, "Missing resource parameter", http.StatusBadRequest)
+		return
+	}
+
+	if params.LookBack <= 0 {
+		http.Error(w, "LookBack must be greater than 0", http.StatusBadRequest)
+		return
+	}
+
+	// Use this node's ID if not specified
+	if params.NodeID == "" {
+		params.NodeID = n.ID
+	}
+
+	// Convert lookback hours to a duration
+	lookbackDuration := time.Duration(params.LookBack) * time.Hour
+
+	// Map resource string to AI resource type
+	var resourceType prediction.ResourceType
+	switch strings.ToLower(params.Resource) {
+	case "cpu":
+		resourceType = prediction.ResourceCPU
+	case "memory":
+		resourceType = prediction.ResourceMemory
+	case "network":
+		resourceType = prediction.ResourceNetwork
+	case "disk":
+		resourceType = prediction.ResourceDisk
+	case "message_rate":
+		resourceType = prediction.ResourceMessageRate
+	default:
+		http.Error(w, "Unsupported resource type: "+params.Resource, http.StatusBadRequest)
+		return
+	}
+
+	// Prepare response
+	response := struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+		Error   string `json:"error,omitempty"`
+	}{}
+
+	// Check if AI engine is available
+	if n.AI == nil {
+		response.Success = false
+		response.Message = "Failed to train model"
+		response.Error = "AI engine not available"
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			log.Printf("[Node %s] Error encoding response: %v", n.ID[:8], err)
+		}
+		return
+	}
+
+	// Try to use production engine
+	enginePtr, ok := n.AI.(*ai.Engine)
+	if ok {
+		// Attempt to train the model with production engine
+		err := enginePtr.TrainResourceModel(resourceType, n.ID, lookbackDuration)
+		if err != nil {
+			response.Success = false
+			response.Message = "Failed to train model"
+			response.Error = err.Error()
+		} else {
+			response.Success = true
+			response.Message = fmt.Sprintf("Successfully trained model for %s with %s lookback", params.Resource, lookbackDuration)
+		}
+	} else {
+		// Try to use test engine
+		testEngine, ok := n.AI.(*TestAIEngine)
+		if ok {
+			// Attempt to train the model with test engine
+			err := testEngine.TrainResourceModel(resourceType, n.ID, lookbackDuration)
+			if err != nil {
+				response.Success = false
+				response.Message = "Failed to train model"
+				response.Error = err.Error()
+			} else {
+				response.Success = true
+				response.Message = fmt.Sprintf("Successfully trained model for %s with %s lookback", params.Resource, lookbackDuration)
+			}
+		} else {
+			response.Success = false
+			response.Message = "Failed to train model"
+			response.Error = "AI engine implementation does not support training"
+		}
+	}
+
+	// Return JSON response
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("[Node %s] Error encoding AI training response: %v", truncateID(n.ID), err)
+	}
+}
+
+// handleStore handles store-related requests
+func (n *Node) handleStore(w http.ResponseWriter, r *http.Request) {
+	// Only accept POST requests
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Use semaphore to limit concurrent requests
+	select {
+	case n.semaphore <- struct{}{}:
+		defer func() { <-n.semaphore }()
+	default:
+		http.Error(w, "Server busy, too many concurrent requests", http.StatusServiceUnavailable)
+		return
+	}
+
+	// GET request to retrieve messages
+	if r.Method == http.MethodGet {
+		topic := r.URL.Query().Get("topic")
+		if topic == "" {
+			http.Error(w, "Topic parameter required", http.StatusBadRequest)
+			return
+		}
+
+		// Get messages from the store
+		messages := n.Store.GetMessages(topic)
+
+		// Return messages as JSON
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(messages); err != nil {
+			log.Printf("[Node %s] Error encoding messages: %v", n.ID[:8], err)
+			http.Error(w, "Failed to encode messages", http.StatusInternalServerError)
+			return
+		}
+		return
+	}
+
+	// POST request to store a message
+	var msg store.Message
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		http.Error(w, "Invalid message format", http.StatusBadRequest)
+		return
+	}
+
+	// Validate message
+	if msg.Topic == "" {
+		http.Error(w, "Topic cannot be empty", http.StatusBadRequest)
+		return
+	}
+
+	// Generate ID if not provided
+	if msg.ID == "" {
+		msg.ID = uuid.New().String()
+	}
+
+	// Set timestamp if not provided
+	if msg.Timestamp.IsZero() {
+		msg.Timestamp = time.Now()
+	}
+
+	// Store the message
+	if err := n.Store.Publish(msg); err != nil {
+		log.Printf("[Node %s] Error storing message: %v", n.ID[:8], err)
+		http.Error(w, fmt.Sprintf("Failed to store message: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Return success response
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": "Message stored successfully",
+		"id":      msg.ID,
+	}); err != nil {
+		log.Printf("[Node %s] Error encoding success response: %v", n.ID[:8], err)
+	}
 }

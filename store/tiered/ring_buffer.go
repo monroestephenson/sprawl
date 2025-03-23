@@ -207,3 +207,101 @@ func (rb *RingBuffer) Close() {
 	rb.notEmpty.Broadcast()
 	rb.mu.Unlock()
 }
+
+// GetOldestMessages retrieves the oldest messages from the buffer
+// up to the specified count and older than the retention period
+func (rb *RingBuffer) GetOldestMessages(count int, retention time.Duration) ([]Message, error) {
+	if count <= 0 {
+		return nil, errors.New("count must be positive")
+	}
+
+	rb.mu.RLock()
+	defer rb.mu.RUnlock()
+
+	if rb.count == 0 {
+		return []Message{}, nil
+	}
+
+	// Calculate the cutoff time
+	cutoff := time.Now().Add(-retention)
+
+	// Collect oldest messages
+	var oldMessages []Message
+	currentPos := rb.head
+	remaining := min(uint64(count), rb.count)
+
+	for remaining > 0 {
+		// Get message at current position
+		msg := rb.buffer[currentPos%rb.size]
+
+		// Check if it's older than the retention period
+		if msg.ID != "" && msg.Timestamp.Before(cutoff) {
+			// Make a copy of the message to avoid race conditions
+			oldMessages = append(oldMessages, Message{
+				ID:        msg.ID,
+				Topic:     msg.Topic,
+				Payload:   append([]byte(nil), msg.Payload...),
+				Timestamp: msg.Timestamp,
+				TTL:       msg.TTL,
+			})
+		}
+
+		// Move to next position
+		currentPos++
+		remaining--
+	}
+
+	return oldMessages, nil
+}
+
+// Delete removes a message from the buffer by ID
+// Returns true if message was found and deleted, false otherwise
+func (rb *RingBuffer) Delete(id string) bool {
+	if id == "" {
+		return false
+	}
+
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	if rb.count == 0 {
+		return false
+	}
+
+	// Search for message with given ID
+	currentPos := rb.head
+	found := false
+	var foundPos uint64
+
+	// Scan buffer to find the message
+	for i := uint64(0); i < rb.count; i++ {
+		pos := currentPos % rb.size
+		if rb.buffer[pos].ID == id {
+			found = true
+			foundPos = pos
+			break
+		}
+		currentPos++
+	}
+
+	if !found {
+		return false
+	}
+
+	// Mark the message as deleted by clearing its ID
+	// This is more efficient than physically removing it
+	msgSize := uint64(len(rb.buffer[foundPos].Payload))
+
+	// Update memory usage
+	if rb.currentMem >= msgSize {
+		rb.currentMem -= msgSize
+	}
+
+	// Clear the message
+	rb.buffer[foundPos] = Message{}
+
+	// Note: We don't decrement count since the slot is still occupied
+	// It will be reused when tail wraps around
+
+	return true
+}
