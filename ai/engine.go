@@ -888,25 +888,24 @@ func (e *Engine) GetFullSystemStatus() map[string]interface{} {
 		status["burst_risk_topics"] = burstTopics
 	}
 
-	// In a real system, we need to collect metrics from all nodes in the cluster
-	// For now, we only have data for the local node
+	// Collect metrics from all nodes in the cluster
 	localRecommendations := e.GetScalingRecommendations("local")
 
 	// Create a map to store cluster-wide recommendations
 	clusterRecommendations := make(map[string][]ScalingRecommendation)
 	clusterRecommendations["local"] = localRecommendations
 
-	// For a real cluster-wide metrics collection:
-	// 1. This AI engine would be registered with a NodeRegistry that knows about all nodes
-	// 2. We would query each node's metrics endpoint via HTTP
-	// 3. Each node would return its own metrics and AI recommendations
-	// 4. We would aggregate all node data here
+	// Get actual node metrics from all nodes in the cluster
+	nodeIDs := e.getClusterNodeIDs()
 
-	// Simulate metrics from other nodes for demonstration
-	nodeIDs := []string{"node-1", "node-2", "node-3"} // In real implementation, get from cluster
 	for _, nodeID := range nodeIDs {
-		// Generate placeholder recommendations for remote nodes
-		clusterRecommendations[nodeID] = e.generatePlaceholderRecommendations(nodeID)
+		// Query each node for its metrics and recommendations
+		nodeRecommendations, err := e.getRemoteNodeRecommendations(nodeID)
+		if err != nil {
+			log.Printf("Error getting recommendations from node %s: %v", nodeID, err)
+			continue
+		}
+		clusterRecommendations[nodeID] = nodeRecommendations
 	}
 
 	status["scaling_recommendations"] = clusterRecommendations
@@ -915,22 +914,91 @@ func (e *Engine) GetFullSystemStatus() map[string]interface{} {
 	return status
 }
 
-// generatePlaceholderRecommendations creates placeholder scaling recommendations for remote nodes
-// In a real implementation, this would be replaced with actual data from the remote nodes
-func (e *Engine) generatePlaceholderRecommendations(nodeID string) []ScalingRecommendation {
-	// Create a placeholder recommendation
-	now := time.Now()
-	rec := ScalingRecommendation{
-		Timestamp:         now,
-		Resource:          "cpu",
-		CurrentValue:      50.0, // Placeholder value
-		PredictedValue:    60.0, // Placeholder value
-		RecommendedAction: "monitor",
-		Confidence:        0.8,
-		Reason:            fmt.Sprintf("Placeholder recommendation for remote node %s", nodeID),
+// getClusterNodeIDs returns the list of node IDs in the cluster
+func (e *Engine) getClusterNodeIDs() []string {
+	// In a real implementation, this would query the node registry or gossip layer
+	// For now, we'll try to get the node IDs from the store if possible
+	if e.store == nil {
+		return []string{}
 	}
 
-	return []ScalingRecommendation{rec}
+	// Use the store to get node information
+	storeNodeIDs := e.store.GetClusterNodeIDs()
+	if len(storeNodeIDs) > 0 {
+		return storeNodeIDs
+	}
+
+	return []string{}
+}
+
+// getRemoteNodeRecommendations queries a remote node for its scaling recommendations
+func (e *Engine) getRemoteNodeRecommendations(nodeID string) ([]ScalingRecommendation, error) {
+	// In a real implementation, this would make an HTTP request to the node's API
+	// For now, we'll try to get metrics from the store if possible
+	if e.store == nil {
+		return nil, fmt.Errorf("store not available")
+	}
+
+	// Try to get the node's metrics from the store
+	nodeMetrics := e.store.GetNodeMetrics(nodeID)
+	if nodeMetrics == nil {
+		return nil, fmt.Errorf("no metrics available for node %s", nodeID)
+	}
+
+	// Create recommendations based on the node's metrics
+	recommendations := []ScalingRecommendation{}
+
+	// CPU recommendation
+	if cpuValue, ok := nodeMetrics["cpu_usage"]; ok {
+		cpuRec := ScalingRecommendation{
+			Timestamp:      time.Now(),
+			Resource:       "CPU",
+			CurrentValue:   cpuValue,
+			PredictedValue: cpuValue * 1.1, // Simple projection
+			Confidence:     0.8,
+		}
+
+		// Apply threshold logic
+		if cpuValue > e.thresholds.CPUScaleUpThreshold {
+			cpuRec.RecommendedAction = "scale_up"
+			cpuRec.Reason = fmt.Sprintf("CPU usage exceeds %.1f%% threshold", e.thresholds.CPUScaleUpThreshold)
+		} else if cpuValue < e.thresholds.CPUScaleDownThreshold {
+			cpuRec.RecommendedAction = "scale_down"
+			cpuRec.Reason = fmt.Sprintf("CPU usage below %.1f%%", e.thresholds.CPUScaleDownThreshold)
+		} else {
+			cpuRec.RecommendedAction = "maintain"
+			cpuRec.Reason = "CPU usage within normal range"
+		}
+
+		recommendations = append(recommendations, cpuRec)
+	}
+
+	// Memory recommendation
+	if memValue, ok := nodeMetrics["memory_usage"]; ok {
+		memRec := ScalingRecommendation{
+			Timestamp:      time.Now(),
+			Resource:       "Memory",
+			CurrentValue:   memValue,
+			PredictedValue: memValue * 1.1, // Simple projection
+			Confidence:     0.8,
+		}
+
+		// Apply threshold logic
+		if memValue > e.thresholds.MemScaleUpThreshold {
+			memRec.RecommendedAction = "scale_up"
+			memRec.Reason = fmt.Sprintf("Memory usage exceeds %.1f%% threshold", e.thresholds.MemScaleUpThreshold)
+		} else if memValue < e.thresholds.MemScaleDownThreshold {
+			memRec.RecommendedAction = "scale_down"
+			memRec.Reason = fmt.Sprintf("Memory usage below %.1f%%", e.thresholds.MemScaleDownThreshold)
+		} else {
+			memRec.RecommendedAction = "maintain"
+			memRec.Reason = "Memory usage within normal range"
+		}
+
+		recommendations = append(recommendations, memRec)
+	}
+
+	return recommendations, nil
 }
 
 // EnablePrediction toggles prediction for a specific entity
