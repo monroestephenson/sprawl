@@ -156,7 +156,7 @@ func (d *gossipDelegate) NotifyMsg(msg []byte) {
 		}
 
 		// Process DHT topic map if present
-		if metadata.DHTPeers != nil && len(metadata.DHTPeers) > 0 {
+		if len(metadata.DHTPeers) > 0 {
 			log.Printf("[Gossip] AGGRESSIVE: Processing DHT peers from GossipMetadata")
 			d.dht.MergeTopicMap(metadata.DHTPeers)
 		}

@@ -204,15 +204,18 @@ func (g *GossipManager) getLocalTopics() []string {
 	return []string{}
 }
 
-// JoinCluster joins a cluster by specifying seed nodes
+// JoinCluster joins a cluster with the given seed nodes
 func (g *GossipManager) JoinCluster(seeds []string) error {
-	log.Printf("[Gossip] Attempting to join cluster with seeds: %v", seeds)
+	if len(seeds) == 0 {
+		log.Printf("[Gossip] No seeds provided, not joining any cluster")
+		return nil
+	}
+
+	log.Printf("[Gossip] Joining cluster with seeds: %v", seeds)
 
 	// Convert string addresses to IP addresses
 	addrs := make([]string, 0, len(seeds))
-	for _, seed := range seeds {
-		addrs = append(addrs, seed)
-	}
+	addrs = append(addrs, seeds...)
 
 	// Join the cluster
 	n, err := g.list.Join(addrs)

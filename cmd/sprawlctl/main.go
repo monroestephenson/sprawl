@@ -115,65 +115,6 @@ func runPublish(cmd *cobra.Command, args []string) {
 	fmt.Printf("Published %d messages (%d failures)\n", count*parallel-failures, failures)
 }
 
-// doRequest sends an HTTP request with retry capability
-func doRequest(url string, data []byte, retries int) (*http.Response, error) {
-	var resp *http.Response
-	var err error
-
-	for i := 0; i <= retries; i++ {
-		resp, err = http.Post(url, "application/json", bytes.NewBuffer(data))
-		if err == nil {
-			return resp, nil
-		}
-
-		log.Printf("Request failed (attempt %d/%d): %v", i+1, retries+1, err)
-		if i < retries {
-			backoff := time.Duration(math.Pow(2, float64(i))) * 100 * time.Millisecond
-			log.Printf("Retrying in %v...", backoff)
-			time.Sleep(backoff)
-		}
-	}
-
-	return nil, fmt.Errorf("request failed after %d attempts: %w", retries+1, err)
-}
-
-// Modify the subscribe function to use the doRequest function
-func subscribe(nodeURL, topic string) error {
-	data := map[string]interface{}{
-		"topics": []string{topic},
-	}
-
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("error marshaling request: %w", err)
-	}
-
-	// Use the doRequest function with 3 retries
-	resp, err := doRequest(nodeURL+"/subscribe", jsonData, 3)
-	if err != nil {
-		return fmt.Errorf("error subscribing to topic: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Rest of the function remains the same
-	var result struct {
-		Status string `json:"status"`
-		ID     string `json:"id"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("error decoding response: %w", err)
-	}
-
-	if result.Status != "subscribed" {
-		return fmt.Errorf("unexpected status: %s", result.Status)
-	}
-
-	fmt.Printf("Successfully subscribed to topic: %s on node: %s (ID: %s)\n", topic, nodeURL, result.ID)
-	return nil
-}
-
-// Modify the publish function to use the doRequest function
 func publish(nodeURL, topic, payload string) error {
 	data := map[string]interface{}{
 		"topic":   topic,
@@ -669,3 +610,16 @@ func testNodeFailure() error {
 
 	return nil
 }
+
+// doRequest and subscribe are commented out as they're unused currently
+/*
+func doRequest(url string, data []byte, retries int) (*http.Response, error) {
+	// Implementation removed to fix linter warning
+	return nil, nil
+}
+
+func subscribe(nodeURL, topic string) error {
+	// Implementation removed to fix linter warning
+	return nil
+}
+*/

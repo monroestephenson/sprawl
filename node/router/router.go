@@ -115,7 +115,7 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 	for retry := 0; retry < maxRetries; retry++ {
 		select {
 		case r.semaphore <- struct{}{}:
-			acquired = true
+			// acquired semaphore, proceed with message processing
 			log.Printf("[Router] RouteMessage for %s: semaphore acquired, new capacity: %d/%d",
 				truncateID(msg.ID), len(r.semaphore), cap(r.semaphore))
 			defer func() {

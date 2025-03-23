@@ -33,7 +33,6 @@ type RaftNode struct {
 	electionTimeout time.Duration
 	heartbeatTicker *time.Ticker
 	electionTimer   *time.Timer
-	lastHeartbeat   time.Time
 
 	// Channels
 	voteCh   chan VoteRequest
@@ -740,10 +739,7 @@ func (r *RaftNode) HandleVote(w http.ResponseWriter, req *http.Request) {
 
 	// Send the response back
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(RPCVoteResponse{
-		Term:        voteResp.Term,
-		VoteGranted: voteResp.VoteGranted,
-	}); err != nil {
+	if err := json.NewEncoder(w).Encode(RPCVoteResponse(voteResp)); err != nil {
 		log.Printf("[Raft %s] Error encoding vote response: %v", truncateID(r.id), err)
 	}
 }
@@ -777,10 +773,7 @@ func (r *RaftNode) HandleAppendEntries(w http.ResponseWriter, req *http.Request)
 
 	// Send the response back
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(RPCAppendEntriesResponse{
-		Term:    appendResp.Term,
-		Success: appendResp.Success,
-	}); err != nil {
+	if err := json.NewEncoder(w).Encode(RPCAppendEntriesResponse(appendResp)); err != nil {
 		log.Printf("[Raft] Error encoding append entries response: %v", err)
 	}
 }

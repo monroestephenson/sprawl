@@ -40,7 +40,6 @@ type CloudStore struct {
 	batch    *messageBatch
 	uploadCh chan []Message
 	doneCh   chan struct{}
-	mu       sync.RWMutex
 }
 
 type CloudMetrics struct {

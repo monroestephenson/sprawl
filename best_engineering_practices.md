@@ -12,7 +12,7 @@
 
 ### 2. **Code Quality & Developer Tooling**
 - ✅ Use **`golangci-lint`** + `go vet` + `staticcheck`.
-- ✅ **Logging**: Use structured logs (e.g., `zerolog`, `zap`) with log levels (`info`, `warn`, `error`, `debug`).
+- ✅ **Logging**: Use structured logs (e.g., `zerolog`, `zap`) with log levels (`info`, `warn`, `error`, `debug`).  
 - ✅ **Profiling/Tracing**: Add `pprof` or OpenTelemetry to monitor performance.
 - ✅ **CI/CD Pipeline**: GitHub Actions or GitLab CI to run all tests + linters on PRs.
 - ✅ **Pre-commit hooks** to enforce formatting and lint rules before every commit (you’re already on this — nice!).

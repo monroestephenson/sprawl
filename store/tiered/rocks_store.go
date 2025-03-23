@@ -40,7 +40,7 @@ func NewRocksStore(path string) (*RocksStore, error) {
 	opts.SetWriteBufferSize(64 * 1024 * 1024)        // 64MB
 	opts.SetMaxWriteBufferNumber(3)
 	opts.SetTargetFileSizeBase(64 * 1024 * 1024)
-	opts.SetMaxBackgroundCompactions(2)
+	opts.SetMaxBackgroundJobs(4) // Modern replacement for SetMaxBackgroundCompactions
 
 	// Ensure directory exists
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -312,13 +312,10 @@ func (rs *RocksStore) monitorCompaction() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			if rs.db != nil {
-				if rs.shouldCompact() {
-					rs.compact()
-				}
+	for range ticker.C {
+		if rs.db != nil {
+			if rs.shouldCompact() {
+				rs.compact()
 			}
 		}
 	}

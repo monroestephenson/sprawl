@@ -77,3 +77,5 @@ go.sum
 # Cache directories
 .cache/
 node_modules/
+
+best_engineering_practices.md

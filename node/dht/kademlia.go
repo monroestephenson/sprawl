@@ -1,7 +1,6 @@
 package dht
 
 import (
-	"crypto/sha256"
 	"math/big"
 )
 
@@ -14,9 +13,13 @@ const (
 	IDLength = 32
 )
 
-// distance calculates the XOR distance between two hashes
+// distance computes the XOR distance between two byte arrays
 func distance(a, b []byte) *big.Int {
 	dist := new(big.Int)
+	if len(a) != len(b) {
+		return dist
+	}
+
 	xor := make([]byte, len(a))
 	for i := range a {
 		xor[i] = a[i] ^ b[i]
@@ -25,6 +28,7 @@ func distance(a, b []byte) *big.Int {
 	return dist
 }
 
+/* Commented out as per linter recommendations - not currently used
 // closestNodes returns the k closest nodes to a given hash
 func (d *DHT) closestNodes(hash []byte, k int) []NodeInfo {
 	distances := make(map[string]*big.Int)
@@ -60,3 +64,4 @@ func sortByDistance(nodes []NodeInfo, distances map[string]*big.Int) {
 		}
 	}
 }
+*/
