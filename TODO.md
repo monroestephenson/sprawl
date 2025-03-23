@@ -376,17 +376,17 @@ This document catalogs all placeholder implementations and unfinished features t
 
 ## Cloud Storage
 
-- [ ] **Implement LRU cache for ID-to-object mappings**
+- [x] **Implement LRU cache for ID-to-object mappings**
   - File: `store/tiered/cloud_store.go:418`
   - Comment: `// If we have too many mappings, evict oldest (would use LRU in production)`
   - Description: Replace the simple randomized eviction with a proper LRU implementation
 
-- [ ] **Add persistent index support for CloudStore**
+- [x] **Add persistent index support for CloudStore**
   - File: `store/tiered/cloud_store.go:426-429`
   - Comment: `// In a production implementation, periodically persist this mapping to disk...`
   - Description: Implement persistence for the ID-to-object mappings to survive restarts
 
-- [ ] **Implement efficient topic listing in cloud storage**
+- [x] **Implement efficient topic listing in cloud storage**
   - File: `store/tiered/manager.go:468`
   - Comment: `// The actual implementation would query the cloud store for all topics`
   - Description: Add proper topic listing in cloud storage without requiring full scans
@@ -492,5 +492,5 @@ This document catalogs all placeholder implementations and unfinished features t
 
 ## Progress
 - Total items: 30
-- Completed: 0
-- Remaining: 30
+- Completed: 3
+- Remaining: 27

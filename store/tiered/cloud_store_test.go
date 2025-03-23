@@ -464,3 +464,91 @@ func TestPersistentMappings(t *testing.T) {
 		}
 	}
 }
+
+func TestCloudStore_TopicListing(t *testing.T) {
+	// Skip if not running integration tests
+	if os.Getenv("RUN_INTEGRATION_TESTS") != "1" {
+		t.Skip("Skipping integration test")
+	}
+
+	// Get test config
+	cfg := getTestConfig(t)
+
+	// Create store
+	store, err := NewCloudStore(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create cloud store: %v", err)
+	}
+	defer cleanupBucket(t, store)
+	defer store.Close()
+
+	// Create test messages for multiple topics
+	topics := []string{"test-topic-1", "test-topic-2", "test-topic-3"}
+	for _, topic := range topics {
+		msgs := []Message{
+			{ID: fmt.Sprintf("%s-msg1", topic), Payload: []byte("test data 1"), Timestamp: time.Now()},
+			{ID: fmt.Sprintf("%s-msg2", topic), Payload: []byte("test data 2"), Timestamp: time.Now()},
+		}
+
+		// Store the messages
+		err := store.Store(topic, msgs)
+		if err != nil {
+			t.Fatalf("Failed to store messages: %v", err)
+		}
+
+		// Wait for batch upload
+		time.Sleep(cfg.BatchTimeout + 100*time.Millisecond)
+	}
+
+	// Test the in-memory topic index
+	listedTopics, err := store.ListTopics()
+	if err != nil {
+		t.Fatalf("Failed to list topics: %v", err)
+	}
+
+	// Verify all topics are listed
+	topicMap := make(map[string]bool)
+	for _, topic := range listedTopics {
+		topicMap[topic] = true
+	}
+
+	for _, expectedTopic := range topics {
+		if !topicMap[expectedTopic] {
+			t.Errorf("Topic %s not found in listing", expectedTopic)
+		}
+	}
+
+	// Create a new store instance to test listing when in-memory index is empty
+	newStore, err := NewCloudStore(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create new cloud store: %v", err)
+	}
+	defer newStore.Close()
+
+	// Clear the in-memory index
+	newStore.topicIndex.topics = make(map[string]struct{})
+
+	// Test listing topics from S3
+	listedTopics, err = newStore.ListTopics()
+	if err != nil {
+		t.Fatalf("Failed to list topics from S3: %v", err)
+	}
+
+	// Verify all topics are listed from S3
+	topicMap = make(map[string]bool)
+	for _, topic := range listedTopics {
+		topicMap[topic] = true
+	}
+
+	for _, expectedTopic := range topics {
+		if !topicMap[expectedTopic] {
+			t.Errorf("Topic %s not found in S3 listing", expectedTopic)
+		}
+	}
+
+	// Verify the in-memory index was updated
+	if len(newStore.topicIndex.topics) != len(topics) {
+		t.Errorf("In-memory topic index not updated correctly. Expected %d topics, got %d",
+			len(topics), len(newStore.topicIndex.topics))
+	}
+}

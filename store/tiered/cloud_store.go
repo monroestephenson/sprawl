@@ -273,15 +273,18 @@ func NewCloudStore(cfg CloudConfig) (*CloudStore, error) {
 		cfg.IndexPath = "./data/cloud_index"
 	}
 
-	// Initialize LRU cache for ID to object mappings
-	cache := newSimpleLRU(100000) // 100K entries
+	// Create a new LRU cache for ID to object mappings
+	// Use a reasonable default size if not specified
+	cacheSize := 10000
+	cache := newSimpleLRU(cacheSize)
 
+	// Create the CloudStore instance
 	cs := &CloudStore{
 		client:     client,
 		config:     cfg,
 		metrics:    &CloudMetrics{},
 		batch:      &messageBatch{messages: make([]Message, 0, cfg.BatchSize)},
-		uploadCh:   make(chan []Message, 100),
+		uploadCh:   make(chan []Message, cfg.UploadWorkers),
 		doneCh:     make(chan struct{}),
 		idMappings: &idMappingCache{cache: cache},
 		topicIndex: &topicIndex{
@@ -289,25 +292,23 @@ func NewCloudStore(cfg CloudConfig) (*CloudStore, error) {
 		},
 	}
 
-	// Load existing mappings from disk if persistent index is enabled
+	// Load persisted mappings if enabled
 	if cfg.EnablePersistentIndex {
 		if err := cs.loadMappingsFromDisk(); err != nil {
-			// Log but continue - this is non-fatal
-			log.Printf("Warning: Failed to load ID mappings from disk: %v", err)
+			log.Printf("Warning: Failed to load persisted ID mappings: %v", err)
+			// Continue anyway, this is not a fatal error
 		}
 	}
 
-	// Start upload workers
+	// Start background workers
 	for i := 0; i < cfg.UploadWorkers; i++ {
 		go cs.uploadWorker()
 	}
-
-	// Start batch uploader
 	go cs.batchUploader()
 
-	// Start periodic persistence if enabled
+	// If persistent index is enabled, start a background task to periodically persist mappings
 	if cfg.EnablePersistentIndex {
-		cs.StartPeriodicPersistence(5 * time.Minute)
+		go cs.StartPeriodicPersistence(5 * time.Minute)
 	}
 
 	return cs, nil
@@ -556,10 +557,12 @@ func (cs *CloudStore) retrieveMessageFromBatch(objKey string, messageID string) 
 
 // saveIDToObjectMapping saves a mapping from message ID to object key for faster lookups
 func (cs *CloudStore) saveIDToObjectMapping(id string, objKey string) {
+	// The simpleLRU implementation already handles LRU eviction when over capacity
+	// so we can simply add the mapping and it will automatically evict the oldest
+	// entry if needed
 	cs.idMappings.cache.Add(id, objKey)
 
-	// In a production implementation, we would periodically persist this mapping to disk
-	// if the persistent index option is enabled
+	// If persistent index is enabled, schedule a write to disk
 	if cs.config.EnablePersistentIndex {
 		go cs.persistMappingsToDisk()
 	}
@@ -602,11 +605,9 @@ func (cs *CloudStore) persistMappingsToDisk() {
 		return
 	}
 
-	// Atomically rename to final file
+	// Rename temp file to actual file (atomic operation)
 	if err := os.Rename(tempPath, mappingsPath); err != nil {
-		log.Printf("Error renaming temp mappings file: %v", err)
-		// Try to clean up
-		os.Remove(tempPath)
+		log.Printf("Error renaming ID mappings file: %v", err)
 		return
 	}
 
@@ -913,6 +914,11 @@ func (cs *CloudStore) Close() error {
 	close(cs.doneCh)
 	close(cs.uploadCh)
 
+	// Persist mappings one last time if enabled
+	if cs.config.EnablePersistentIndex {
+		cs.persistMappingsToDisk()
+	}
+
 	return nil
 }
 
@@ -937,7 +943,7 @@ func (cs *CloudStore) ListTopics() ([]string, error) {
 	// Use the S3 client to list the topics (which are prefixes in our storage scheme)
 	// We use the delimiter-based approach to list "directories" (which are our topics)
 	input := &s3.ListObjectsV2Input{
-		Bucket:    &cs.config.Bucket,
+		Bucket:    aws.String(cs.config.Bucket),
 		Delimiter: aws.String("/"),
 	}
 
@@ -947,35 +953,36 @@ func (cs *CloudStore) ListTopics() ([]string, error) {
 	// Paginate through all results
 	paginator := s3.NewListObjectsV2Paginator(cs.client, input)
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		output, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to list objects in bucket: %w", err)
+			return nil, fmt.Errorf("error listing objects: %w", err)
 		}
 
-		// Common prefixes are our "directories" which represent topics
-		for _, prefix := range page.CommonPrefixes {
+		// Common prefixes are the "directories" (topics)
+		for _, prefix := range output.CommonPrefixes {
 			if prefix.Prefix == nil {
 				continue
 			}
 
-			// Extract topic name (remove the trailing slash)
-			topic := *prefix.Prefix
-			if len(topic) > 0 && topic[len(topic)-1] == '/' {
-				topic = topic[:len(topic)-1]
+			// Remove trailing slash and extract the topic name
+			topicPath := strings.TrimSuffix(*prefix.Prefix, "/")
+			if topicPath == "" {
+				continue
 			}
 
-			topicsMap[topic] = struct{}{}
+			// Add to the topics set
+			topicsMap[topicPath] = struct{}{}
 		}
 
-		// Also check objects (for the case where we don't have directories)
-		for _, obj := range page.Contents {
+		// Also check objects directly for topics
+		for _, obj := range output.Contents {
 			if obj.Key == nil {
 				continue
 			}
 
-			// Extract topic from object key (format: topic/batch_timestamp.json)
+			// Extract topic from key using the first segment
 			parts := strings.SplitN(*obj.Key, "/", 2)
-			if len(parts) > 0 {
+			if len(parts) > 0 && parts[0] != "" {
 				topicsMap[parts[0]] = struct{}{}
 			}
 		}
@@ -985,12 +992,15 @@ func (cs *CloudStore) ListTopics() ([]string, error) {
 	topics := make([]string, 0, len(topicsMap))
 	for topic := range topicsMap {
 		topics = append(topics, topic)
-
-		// Also update our in-memory cache
-		cs.topicIndex.mu.Lock()
-		cs.topicIndex.topics[topic] = struct{}{}
-		cs.topicIndex.mu.Unlock()
 	}
+
+	// Update our in-memory index with discovered topics
+	// This prevents having to scan the bucket again next time
+	cs.topicIndex.mu.Lock()
+	for topic := range topicsMap {
+		cs.topicIndex.topics[topic] = struct{}{}
+	}
+	cs.topicIndex.mu.Unlock()
 
 	return topics, nil
 }
