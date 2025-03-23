@@ -147,7 +147,9 @@ func (s *registrySnapshot) Persist(sink raft.SnapshotSink) error {
 	}()
 
 	if err != nil {
-		sink.Cancel()
+		if cancelErr := sink.Cancel(); cancelErr != nil {
+			return fmt.Errorf("failed to cancel sink: %v (original error: %v)", cancelErr, err)
+		}
 		return err
 	}
 

@@ -41,6 +41,9 @@ type RaftNode struct {
 	stopCh   chan struct{}
 	done     chan struct{}
 
+	// Flag to track if node is stopped
+	stopped bool
+
 	// Callbacks
 	onLeaderElected func(leaderId string)
 	onStateChange   func(oldState, newState NodeState)
@@ -121,6 +124,7 @@ func NewRaftNode(id string, peers []string) *RaftNode {
 		done:            make(chan struct{}),
 		nodeInfos:       make(map[string]NodeInfo),
 		httpClient:      &http.Client{Timeout: 2 * time.Second},
+		stopped:         false,
 	}
 
 	// Initialize timers with appropriate heartbeat (shorter than election timeout)
@@ -134,7 +138,20 @@ func NewRaftNode(id string, peers []string) *RaftNode {
 }
 
 func (r *RaftNode) run() {
-	defer close(r.done)
+	defer func() {
+		r.mu.Lock()
+		// Only close the done channel if we're marked as stopped
+		// This prevents multiple goroutines from trying to close it
+		if r.stopped {
+			select {
+			case <-r.done:
+				// Already closed
+			default:
+				close(r.done)
+			}
+		}
+		r.mu.Unlock()
+	}()
 	defer r.heartbeatTicker.Stop()
 	defer r.electionTimer.Stop()
 
@@ -639,9 +656,32 @@ func (r *RaftNode) SetLeaderElectedCallback(cb func(leaderId string)) {
 	r.onLeaderElected = cb
 }
 
+// Stop stops the Raft node and releases resources
 func (r *RaftNode) Stop() {
+	r.mu.Lock()
+	if r.stopped {
+		// Already stopped
+		r.mu.Unlock()
+		return
+	}
+
+	// Mark as stopped and close the stop channel
+	r.stopped = true
 	close(r.stopCh)
-	<-r.done
+	r.mu.Unlock()
+
+	// Stop the timers
+	r.heartbeatTicker.Stop()
+	r.electionTimer.Stop()
+
+	// Wait for the run goroutine to finish
+	select {
+	case <-r.done:
+		// Already done
+	case <-time.After(1 * time.Second):
+		// Timeout, just continue
+		log.Printf("[Node %s] Timeout waiting for Raft node to stop", truncateID(r.id))
+	}
 }
 
 // UpdatePeers updates the list of peers in the cluster
@@ -700,10 +740,12 @@ func (r *RaftNode) HandleVote(w http.ResponseWriter, req *http.Request) {
 
 	// Send the response back
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(RPCVoteResponse{
+	if err := json.NewEncoder(w).Encode(RPCVoteResponse{
 		Term:        voteResp.Term,
 		VoteGranted: voteResp.VoteGranted,
-	})
+	}); err != nil {
+		log.Printf("[Raft %s] Error encoding vote response: %v", truncateID(r.id), err)
+	}
 }
 
 // HandleAppendEntries handles HTTP appendEntries requests from other nodes
@@ -735,8 +777,10 @@ func (r *RaftNode) HandleAppendEntries(w http.ResponseWriter, req *http.Request)
 
 	// Send the response back
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(RPCAppendEntriesResponse{
+	if err := json.NewEncoder(w).Encode(RPCAppendEntriesResponse{
 		Term:    appendResp.Term,
 		Success: appendResp.Success,
-	})
+	}); err != nil {
+		log.Printf("[Raft] Error encoding append entries response: %v", err)
+	}
 }

@@ -63,6 +63,11 @@ func getTestConfig(t *testing.T) CloudConfig {
 }
 
 func TestCloudStore_BasicOperations(t *testing.T) {
+	// Skip test if AWS credentials are not available
+	if os.Getenv("AWS_ACCESS_KEY_ID") == "" || os.Getenv("AWS_SECRET_ACCESS_KEY") == "" {
+		t.Skip("Skipping test because AWS credentials are not available")
+	}
+
 	// Skip if no MinIO endpoint is provided
 	endpoint := os.Getenv("MINIO_ENDPOINT")
 	if endpoint == "" {
@@ -148,6 +153,12 @@ func TestCloudStore_BasicOperations(t *testing.T) {
 }
 
 func TestCloudStore_BatchUpload(t *testing.T) {
+	// Skip test if AWS credentials are not available
+	if os.Getenv("AWS_ACCESS_KEY_ID") == "" || os.Getenv("AWS_SECRET_ACCESS_KEY") == "" {
+		t.Skip("Skipping test because AWS credentials are not available")
+	}
+
+	// Skip if no MinIO endpoint is provided
 	endpoint := os.Getenv("MINIO_ENDPOINT")
 	if endpoint == "" {
 		t.Skip("Skipping cloud store test: MINIO_ENDPOINT not set")
@@ -217,7 +228,14 @@ func TestCloudStore_BatchUpload(t *testing.T) {
 }
 
 func TestCloudStore_ConcurrentAccess(t *testing.T) {
-	if os.Getenv("MINIO_ENDPOINT") == "" {
+	// Skip test if AWS credentials are not available
+	if os.Getenv("AWS_ACCESS_KEY_ID") == "" || os.Getenv("AWS_SECRET_ACCESS_KEY") == "" {
+		t.Skip("Skipping test because AWS credentials are not available")
+	}
+
+	// Skip if no MinIO endpoint is provided
+	endpoint := os.Getenv("MINIO_ENDPOINT")
+	if endpoint == "" {
 		t.Skip("Skipping cloud store test: MINIO_ENDPOINT not set")
 	}
 

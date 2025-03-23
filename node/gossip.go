@@ -241,7 +241,9 @@ func (g *GossipManager) Shutdown() {
 	log.Printf("[Gossip] Shutting down gossip manager")
 	close(g.stopCh)
 	<-g.done
-	g.list.Shutdown()
+	if err := g.list.Shutdown(); err != nil {
+		log.Printf("[Gossip] Error shutting down memberlist: %v", err)
+	}
 }
 
 // NotifyJoin is called when a node joins the cluster

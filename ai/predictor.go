@@ -65,5 +65,7 @@ func HandlePredictions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(prediction)
+	if err := json.NewEncoder(w).Encode(prediction); err != nil {
+		http.Error(w, fmt.Sprintf("Error encoding response: %v", err), http.StatusInternalServerError)
+	}
 }

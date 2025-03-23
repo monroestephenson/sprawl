@@ -201,7 +201,9 @@ func (n *Node) handleAIStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(status)
+	if err := json.NewEncoder(w).Encode(status); err != nil {
+		log.Printf("[Node %s] Error encoding AI status: %v", truncateID(n.ID), err)
+	}
 }
 
 // HandleAIPredictions handles requests for AI predictions
@@ -210,10 +212,12 @@ func (n *Node) handleAIPredictions(w http.ResponseWriter, r *http.Request) {
 	if resource == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": false,
 			"error":   "Missing resource parameter",
-		})
+		}); err != nil {
+			log.Printf("[Node %s] Error encoding error response: %v", truncateID(n.ID), err)
+		}
 		return
 	}
 
@@ -222,12 +226,14 @@ func (n *Node) handleAIPredictions(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":    true,
 		"resource":   resource,
 		"prediction": value,
 		"confidence": confidence,
-	})
+	}); err != nil {
+		log.Printf("[Node %s] Error encoding prediction response: %v", truncateID(n.ID), err)
+	}
 }
 
 // HandleAIAnomalies handles requests to get AI detected anomalies
@@ -236,9 +242,11 @@ func (n *Node) handleAIAnomalies(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"anomalies": anomalies,
-	})
+	}); err != nil {
+		log.Printf("[Node %s] Error encoding anomalies response: %v", truncateID(n.ID), err)
+	}
 }
 
 // HandleGetStore handles requests to get store information
@@ -264,7 +272,9 @@ func (n *Node) handleGetStore(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(storeInfo)
+	if err := json.NewEncoder(w).Encode(storeInfo); err != nil {
+		log.Printf("[Node %s] Error encoding store info: %v", truncateID(n.ID), err)
+	}
 }
 
 // StartHTTP starts the HTTP server for publish/subscribe endpoints
@@ -370,10 +380,12 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 					n.ID[:8], requestID, retryCount)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusServiceUnavailable)
-				json.NewEncoder(w).Encode(map[string]string{
+				if err := json.NewEncoder(w).Encode(map[string]string{
 					"error":       "Server is too busy, please retry later",
 					"retry_after": "1",
-				})
+				}); err != nil {
+					log.Printf("[Node %s] Error encoding service unavailable response: %v", truncateID(n.ID), err)
+				}
 				return
 			}
 			// Increase timeout with exponential backoff
@@ -396,9 +408,11 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Node %s] Publish request %s: method not allowed: %s", n.ID[:8], requestID, r.Method)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(map[string]string{
+		if err := json.NewEncoder(w).Encode(map[string]string{
 			"error": "Method not allowed",
-		})
+		}); err != nil {
+			log.Printf("[Node %s] Error encoding method not allowed response: %v", truncateID(n.ID), err)
+		}
 		return
 	}
 
@@ -415,9 +429,11 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Node %s] Publish request %s: error reading body: %v", n.ID[:8], requestID, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
+		if err := json.NewEncoder(w).Encode(map[string]string{
 			"error": "Error reading request body",
-		})
+		}); err != nil {
+			log.Printf("[Node %s] Error encoding bad request response: %v", truncateID(n.ID), err)
+		}
 		return
 	}
 
@@ -431,9 +447,11 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Node %s] Publish request %s: invalid JSON: %v", n.ID[:8], requestID, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
+		if err := json.NewEncoder(w).Encode(map[string]string{
 			"error": "Invalid request body",
-		})
+		}); err != nil {
+			log.Printf("[Node %s] Error encoding invalid JSON response: %v", truncateID(n.ID), err)
+		}
 		return
 	}
 
@@ -442,9 +460,11 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Node %s] Publish request %s: missing topic", n.ID[:8], requestID)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
+		if err := json.NewEncoder(w).Encode(map[string]string{
 			"error": "Missing required field: topic",
-		})
+		}); err != nil {
+			log.Printf("[Node %s] Error encoding missing field response: %v", truncateID(n.ID), err)
+		}
 		return
 	}
 
@@ -459,10 +479,12 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Node %s] Dropping message %s due to expired TTL", n.ID[:8], msg.ID)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{
+		if err := json.NewEncoder(w).Encode(map[string]string{
 			"status": "dropped",
 			"id":     msg.ID,
-		})
+		}); err != nil {
+			log.Printf("[Node %s] Error encoding dropped message response: %v", truncateID(n.ID), err)
+		}
 		return
 	}
 
@@ -496,9 +518,11 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 		if ctx.Err() == context.DeadlineExceeded {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusGatewayTimeout)
-			json.NewEncoder(w).Encode(map[string]string{
+			if err := json.NewEncoder(w).Encode(map[string]string{
 				"error": "Request timed out",
-			})
+			}); err != nil {
+				log.Printf("[Node %s] Error encoding timeout response: %v", truncateID(n.ID), err)
+			}
 			return
 		}
 
@@ -506,19 +530,23 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(err.Error(), "failed to deliver message") {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]string{
+			if err := json.NewEncoder(w).Encode(map[string]string{
 				"error": err.Error(),
-			})
+			}); err != nil {
+				log.Printf("[Node %s] Error encoding error response: %v", truncateID(n.ID), err)
+			}
 			return
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
+	if err := json.NewEncoder(w).Encode(map[string]string{
 		"status": "published",
 		"id":     msg.ID,
-	})
+	}); err != nil {
+		log.Printf("[Node %s] Error encoding published response: %v", truncateID(n.ID), err)
+	}
 }
 
 func (n *Node) handleSubscribe(w http.ResponseWriter, r *http.Request) {
@@ -670,7 +698,9 @@ func (n *Node) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(metrics)
+	if err := json.NewEncoder(w).Encode(metrics); err != nil {
+		log.Printf("[Node %s] Error encoding metrics response: %v", truncateID(n.ID), err)
+	}
 }
 
 func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -698,7 +728,9 @@ func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	if err := json.NewEncoder(w).Encode(status); err != nil {
+		log.Printf("[Node %s] Error encoding status response: %v", truncateID(n.ID), err)
+	}
 }
 
 // handleHealth handles health check requests
@@ -906,10 +938,12 @@ func (n *Node) rateLimiterMiddleware(next http.Handler) http.Handler {
 			// No slots available, return a 429 Too Many Requests
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			if err := json.NewEncoder(w).Encode(map[string]interface{}{
 				"error":   "Server is too busy",
 				"success": false,
-			})
+			}); err != nil {
+				log.Printf("[Node %s] Error encoding too many requests response: %v", truncateID(n.ID), err)
+			}
 		}
 	})
 }
@@ -1001,7 +1035,9 @@ func (n *Node) handleConsumerGroup(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Consumer group not found", http.StatusNotFound)
 			return
 		}
-		json.NewEncoder(w).Encode(group)
+		if err := json.NewEncoder(w).Encode(group); err != nil {
+			log.Printf("[Node %s] Error encoding consumer group response: %v", truncateID(n.ID), err)
+		}
 
 	case http.MethodPut:
 		var req struct {
@@ -1053,7 +1089,9 @@ func (n *Node) handleConsumerGroup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		json.NewEncoder(w).Encode(group)
+		if err := json.NewEncoder(w).Encode(group); err != nil {
+			log.Printf("[Node %s] Error encoding updated consumer group response: %v", truncateID(n.ID), err)
+		}
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1087,7 +1125,9 @@ func (n *Node) handleOffsets(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(offset)
+		if err := json.NewEncoder(w).Encode(offset); err != nil {
+			log.Printf("[Node %s] Error encoding offset response: %v", truncateID(n.ID), err)
+		}
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1117,7 +1157,9 @@ func (n *Node) handleOffset(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		json.NewEncoder(w).Encode(offset)
+		if err := json.NewEncoder(w).Encode(offset); err != nil {
+			log.Printf("[Node %s] Error encoding offset response: %v", truncateID(n.ID), err)
+		}
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1556,12 +1598,13 @@ func (n *Node) handleAIRecommendations(w http.ResponseWriter, r *http.Request) {
 
 // handleAITrain handles requests to manually train the AI models
 func (n *Node) handleAITrain(w http.ResponseWriter, r *http.Request) {
-	// For tests and simple implementations
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "training_started",
 		"message": "Training has been initiated (simplified implementation)",
-	})
+	}); err != nil {
+		log.Printf("[Node %s] Error encoding AI train response: %v", truncateID(n.ID), err)
+	}
 }
 
 // feedMetricsToAI periodically sends metrics to the AI engine for analysis
@@ -1784,4 +1827,12 @@ func (n *Node) GetFullAIEngine() *ai.Engine {
 		return engine
 	}
 	return nil
+}
+
+// truncateID safely truncates a node ID for logging
+func truncateID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }

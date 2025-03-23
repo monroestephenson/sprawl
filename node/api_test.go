@@ -32,10 +32,12 @@ func TestPublishHandler(t *testing.T) {
 
 		// Send response
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
+		if err := json.NewEncoder(w).Encode(map[string]string{
 			"status": "published",
 			"id":     uuid.New().String(),
-		})
+		}); err != nil {
+			t.Logf("Error encoding publish response: %v", err)
+		}
 	}
 
 	// Create test data
@@ -109,10 +111,12 @@ func TestSubscribeHandler(t *testing.T) {
 
 		// Send response
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
+		if err := json.NewEncoder(w).Encode(map[string]string{
 			"status": "subscribed",
 			"id":     sub.ID,
-		})
+		}); err != nil {
+			t.Logf("Error encoding subscribe response: %v", err)
+		}
 	}
 
 	// Create test data
@@ -173,7 +177,9 @@ func TestAIEndpoints(t *testing.T) {
 			status["server_time"] = time.Now().Format(time.RFC3339)
 
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(status)
+			if err := json.NewEncoder(w).Encode(status); err != nil {
+				t.Logf("Error encoding AI status response: %v", err)
+			}
 		}
 
 		// Create request
@@ -209,12 +215,14 @@ func TestAIEndpoints(t *testing.T) {
 			value, confidence := ai.GetPrediction(resource)
 
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			if err := json.NewEncoder(w).Encode(map[string]interface{}{
 				"success":    true,
 				"resource":   resource,
 				"prediction": value,
 				"confidence": confidence,
-			})
+			}); err != nil {
+				t.Logf("Error encoding AI predictions response: %v", err)
+			}
 		}
 
 		// Create request
@@ -247,9 +255,11 @@ func TestAIEndpoints(t *testing.T) {
 			anomalies := ai.GetSimpleAnomalies()
 
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			if err := json.NewEncoder(w).Encode(map[string]interface{}{
 				"anomalies": anomalies,
-			})
+			}); err != nil {
+				t.Logf("Error encoding AI anomalies response: %v", err)
+			}
 		}
 
 		// Create request

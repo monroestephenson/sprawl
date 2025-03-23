@@ -229,7 +229,9 @@ PROCESS_MESSAGE:
 			Timestamp: time.Now(),
 			TTL:       msg.TTL,
 		}
-		r.store.Publish(storeMsg)
+		if err := r.store.Publish(storeMsg); err != nil {
+			log.Printf("[Router] Error publishing message %s to local store: %v", truncateID(msg.ID), err)
+		}
 
 		msgState.Destinations[r.nodeID] = true
 		r.metrics.messagesRouted.Add(1)

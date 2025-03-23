@@ -21,10 +21,12 @@ func main() {
 	// Add a simple health endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
+		if err := json.NewEncoder(w).Encode(map[string]string{
 			"status": "ok",
 			"time":   time.Now().String(),
-		})
+		}); err != nil {
+			log.Printf("Error encoding health response: %v", err)
+		}
 	})
 
 	// Start server with a sensible timeout
