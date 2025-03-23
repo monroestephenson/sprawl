@@ -228,20 +228,119 @@ This document catalogs all placeholder implementations and unfinished features t
 
 ## System Metrics Collection
 
-- [ ] **Replace simulated CPU metrics with real host metrics**
+- [x] **Replace simulated CPU metrics with real host metrics**
   - File: `ai/engine.go:233`
   - Comment: `// In a real implementation, we would use the host's CPU metrics`
-  - Description: Replace the current synthetic CPU usage calculation with real OS-level metrics using a library like gopsutil
+  - Description: 
+    - Implement real CPU usage monitoring using the `github.com/shirou/gopsutil/cpu` package
+    - Add a function to collect per-core and overall CPU utilization percentages (user, system, idle)
+    - Modify `getCPUUsagePercent()` to call this new function
+    - Store historical CPU usage data with timestamps for trend analysis
+    - Add appropriate error handling for cases where CPU metrics can't be obtained
+    - Sample implementation:
+      ```go
+      import "github.com/shirou/gopsutil/v3/cpu"
+      
+      func getCPUUsagePercent() float64 {
+          percent, err := cpu.Percent(time.Second, false) // false = overall CPU percentage
+          if err != nil {
+              log.Printf("Error getting CPU usage: %v", err)
+              return 0.0
+          }
+          if len(percent) == 0 {
+              return 0.0
+          }
+          return percent[0] // Return the overall CPU usage percentage
+      }
+      ```
 
-- [ ] **Implement real memory usage tracking**
+- [x] **Implement real memory usage tracking**
   - File: `ai/engine.go:219`
   - Comment: `// This is a simple implementation; a production version would use the host's CPU metrics`
-  - Description: Update memory usage tracking to measure actual system memory usage instead of just Go runtime memory
+  - Description: 
+    - Use the `github.com/shirou/gopsutil/mem` package to collect actual system memory metrics
+    - Track both virtual and physical memory usage
+    - Implement memory metrics collection with the following details:
+      - Total memory available
+      - Used memory (total - free - buffers/cache)
+      - Memory usage percentage
+      - Swap space usage
+    - Store historical memory usage data for trend analysis
+    - Sample implementation:
+      ```go
+      import "github.com/shirou/gopsutil/v3/mem"
+      
+      func getMemoryUsagePercent() float64 {
+          v, err := mem.VirtualMemory()
+          if err != nil {
+              log.Printf("Error getting memory usage: %v", err)
+              return 0.0
+          }
+          return v.UsedPercent
+      }
+      ```
 
-- [ ] **Replace network activity estimation**
+- [x] **Replace network activity estimation**
   - File: `ai/intelligence.go:233`
   - Comment: `// In a real implementation, this would measure actual network traffic`
-  - Description: Implement actual network throughput measurement instead of synthetic estimation based on goroutine count
+  - Description: 
+    - Implement real network throughput monitoring using `github.com/shirou/gopsutil/net`
+    - Track the following metrics:
+      - Bytes sent/received per second
+      - Packets sent/received per second
+      - Network errors and dropped packets
+      - Connection count and states (TCP/UDP)
+    - Collect per-interface and aggregate network statistics
+    - Calculate rates by sampling at regular intervals and computing deltas
+    - Store historical network usage data for trend analysis
+    - Add configuration to specify which network interfaces to monitor
+    - Sample implementation:
+      ```go
+      import (
+          "github.com/shirou/gopsutil/v3/net"
+          "time"
+      )
+      
+      var lastNetStats map[string]net.IOCountersStat
+      var lastNetStatsTime time.Time
+      
+      func getNetworkActivity() float64 {
+          netStats, err := net.IOCounters(false) // false = all interfaces combined
+          if err != nil {
+              log.Printf("Error getting network stats: %v", err)
+              return 0.0
+          }
+          
+          now := time.Now()
+          if lastNetStats == nil {
+              // First run, store values and return 0
+              lastNetStats = make(map[string]net.IOCountersStat)
+              for _, stat := range netStats {
+                  lastNetStats[stat.Name] = stat
+              }
+              lastNetStatsTime = now
+              return 0.0
+          }
+          
+          timeDiff := now.Sub(lastNetStatsTime).Seconds()
+          if timeDiff < 0.1 {
+              return 0.0 // Avoid division by zero or very small time differences
+          }
+          
+          var totalBytesPerSec float64
+          for _, stat := range netStats {
+              if lastStat, ok := lastNetStats[stat.Name]; ok {
+                  bytesIn := float64(stat.BytesRecv - lastStat.BytesRecv) / timeDiff
+                  bytesOut := float64(stat.BytesSent - lastStat.BytesSent) / timeDiff
+                  totalBytesPerSec += bytesIn + bytesOut
+              }
+              lastNetStats[stat.Name] = stat
+          }
+          
+          lastNetStatsTime = now
+          return totalBytesPerSec
+      }
+      ```
 
 ## Storage Package
 

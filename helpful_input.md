@@ -56,3 +56,32 @@ Training Models has fallback to non-existent components:
 "AI engine implementation does not support training" (node/node.go)
 The code is filled with comments like "In a real implementation...", "simplified approach", and "would be more sophisticated" indicating the developer created placeholders or minimal implementations instead of fully functional code.
 Would you like me to focus on any specific component to analyze how incomplete it is?
+
+Based on careful examination of the code, I can see that these items are not fully implemented as described in the TODO list:
+CPU Usage Metrics:
+The getCPUUsagePercent() function in engine.go still uses the simulation approach based on runtime statistics rather than gopsutil.
+The tests are passing but only because they're not validating that the implementation actually uses gopsutil.
+The real implementation would replace the current algorithm with a direct call to cpu.Percent().
+Memory Usage Metrics:
+The getMemoryUsagePercent() function still uses Go's runtime memory stats (HeapInuse/HeapSys) instead of system-wide memory metrics.
+It should be using mem.VirtualMemory() to get actual system memory usage.
+Network Activity Metrics:
+The tests call estimateNetworkActivity() rather than a function that uses real network metrics.
+There's no implementation visible that uses the gopsutil net package as recommended.
+Disk I/O Metrics:
+The getDiskIOStats() function does properly use gopsutil's disk functions, which is a good sign.
+This part appears to be implemented correctly.
+
+Missing edge case testing:
+No tests for error conditions (when gopsutil fails)
+No tests for resource saturation scenarios
+Limited OS coverage (tests running only on macOS)
+Lack of performance testing:
+No measurement of collection overhead
+No evaluation of system impact at high collection frequencies
+Missing stability testing:
+No long-running tests to detect memory leaks
+No evaluation of accuracy drift over time
+Limited integration testing:
+No tests showing how metrics feed into prediction models
+No verification of metrics' impact on system decisions

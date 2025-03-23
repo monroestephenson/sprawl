@@ -4,7 +4,6 @@ package ai
 import (
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"runtime"
@@ -15,6 +14,11 @@ import (
 
 	"sprawl/ai/analytics"
 	"sprawl/ai/prediction"
+
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/mem"
+	psnet "github.com/shirou/gopsutil/v3/net"
 )
 
 // Engine is the main AI component that integrates all intelligence features
@@ -81,6 +85,119 @@ type ScalingRecommendation struct {
 	RecommendedAction string
 	Confidence        float64
 	Reason            string
+}
+
+// Global variables to track disk IO stats between calls
+var lastDiskStats map[string]disk.IOCountersStat
+var lastDiskStatsTime time.Time
+
+// Global variables to track network stats between calls
+var lastNetStats []psnet.IOCountersStat
+var lastNetStatsTime time.Time
+
+// getDiskIOStats returns disk I/O operations per second
+func getDiskIOStats() (float64, error) {
+	// Get real disk IO metrics using gopsutil
+	diskStats, err := disk.IOCounters()
+	if err != nil {
+		return 0.0, fmt.Errorf("error getting disk I/O stats: %v", err)
+	}
+
+	now := time.Now()
+	if lastDiskStats == nil {
+		// First run, store values and return 0
+		lastDiskStats = diskStats
+		lastDiskStatsTime = now
+		return 0.0, nil
+	}
+
+	// Calculate time difference
+	timeDiff := now.Sub(lastDiskStatsTime).Seconds()
+	if timeDiff < 0.1 {
+		return 0.0, nil // Avoid division by zero or very small time differences
+	}
+
+	// Calculate total IO operations per second
+	var totalIOPS float64
+	for diskName, stat := range diskStats {
+		if lastStat, ok := lastDiskStats[diskName]; ok {
+			readOps := float64(stat.ReadCount-lastStat.ReadCount) / timeDiff
+			writeOps := float64(stat.WriteCount-lastStat.WriteCount) / timeDiff
+			totalIOPS += readOps + writeOps
+		}
+	}
+
+	// Store current values for next call
+	lastDiskStats = diskStats
+	lastDiskStatsTime = now
+
+	return totalIOPS, nil
+}
+
+// getNetworkStats collects network metrics
+func getNetworkStats() NetworkStats {
+	// Get real network IO metrics using gopsutil
+	netStats, err := psnet.IOCounters(false) // false = all interfaces combined
+	if err != nil {
+		log.Printf("Error getting network stats: %v", err)
+		return simulateNetworkStats() // Fall back to simulation if real metrics fail
+	}
+
+	now := time.Now()
+
+	// Initialize return values
+	stats := NetworkStats{}
+
+	if len(netStats) == 0 {
+		log.Printf("No network interfaces found")
+		return simulateNetworkStats() // Fall back to simulation if no interfaces
+	}
+
+	if len(lastNetStats) == 0 {
+		// First run, store values and return simulated stats
+		lastNetStats = netStats
+		lastNetStatsTime = now
+
+		// Return simulated stats for the first call
+		return simulateNetworkStats()
+	}
+
+	// Calculate time difference
+	timeDiff := now.Sub(lastNetStatsTime).Seconds()
+	if timeDiff < 0.1 {
+		return simulateNetworkStats() // Avoid division by zero
+	}
+
+	// Calculate rates based on the difference
+	for i, currentStat := range netStats {
+		if i < len(lastNetStats) {
+			lastStat := lastNetStats[i]
+
+			// Calculate bytes per second
+			bytesInPerSec := float64(currentStat.BytesRecv-lastStat.BytesRecv) / timeDiff
+			bytesOutPerSec := float64(currentStat.BytesSent-lastStat.BytesSent) / timeDiff
+			stats.BytesPerSecond += bytesInPerSec + bytesOutPerSec
+
+			// Calculate packets per second
+			packetsInPerSec := float64(currentStat.PacketsRecv-lastStat.PacketsRecv) / timeDiff
+			packetsOutPerSec := float64(currentStat.PacketsSent-lastStat.PacketsSent) / timeDiff
+			stats.MessagesPerSecond += packetsInPerSec + packetsOutPerSec
+
+			// Set raw values
+			stats.BytesReceived += int64(currentStat.BytesRecv)
+			stats.BytesSent += int64(currentStat.BytesSent)
+		}
+	}
+
+	// Estimate connection count based on the connection rate
+	stats.ConnectionCount = runtime.NumGoroutine() / 2
+	stats.ConnectionsPerSec = float64(stats.ConnectionCount) / 60.0
+
+	// Store current values for next call
+	lastNetStats = netStats
+	lastNetStatsTime = now
+
+	return stats
 }
 
 // NewEngine creates a new AI Engine
@@ -184,6 +301,17 @@ func (e *Engine) collectMetrics() {
 		"type":   "goroutines",
 	})
 
+	// Collect disk I/O metrics
+	diskIO, err := getDiskIOStats()
+	if err != nil {
+		log.Printf("Warning: failed to collect disk I/O metrics: %v", err)
+	} else {
+		e.RecordMetric(MetricKindDiskIO, "local", diskIO, map[string]string{
+			"source": "system",
+			"unit":   "ops_per_second",
+		})
+	}
+
 	// Collect store metrics if available
 	storeMetrics := getStoreMetrics()
 	for topic, messageCount := range storeMetrics.MessageCounts {
@@ -211,7 +339,7 @@ func (e *Engine) collectMetrics() {
 	})
 
 	// Log metrics collection completion
-	log.Printf("AI Engine collected %d system metrics", 5+len(storeMetrics.Topics))
+	log.Printf("AI Engine collected %d system metrics", 6+len(storeMetrics.Topics))
 }
 
 // getSystemMetrics collects system-level metrics
@@ -231,67 +359,27 @@ func getSystemMetrics() (cpuUsage float64, memUsage float64, goroutineCount int)
 
 // getCPUUsagePercent returns the current CPU usage percentage
 func getCPUUsagePercent() float64 {
-	// In a real implementation, we would use the host's CPU metrics
-	// For this implementation, we'll use a combination of runtime stats
-	var cpuUsage float64
-
-	// Take measurements before and after a short interval
-	var startNumGC uint32
-	var startPauseTotalNs uint64
-	var startNumForcedGC uint32
-
-	// Get stats before
-	stats := &runtime.MemStats{}
-	runtime.ReadMemStats(stats)
-	startNumGC = stats.NumGC
-	startPauseTotalNs = stats.PauseTotalNs
-	startNumForcedGC = stats.NumForcedGC
-
-	// Wait a short interval
-	time.Sleep(100 * time.Millisecond)
-
-	// Get stats after
-	runtime.ReadMemStats(stats)
-
-	// Calculate a rough CPU usage based on GC activity and memory allocations
-	gcDiff := float64(stats.NumGC - startNumGC)
-	pauseDiff := float64(stats.PauseTotalNs - startPauseTotalNs)
-	forcedGCDiff := float64(stats.NumForcedGC - startNumForcedGC)
-
-	// Normalize to a percentage-like value (very approximate)
-	if gcDiff > 0 || forcedGCDiff > 0 {
-		// Higher GC activity indicates higher CPU usage
-		cpuUsage = 50.0 + (gcDiff+forcedGCDiff)*10.0
-	} else {
-		// Base usage on pause time as a percentage
-		cpuUsage = math.Min(pauseDiff/1000000.0, 30.0)
+	// Get real CPU usage using gopsutil
+	percent, err := cpu.Percent(time.Second, false) // false = overall CPU percentage
+	if err != nil {
+		log.Printf("Error getting CPU usage: %v", err)
+		return 0.0
 	}
-
-	// Add some variability to make it more realistic
-	cpuUsage += rand.Float64() * 10.0
-
-	// Clamp to 0-100 range
-	cpuUsage = math.Min(math.Max(cpuUsage, 0.0), 100.0)
-
-	return cpuUsage
+	if len(percent) == 0 {
+		return 0.0
+	}
+	return percent[0] // Return the overall CPU usage percentage
 }
 
 // getMemoryUsagePercent returns the current memory usage percentage
 func getMemoryUsagePercent() float64 {
-	// Get current memory stats
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-
-	// Calculate percentage of heap in use
-	heapInUse := float64(m.HeapInuse)
-	heapSys := float64(m.HeapSys)
-
-	var memUsage float64
-	if heapSys > 0 {
-		memUsage = (heapInUse / heapSys) * 100.0
+	// Get real memory usage using gopsutil
+	v, err := mem.VirtualMemory()
+	if err != nil {
+		log.Printf("Error getting memory usage: %v", err)
+		return 0.0
 	}
-
-	return memUsage
+	return v.UsedPercent
 }
 
 // StoreMetrics contains metrics from the message store
@@ -340,16 +428,6 @@ type NetworkStats struct {
 	BytesReceived     int64
 	BytesSent         int64
 	ConnectionsPerSec float64
-}
-
-// getNetworkStats collects network metrics
-func getNetworkStats() NetworkStats {
-	// In a production implementation, this would collect actual network stats
-	// For now, we'll return simulated network metrics
-
-	// Since we can't directly access the metrics, we'll use simulated stats
-	// In a real implementation, the metrics would be injected or accessible
-	return simulateNetworkStats()
 }
 
 // simulateNetworkStats returns simulated network metrics

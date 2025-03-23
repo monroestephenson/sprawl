@@ -8,6 +8,10 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/mem"
+	psnet "github.com/shirou/gopsutil/v3/net"
 )
 
 // MetricType defines the type of metric being tracked
@@ -91,6 +95,10 @@ type AnomalyDetector struct {
 	thresholds    map[MetricType]float64
 	detectionAlgo string
 }
+
+// Global variables to track network stats between calls
+var lastNetIOStats []psnet.IOCountersStat
+var lastNetIOStatsTime time.Time
 
 // NewIntelligence creates a new Intelligence instance
 func NewIntelligence(sampleInterval time.Duration) *Intelligence {
@@ -194,32 +202,45 @@ func (i *Intelligence) sampleMetrics() {
 
 // getCPUUsage gets the current CPU usage
 func getCPUUsage() (float64, error) {
-	// Use runtime metrics to estimate CPU usage
-	var cpuStats runtime.MemStats
-	runtime.ReadMemStats(&cpuStats)
+	// Get real CPU usage using gopsutil
+	percent, err := cpu.Percent(time.Second, false) // false = overall CPU percentage
+	if err != nil {
+		log.Printf("Error getting CPU usage: %v", err)
 
-	// This is an estimate - in production we would use OS-specific methods
-	numCPU := runtime.NumCPU()
-	goroutines := runtime.NumGoroutine()
+		// Fall back to synthetic estimation if real metrics fail
+		numCPU := runtime.NumCPU()
+		goroutines := runtime.NumGoroutine()
+		estimate := float64(goroutines) / float64(numCPU) * 10
 
-	// Simple heuristic based on goroutines per CPU
-	estimate := float64(goroutines) / float64(numCPU) * 10
+		// Ensure value is between 0-100
+		if estimate > 100 {
+			estimate = 100
+		}
 
-	// Ensure value is between 0-100
-	if estimate > 100 {
-		estimate = 100
+		return estimate, nil
 	}
 
-	return estimate, nil
+	if len(percent) == 0 {
+		return 0.0, fmt.Errorf("no CPU percentage data received")
+	}
+
+	return percent[0], nil // Return the overall CPU usage percentage
 }
 
 // getMemoryUsage gets the current memory usage percentage
 func getMemoryUsage() float64 {
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
+	// Get real memory usage using gopsutil
+	v, err := mem.VirtualMemory()
+	if err != nil {
+		log.Printf("Error getting memory usage: %v", err)
 
-	// Calculate memory usage percentage
-	return float64(memStats.Alloc) / float64(memStats.Sys) * 100.0
+		// Fall back to synthetic estimation if real metrics fail
+		var memStats runtime.MemStats
+		runtime.ReadMemStats(&memStats)
+		return float64(memStats.Alloc) / float64(memStats.Sys) * 100.0
+	}
+
+	return v.UsedPercent
 }
 
 // estimateStorageUsage estimates storage usage
@@ -231,12 +252,62 @@ func estimateStorageUsage() float64 {
 
 // estimateNetworkActivity estimates network activity
 func estimateNetworkActivity() float64 {
-	// In a real implementation, this would measure actual network traffic
-	// For now, return a synthetic value
-	goroutines := runtime.NumGoroutine()
+	// Get real network IO metrics using gopsutil
+	netStats, err := psnet.IOCounters(false) // false = all interfaces combined
+	if err != nil {
+		log.Printf("Error getting network stats: %v", err)
 
-	// Base traffic on goroutine count with some randomness
-	return float64(goroutines) * (0.5 + 0.5*float64(time.Now().UnixNano()%100)/100.0)
+		// Fall back to synthetic estimation if real metrics fail
+		goroutines := runtime.NumGoroutine()
+		return float64(goroutines) * (0.5 + 0.5*float64(time.Now().UnixNano()%100)/100.0)
+	}
+
+	now := time.Now()
+
+	if len(netStats) == 0 {
+		log.Printf("No network interfaces found")
+
+		// Fall back to synthetic estimation if no interfaces
+		goroutines := runtime.NumGoroutine()
+		return float64(goroutines) * (0.5 + 0.5*float64(time.Now().UnixNano()%100)/100.0)
+	}
+
+	if len(lastNetIOStats) == 0 {
+		// First run, store values and return synthetic value
+		lastNetIOStats = netStats
+		lastNetIOStatsTime = now
+
+		// Return synthetic value for the first call
+		goroutines := runtime.NumGoroutine()
+		return float64(goroutines) * (0.5 + 0.5*float64(now.UnixNano()%100)/100.0)
+	}
+
+	// Calculate time difference
+	timeDiff := now.Sub(lastNetIOStatsTime).Seconds()
+	if timeDiff < 0.1 {
+		// Avoid division by zero or very small time differences
+		goroutines := runtime.NumGoroutine()
+		return float64(goroutines) * (0.5 + 0.5*float64(now.UnixNano()%100)/100.0)
+	}
+
+	// Calculate total network bytes per second across all interfaces
+	var totalBytesPerSec float64
+	for i, currentStat := range netStats {
+		if i < len(lastNetIOStats) {
+			lastStat := lastNetIOStats[i]
+
+			// Calculate bytes per second
+			bytesInPerSec := float64(currentStat.BytesRecv-lastStat.BytesRecv) / timeDiff
+			bytesOutPerSec := float64(currentStat.BytesSent-lastStat.BytesSent) / timeDiff
+			totalBytesPerSec += bytesInPerSec + bytesOutPerSec
+		}
+	}
+
+	// Store current values for next call
+	lastNetIOStats = netStats
+	lastNetIOStatsTime = now
+
+	return totalBytesPerSec
 }
 
 // AddMetric adds a new metric data point
