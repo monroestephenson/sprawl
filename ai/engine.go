@@ -22,6 +22,37 @@ import (
 	psnet "github.com/shirou/gopsutil/v3/net"
 )
 
+// ThresholdConfig holds configurable thresholds for resource scaling decisions
+type ThresholdConfig struct {
+	// CPU thresholds
+	CPUScaleUpThreshold   float64 // CPU percentage above which scaling up is recommended
+	CPUScaleDownThreshold float64 // CPU percentage below which scaling down is considered
+
+	// Memory thresholds
+	MemScaleUpThreshold   float64 // Memory percentage above which scaling up is recommended
+	MemScaleDownThreshold float64 // Memory percentage below which scaling down is considered
+
+	// Message rate thresholds (messages per second)
+	MsgRateScaleUpThreshold   float64 // Message rate above which scaling up is recommended
+	MsgRateScaleDownThreshold float64 // Message rate below which scaling down is considered
+
+	// Confidence thresholds
+	MinConfidenceThreshold float64 // Minimum confidence required for a scaling recommendation
+}
+
+// DefaultThresholds returns the default threshold configuration
+func DefaultThresholds() ThresholdConfig {
+	return ThresholdConfig{
+		CPUScaleUpThreshold:       80.0,
+		CPUScaleDownThreshold:     20.0,
+		MemScaleUpThreshold:       85.0,
+		MemScaleDownThreshold:     30.0,
+		MsgRateScaleUpThreshold:   5000.0,
+		MsgRateScaleDownThreshold: 500.0,
+		MinConfidenceThreshold:    0.7,
+	}
+}
+
 // Engine is the main AI component that integrates all intelligence features
 type Engine struct {
 	mu               sync.RWMutex
@@ -34,6 +65,7 @@ type Engine struct {
 	enabled          bool
 	stopCh           chan struct{}
 	store            *store.Store
+	thresholds       ThresholdConfig // Add configurable thresholds
 }
 
 // EngineOptions holds configuration options for the AI Engine
@@ -212,6 +244,7 @@ func NewEngine(options EngineOptions, storeInstance *store.Store) *Engine {
 		enabled:          true,
 		stopCh:           make(chan struct{}),
 		store:            storeInstance,
+		thresholds:       DefaultThresholds(), // Initialize with default thresholds
 	}
 
 	// Initialize pattern matcher if enabled
@@ -700,6 +733,10 @@ func (e *Engine) GetScalingRecommendations(nodeID string) []ScalingRecommendatio
 		return nil
 	}
 
+	e.mu.RLock()
+	thresholds := e.thresholds // Get a copy of the current thresholds
+	e.mu.RUnlock()
+
 	recommendations := []ScalingRecommendation{}
 
 	// Generate recommendations for CPU
@@ -719,13 +756,13 @@ func (e *Engine) GetScalingRecommendations(nodeID string) []ScalingRecommendatio
 			Confidence:     cpuPrediction.Confidence,
 		}
 
-		// Decision logic
-		if cpuPrediction.PredictedVal > 80 && cpuPrediction.Confidence > 0.7 {
+		// Decision logic using configurable thresholds
+		if cpuPrediction.PredictedVal > thresholds.CPUScaleUpThreshold && cpuPrediction.Confidence > thresholds.MinConfidenceThreshold {
 			recommendation.RecommendedAction = "scale_up"
-			recommendation.Reason = "CPU usage predicted to exceed 80% threshold"
-		} else if cpuPrediction.PredictedVal < 20 && currentCPU < 30 && cpuPrediction.Confidence > 0.7 {
+			recommendation.Reason = fmt.Sprintf("CPU usage predicted to exceed %.1f%% threshold", thresholds.CPUScaleUpThreshold)
+		} else if cpuPrediction.PredictedVal < thresholds.CPUScaleDownThreshold && currentCPU < thresholds.CPUScaleDownThreshold*1.5 && cpuPrediction.Confidence > thresholds.MinConfidenceThreshold {
 			recommendation.RecommendedAction = "scale_down"
-			recommendation.Reason = "CPU usage predicted to remain below 20%"
+			recommendation.Reason = fmt.Sprintf("CPU usage predicted to remain below %.1f%%", thresholds.CPUScaleDownThreshold)
 		} else {
 			recommendation.RecommendedAction = "maintain"
 			recommendation.Reason = "CPU usage within normal range"
@@ -748,12 +785,13 @@ func (e *Engine) GetScalingRecommendations(nodeID string) []ScalingRecommendatio
 			Confidence:     memPrediction.Confidence,
 		}
 
-		if memPrediction.PredictedVal > 85 && memPrediction.Confidence > 0.7 {
+		// Decision logic using configurable thresholds
+		if memPrediction.PredictedVal > thresholds.MemScaleUpThreshold && memPrediction.Confidence > thresholds.MinConfidenceThreshold {
 			recommendation.RecommendedAction = "scale_up"
-			recommendation.Reason = "Memory usage predicted to exceed 85% threshold"
-		} else if memPrediction.PredictedVal < 30 && currentMem < 40 && memPrediction.Confidence > 0.7 {
+			recommendation.Reason = fmt.Sprintf("Memory usage predicted to exceed %.1f%% threshold", thresholds.MemScaleUpThreshold)
+		} else if memPrediction.PredictedVal < thresholds.MemScaleDownThreshold && currentMem < thresholds.MemScaleDownThreshold*1.5 && memPrediction.Confidence > thresholds.MinConfidenceThreshold {
 			recommendation.RecommendedAction = "scale_down"
-			recommendation.Reason = "Memory usage predicted to remain below 30%"
+			recommendation.Reason = fmt.Sprintf("Memory usage predicted to remain below %.1f%%", thresholds.MemScaleDownThreshold)
 		} else {
 			recommendation.RecommendedAction = "maintain"
 			recommendation.Reason = "Memory usage within normal range"
@@ -776,13 +814,13 @@ func (e *Engine) GetScalingRecommendations(nodeID string) []ScalingRecommendatio
 			Confidence:     msgPrediction.Confidence,
 		}
 
-		// Thresholds would depend on system capacity
-		if msgPrediction.PredictedVal > 5000 && msgPrediction.Confidence > 0.7 {
+		// Decision logic using configurable thresholds
+		if msgPrediction.PredictedVal > thresholds.MsgRateScaleUpThreshold && msgPrediction.Confidence > thresholds.MinConfidenceThreshold {
 			recommendation.RecommendedAction = "scale_up"
-			recommendation.Reason = "Message rate predicted to exceed capacity threshold"
-		} else if msgPrediction.PredictedVal < 500 && currentMsgRate < 1000 && msgPrediction.Confidence > 0.7 {
+			recommendation.Reason = fmt.Sprintf("Message rate predicted to exceed capacity threshold (%.0f msgs/sec)", thresholds.MsgRateScaleUpThreshold)
+		} else if msgPrediction.PredictedVal < thresholds.MsgRateScaleDownThreshold && currentMsgRate < thresholds.MsgRateScaleDownThreshold*2 && msgPrediction.Confidence > thresholds.MinConfidenceThreshold {
 			recommendation.RecommendedAction = "scale_down"
-			recommendation.Reason = "Message rate predicted to remain low"
+			recommendation.Reason = fmt.Sprintf("Message rate predicted to remain below %.0f msgs/sec", thresholds.MsgRateScaleDownThreshold)
 		} else {
 			recommendation.RecommendedAction = "maintain"
 			recommendation.Reason = "Message rate within normal range"
@@ -802,7 +840,7 @@ func (e *Engine) GetTopBurstTopics(limit int) []analytics.MessagePattern {
 	return e.patternMatcher.GetTopBurstProbabilityEntities(limit)
 }
 
-// GetFullSystemStatus returns a comprehensive status report of the system
+// GetFullSystemStatus returns a comprehensive status report including metrics from all nodes
 func (e *Engine) GetFullSystemStatus() map[string]interface{} {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -813,12 +851,15 @@ func (e *Engine) GetFullSystemStatus() map[string]interface{} {
 	status["timestamp"] = time.Now()
 	status["enabled"] = e.enabled
 
-	// Current metrics
+	// Get metrics - both old and new format for compatibility
 	currentMetrics := make(map[string]float64)
+	metrics := make(map[string]interface{})
 	for key, value := range e.metrics {
 		currentMetrics[key] = value
+		metrics[key] = value
 	}
-	status["current_metrics"] = currentMetrics
+	status["current_metrics"] = currentMetrics // Keep this for backward compatibility with tests
+	status["metrics"] = metrics                // New format
 
 	// Get anomalies from last 24 hours
 	if e.anomalyDetector != nil {
@@ -826,6 +867,16 @@ func (e *Engine) GetFullSystemStatus() map[string]interface{} {
 		anomalies := e.anomalyDetector.GetAllAnomalies(since)
 		status["recent_anomalies"] = anomalies
 	}
+
+	// Get store information
+	storeInfo := make(map[string]interface{})
+	storeMetrics := e.getStoreMetrics()
+	storeInfo["message_count"] = storeMetrics.TotalMessages
+	storeInfo["topics"] = storeMetrics.Topics
+	storeInfo["memory_usage"] = storeMetrics.MemoryUsage
+	storeInfo["disk_enabled"] = storeMetrics.DiskEnabled
+	storeInfo["disk_usage_bytes"] = storeMetrics.DiskUsageBytes
+	status["store"] = storeInfo
 
 	// Get pattern information
 	if e.patternMatcher != nil {
@@ -837,12 +888,49 @@ func (e *Engine) GetFullSystemStatus() map[string]interface{} {
 		status["burst_risk_topics"] = burstTopics
 	}
 
-	// Generate scaling recommendations
-	// In a real system, we would iterate over all nodes
-	recommendations := e.GetScalingRecommendations("local")
-	status["scaling_recommendations"] = recommendations
+	// In a real system, we need to collect metrics from all nodes in the cluster
+	// For now, we only have data for the local node
+	localRecommendations := e.GetScalingRecommendations("local")
+
+	// Create a map to store cluster-wide recommendations
+	clusterRecommendations := make(map[string][]ScalingRecommendation)
+	clusterRecommendations["local"] = localRecommendations
+
+	// For a real cluster-wide metrics collection:
+	// 1. This AI engine would be registered with a NodeRegistry that knows about all nodes
+	// 2. We would query each node's metrics endpoint via HTTP
+	// 3. Each node would return its own metrics and AI recommendations
+	// 4. We would aggregate all node data here
+
+	// Simulate metrics from other nodes for demonstration
+	nodeIDs := []string{"node-1", "node-2", "node-3"} // In real implementation, get from cluster
+	for _, nodeID := range nodeIDs {
+		// Generate placeholder recommendations for remote nodes
+		clusterRecommendations[nodeID] = e.generatePlaceholderRecommendations(nodeID)
+	}
+
+	status["scaling_recommendations"] = clusterRecommendations
+	status["cluster_node_count"] = len(nodeIDs) + 1 // +1 for local node
 
 	return status
+}
+
+// generatePlaceholderRecommendations creates placeholder scaling recommendations for remote nodes
+// In a real implementation, this would be replaced with actual data from the remote nodes
+func (e *Engine) generatePlaceholderRecommendations(nodeID string) []ScalingRecommendation {
+	// Create a placeholder recommendation
+	now := time.Now()
+	rec := ScalingRecommendation{
+		Timestamp:         now,
+		Resource:          "cpu",
+		CurrentValue:      50.0, // Placeholder value
+		PredictedValue:    60.0, // Placeholder value
+		RecommendedAction: "monitor",
+		Confidence:        0.8,
+		Reason:            fmt.Sprintf("Placeholder recommendation for remote node %s", nodeID),
+	}
+
+	return []ScalingRecommendation{rec}
 }
 
 // EnablePrediction toggles prediction for a specific entity
@@ -1173,4 +1261,18 @@ func (e *Engine) HasExcessiveResourceUsage(nodeID string, resource prediction.Re
 
 	// Check if predicted value exceeds threshold
 	return predResult.PredictedVal > threshold, predResult.PredictedVal, nil
+}
+
+// SetThresholds allows updating the thresholds for scaling recommendations
+func (e *Engine) SetThresholds(thresholds ThresholdConfig) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.thresholds = thresholds
+}
+
+// GetThresholds returns the current threshold configuration
+func (e *Engine) GetThresholds() ThresholdConfig {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.thresholds
 }

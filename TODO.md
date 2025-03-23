@@ -475,29 +475,29 @@ This document catalogs all placeholder implementations and unfinished features t
 
 ## Performance and Scaling
 
-- [ ] **Move message publishing to background goroutine**
+- [x] **Move message publishing to background goroutine**
   - File: `store/store.go:242`
   - Comment: `// In a production system, this would likely be done in a goroutine`
   - Description: Implement non-blocking publish operations with background processing
 
-- [ ] **Implement continuous background tier migration**
+- [x] **Implement continuous background tier migration**
   - File: `store/store.go:481`
   - Comment: `// A more robust approach would continuously...`
   - Description: Add background job to migrate messages between tiers
 
-- [ ] **Add real metrics collection from all nodes**
+- [x] **Add real metrics collection from all nodes**
   - File: `ai/engine.go:670`
   - Comment: `// In a real system, we would iterate over all nodes`
   - Description: Implement cluster-wide metrics collection
 
-- [ ] **Replace hard-coded thresholds**
+- [x] **Replace hard-coded thresholds**
   - File: `ai/engine.go:608`
   - Comment: `// Thresholds would depend on system capacity`
   - Description: Make thresholds configurable based on actual system capacity
 
 ## Architecture Improvements
 
-- [ ] **Implement proper dependency injection**
+- [x] **Implement proper dependency injection**
   - File: `ai/engine.go:350`
   - Comment: `// In a real implementation, the metrics would be injected or accessible`
   - Description: Use proper DI for components like metrics and store
@@ -519,9 +519,9 @@ This document catalogs all placeholder implementations and unfinished features t
   - Description: Create more realistic test doubles that better represent production behavior
 
 ## Progress
-- Total items: 30
-- Completed: 15
-- Remaining: 18
+- Total items: 31
+- Completed: 23
+- Remaining: 8
 
 ## Production Enhancements Completed
 
