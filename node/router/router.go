@@ -21,14 +21,17 @@ import (
 )
 
 type Router struct {
-	dht         *dht.DHT
-	store       *store.Store
-	nodeID      string
-	routeCache  sync.Map
-	metrics     *RouterMetrics
-	ackTracker  *AckTracker
-	semaphore   chan struct{}
-	replication *consensus.ReplicationManager
+	dht          *dht.DHT
+	store        *store.Store
+	nodeID       string
+	routeCache   *RouteCache
+	metrics      *RouterMetrics
+	ackTracker   *AckTracker
+	semaphore    chan struct{}
+	replication  *consensus.ReplicationManager
+	optimizer    *RouteOptimizer
+	loadBalancer *LoadBalancer
+	routeTimeout time.Duration
 }
 
 type RouterMetrics struct {
@@ -39,6 +42,11 @@ type RouterMetrics struct {
 	latencyCount     atomic.Int64
 	messagesStored   atomic.Int64
 	messagesReceived atomic.Int64
+	routeErrors      atomic.Int64
+	p99LatencyMs     atomic.Int64
+	maxLatencyMs     atomic.Int64
+	messageSize      atomic.Int64
+	messageCount     atomic.Int64
 }
 
 type AckTracker struct {
@@ -80,20 +88,57 @@ type Message struct {
 }
 
 func NewRouter(nodeID string, dht *dht.DHT, store *store.Store, replication *consensus.ReplicationManager) *Router {
+	// Initialize the cache with a capacity of 10,000 entries, 5-minute TTL, and 8 shards
+	cache := NewRouteCache(10000, 5*time.Minute, 8)
+
+	// Initialize the load balancer with default config
+	loadBalancer := NewLoadBalancer(defaultLoadBalancerConfig())
+
+	// Initialize the route optimizer with default config
+	optimizer := NewRouteOptimizer(defaultOptimizerConfig())
+
 	return &Router{
-		dht:         dht,
-		store:       store,
-		nodeID:      nodeID,
-		metrics:     &RouterMetrics{},
-		ackTracker:  &AckTracker{pending: make(map[string]*MessageState), maxRetry: 3},
-		semaphore:   make(chan struct{}, 200),
-		replication: replication,
+		dht:          dht,
+		store:        store,
+		nodeID:       nodeID,
+		routeCache:   cache,
+		metrics:      &RouterMetrics{},
+		ackTracker:   &AckTracker{pending: make(map[string]*MessageState), maxRetry: 3},
+		semaphore:    make(chan struct{}, 200),
+		replication:  replication,
+		optimizer:    optimizer,
+		loadBalancer: loadBalancer,
+		routeTimeout: 5 * time.Second,
 	}
 }
 
 // RouteMessage routes a message to the appropriate nodes
 func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 	start := time.Now()
+	defer func() {
+		latency := time.Since(start)
+		r.metrics.RecordLatency(latency)
+
+		// Update P99 and max latency metrics
+		latencyMs := latency.Milliseconds()
+
+		// Simple approximation for P99 latency
+		// In production, we'd use a more sophisticated algorithm like HDR Histogram
+		currentP99 := r.metrics.p99LatencyMs.Load()
+		if latencyMs > currentP99 {
+			r.metrics.p99LatencyMs.Store(latencyMs)
+		}
+
+		// Update max latency
+		currentMax := r.metrics.maxLatencyMs.Load()
+		if latencyMs > currentMax {
+			r.metrics.maxLatencyMs.Store(latencyMs)
+		}
+
+		// Track message size
+		r.metrics.messageSize.Add(int64(len(msg.Payload)))
+		r.metrics.messageCount.Add(1)
+	}()
 
 	// Check if we've already processed this message
 	r.ackTracker.mu.RLock()
@@ -105,40 +150,32 @@ func (r *Router) RouteMessage(ctx context.Context, msg Message) error {
 	r.ackTracker.mu.RUnlock()
 
 	// Use a semaphore to limit concurrent message processing with retry logic
-	var acquired bool
 	backoffDuration := 50 * time.Millisecond
 	maxRetries := 5
-
-	log.Printf("[Router] RouteMessage for %s: semaphore check, current capacity: %d/%d",
-		truncateID(msg.ID), len(r.semaphore), cap(r.semaphore))
 
 	for retry := 0; retry < maxRetries; retry++ {
 		select {
 		case r.semaphore <- struct{}{}:
 			// acquired semaphore, proceed with message processing
-			log.Printf("[Router] RouteMessage for %s: semaphore acquired, new capacity: %d/%d",
-				truncateID(msg.ID), len(r.semaphore), cap(r.semaphore))
+			log.Printf("[Router] RouteMessage for %s: semaphore acquired", truncateID(msg.ID))
 			defer func() {
 				<-r.semaphore
-				log.Printf("[Router] RouteMessage for %s: semaphore released, new capacity: %d/%d",
-					truncateID(msg.ID), len(r.semaphore), cap(r.semaphore))
 			}()
 			goto PROCESS_MESSAGE
 		case <-ctx.Done():
+			r.metrics.routeErrors.Add(1)
 			return fmt.Errorf("context deadline exceeded while waiting for router semaphore: %w", ctx.Err())
 		case <-time.After(backoffDuration):
 			// Exponential backoff for next iteration
 			backoffDuration *= 2
-			log.Printf("[Router] Failed to acquire semaphore for message %s, retry %d/%d with timeout %v, current capacity: %d/%d",
-				truncateID(msg.ID), retry+1, maxRetries, backoffDuration, len(r.semaphore), cap(r.semaphore))
 			continue
 		}
 	}
 
-	if !acquired {
-		return fmt.Errorf("failed to acquire routing semaphore after %d retries for message %s",
-			maxRetries, truncateID(msg.ID))
-	}
+	// If we reach here, we failed to acquire the semaphore after all retries
+	r.metrics.routeErrors.Add(1)
+	return fmt.Errorf("failed to acquire routing semaphore after %d retries for message %s",
+		maxRetries, truncateID(msg.ID))
 
 PROCESS_MESSAGE:
 	// Create message state for tracking
@@ -164,23 +201,50 @@ PROCESS_MESSAGE:
 
 	// Check route cache first
 	var nodes []dht.NodeInfo
-	if cachedNodes, ok := r.routeCache.Load(msg.Topic); ok {
+	cachedNodes, cacheHit := r.routeCache.Get(msg.Topic)
+
+	if cacheHit {
+		nodes = cachedNodes
 		r.metrics.RecordCacheHit()
-		nodes = cachedNodes.([]dht.NodeInfo)
 	} else {
-		nodes = r.dht.GetNodesForTopic(msg.Topic)
-		if len(nodes) > 0 {
-			r.routeCache.Store(msg.Topic, nodes)
+		// Cache miss - get nodes from DHT
+		// Create a timeout context for DHT operation
+		dhtCtx, cancel := context.WithTimeout(ctx, r.routeTimeout)
+		defer cancel()
+
+		// Try with context-aware DHT lookup if available
+		dhtNodes, err := r.dht.GetNodesForTopicWithContext(dhtCtx, msg.Topic)
+		if err != nil {
+			// Fall back to regular lookup on error
+			dhtNodes = r.dht.GetNodesForTopic(msg.Topic)
+		}
+
+		// Update the cache with the results
+		if len(dhtNodes) > 0 {
+			nodes = dhtNodes
+			r.routeCache.Set(msg.Topic, nodes)
 		}
 	}
 
 	if len(nodes) == 0 {
+		r.metrics.routeErrors.Add(1)
 		return fmt.Errorf("no nodes found for topic %s", msg.Topic)
 	}
 
-	// If we are one of the target nodes and we're the leader, handle replication
+	// Apply load balancing to select the best nodes based on health metrics
+	selectedNodes := r.loadBalancer.SelectNodes(nodes, msg)
+
+	// If load balancer filtered out all nodes, use original nodes as fallback
+	if len(selectedNodes) == 0 {
+		selectedNodes = nodes
+	}
+
+	// Apply route optimization to order the nodes optimally
+	optimizedNodes := r.optimizer.OptimizeRoute(selectedNodes, msg)
+
+	// Check if we're one of the target nodes
 	isTargetNode := false
-	for _, node := range nodes {
+	for _, node := range optimizedNodes {
 		if node.ID == r.nodeID {
 			isTargetNode = true
 			break
@@ -194,7 +258,6 @@ PROCESS_MESSAGE:
 			// Message will be stored locally via replication commit callback
 			r.metrics.messagesRouted.Add(1)
 			r.metrics.messagesStored.Add(1)
-			r.metrics.RecordLatency(time.Since(start))
 			return nil
 		}
 
@@ -202,8 +265,10 @@ PROCESS_MESSAGE:
 		if err.Error() == "not the leader" {
 			// Find the leader node
 			var leaderNode *dht.NodeInfo
-			for _, node := range nodes {
-				if node.ID == r.replication.GetLeader() {
+			leaderID := r.replication.GetLeader()
+
+			for _, node := range optimizedNodes {
+				if node.ID == leaderID {
 					leaderNode = &node
 					break
 				}
@@ -214,7 +279,26 @@ PROCESS_MESSAGE:
 				log.Printf("[Router] Forwarding message %s to leader node %s",
 					truncateID(msg.ID), truncateID(leaderNode.ID))
 				r.metrics.messagesRouted.Add(1)
-				return r.forwardToNode(ctx, *leaderNode, msg)
+
+				// Create forwarding context with timeout
+				forwardCtx, cancel := context.WithTimeout(ctx, r.routeTimeout)
+				defer cancel()
+
+				startForward := time.Now()
+				err := r.forwardToNode(forwardCtx, *leaderNode, msg)
+
+				// Record latency for this specific path
+				r.optimizer.UpdateLatency(r.nodeID, leaderNode.ID, time.Since(startForward))
+
+				// Update load balancer metrics based on success/failure
+				if err != nil {
+					r.loadBalancer.RecordNodeFailure(leaderNode.ID)
+					r.metrics.routeErrors.Add(1)
+				} else {
+					r.loadBalancer.RecordNodeSuccess(leaderNode.ID)
+				}
+
+				return err
 			}
 		}
 
@@ -231,6 +315,7 @@ PROCESS_MESSAGE:
 		}
 		if err := r.store.Publish(storeMsg); err != nil {
 			log.Printf("[Router] Error publishing message %s to local store: %v", truncateID(msg.ID), err)
+			r.metrics.routeErrors.Add(1)
 			return err
 		}
 
@@ -239,21 +324,29 @@ PROCESS_MESSAGE:
 		r.metrics.messagesStored.Add(1)
 
 		// If we're the only target node, consider the message delivered
-		if len(nodes) == 1 {
-			r.metrics.RecordLatency(time.Since(start))
+		if len(optimizedNodes) == 1 {
 			return nil
 		}
 	}
 
 	// Send to other nodes
 	var wg sync.WaitGroup
-	errChan := make(chan error, len(nodes))
-	successCount := atomic.Int32{}
-	nodeErrorsMu := sync.Mutex{}
-	nodeErrors := make(map[string]error)
+	errChan := make(chan error, len(optimizedNodes))
+	successNodeCount := atomic.Int32{}
 
-	for _, node := range nodes {
+	// Create a context with timeout for the forwarding operations
+	forwardCtx, cancel := context.WithTimeout(ctx, r.routeTimeout)
+	defer cancel()
+
+	for _, node := range optimizedNodes {
+		// Skip ourselves, we already handled that case
 		if node.ID == r.nodeID {
+			continue
+		}
+
+		// Skip nodes with open circuit breakers
+		if r.loadBalancer.IsCircuitOpen(node.ID) {
+			log.Printf("[Router] Skipping node %s due to open circuit breaker", truncateID(node.ID))
 			continue
 		}
 
@@ -261,51 +354,66 @@ PROCESS_MESSAGE:
 		go func(targetNode dht.NodeInfo) {
 			defer wg.Done()
 
-			err := r.forwardToNode(ctx, targetNode, msg)
-			if err != nil {
-				nodeErrorsMu.Lock()
-				nodeErrors[targetNode.ID] = err
-				nodeErrorsMu.Unlock()
-				select {
-				case errChan <- fmt.Errorf("failed to send to %s: %v", targetNode.ID, err):
-				default:
-				}
-				return
-			}
+			startForward := time.Now()
+			err := r.forwardToNode(forwardCtx, targetNode, msg)
+			forwardLatency := time.Since(startForward)
 
-			r.metrics.messagesReceived.Add(1)
-			r.ackTracker.mu.Lock()
-			msgState.Destinations[targetNode.ID] = true
-			r.ackTracker.mu.Unlock()
-			successCount.Add(1)
-			r.metrics.messagesSent.Add(1)
+			// Update routing metrics
+			r.optimizer.UpdateLatency(r.nodeID, targetNode.ID, forwardLatency)
+			r.loadBalancer.UpdateNodeMetric(targetNode.ID, "response_latency", float64(forwardLatency.Milliseconds()))
+
+			if err != nil {
+				log.Printf("[Router] Error forwarding message %s to node %s: %v",
+					truncateID(msg.ID), truncateID(targetNode.ID), err)
+				errChan <- err
+
+				// Record failure in load balancer
+				r.loadBalancer.RecordNodeFailure(targetNode.ID)
+			} else {
+				// Add to successful destinations
+				r.ackTracker.mu.Lock()
+				if state, exists := r.ackTracker.pending[msg.ID]; exists {
+					state.Destinations[targetNode.ID] = true
+				}
+				r.ackTracker.mu.Unlock()
+
+				// Update success metrics
+				successNodeCount.Add(1)
+				r.metrics.messagesSent.Add(1)
+
+				// Record success in load balancer
+				r.loadBalancer.RecordNodeSuccess(targetNode.ID)
+
+				// Update throughput metric
+				r.loadBalancer.UpdateNodeMetric(targetNode.ID, "message_throughput", 1.0)
+			}
 		}(node)
 	}
 
-	// Wait for all goroutines to finish
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-		close(errChan)
-	}()
+	// Wait for all forwarding operations to complete
+	wg.Wait()
+	close(errChan)
 
-	// Wait for either completion or context cancellation
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-done:
-		// Check if we have enough successful deliveries
-		if successCount.Load() > 0 {
-			r.metrics.RecordLatency(time.Since(start))
-			return nil
-		}
-		// Return first error if no successes
-		if err, ok := <-errChan; ok {
-			return err
-		}
-		return fmt.Errorf("no successful deliveries")
+	// If we successfully delivered to at least one node, consider it a success
+	if successNodeCount.Load() > 0 {
+		r.metrics.messagesRouted.Add(1)
+		return nil
 	}
+
+	// Otherwise, return the first error
+	for err := range errChan {
+		r.metrics.routeErrors.Add(1)
+		return fmt.Errorf("failed to route message: %w", err)
+	}
+
+	// If we get here, it means we didn't forward to any nodes
+	if isTargetNode {
+		// If we handled it locally, that's still a success
+		return nil
+	}
+
+	r.metrics.routeErrors.Add(1)
+	return fmt.Errorf("no suitable nodes found for topic %s", msg.Topic)
 }
 
 // truncateID safely truncates a message ID for logging
@@ -540,12 +648,59 @@ func (r *Router) forwardToNode(ctx context.Context, targetNode dht.NodeInfo, msg
 	return lastErr
 }
 
-// GetMetrics returns the current router metrics
+// GetMetrics returns router metrics for monitoring
 func (r *Router) GetMetrics() map[string]interface{} {
-	return map[string]interface{}{
-		"messages_sent":    r.metrics.messagesSent.Load(),
-		"messages_routed":  r.metrics.messagesRouted.Load(),
-		"route_cache_hits": r.metrics.routeCacheHits.Load(),
-		"avg_latency_ms":   r.metrics.GetAverageLatency().Milliseconds(),
+	metrics := map[string]interface{}{
+		"messages_sent":     r.metrics.messagesSent.Load(),
+		"messages_routed":   r.metrics.messagesRouted.Load(),
+		"route_cache_hits":  r.metrics.routeCacheHits.Load(),
+		"avg_latency_ms":    r.metrics.GetAverageLatency() / time.Millisecond,
+		"p99_latency_ms":    r.metrics.p99LatencyMs.Load(),
+		"max_latency_ms":    r.metrics.maxLatencyMs.Load(),
+		"messages_stored":   r.metrics.messagesStored.Load(),
+		"messages_received": r.metrics.messagesReceived.Load(),
+		"route_errors":      r.metrics.routeErrors.Load(),
+		"avg_message_size":  int64(0),
 	}
+
+	// Calculate average message size
+	if count := r.metrics.messageCount.Load(); count > 0 {
+		metrics["avg_message_size"] = r.metrics.messageSize.Load() / count
+	}
+
+	// Add cache metrics
+	for k, v := range r.routeCache.GetMetrics() {
+		metrics["cache_"+k] = v
+	}
+
+	// Add load balancer metrics
+	for k, v := range r.loadBalancer.GetMetrics() {
+		metrics["load_balancer_"+k] = v
+	}
+
+	// Add optimizer metrics
+	for k, v := range r.optimizer.GetMetrics() {
+		metrics["optimizer_"+k] = v
+	}
+
+	return metrics
+}
+
+// UpdateNodeMetrics updates the load balancer with node metrics
+// This should be called periodically with metrics from the monitoring system
+func (r *Router) UpdateNodeMetrics(nodeID string, cpuUsage, memoryUsage float64) {
+	r.loadBalancer.UpdateNodeMetric(nodeID, "cpu_usage", cpuUsage)
+	r.loadBalancer.UpdateNodeMetric(nodeID, "memory_usage", memoryUsage)
+}
+
+// InvalidateRoutesForNode removes a node from the route cache
+// This should be called when a node becomes unhealthy or unavailable
+func (r *Router) InvalidateRoutesForNode(nodeID string) {
+	r.routeCache.RemoveNodeFromAll(nodeID)
+}
+
+// InvalidateRoute removes a specific topic from the route cache
+// This should be called when topic ownership changes
+func (r *Router) InvalidateRoute(topic string) {
+	r.routeCache.Remove(topic)
 }
