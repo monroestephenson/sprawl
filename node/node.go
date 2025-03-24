@@ -9,12 +9,14 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
-	"sprawl/ai"
+	"sprawl/ai" // Aliased import for AI metrics
 	"sprawl/ai/prediction"
 	"sprawl/node/balancer"
+	"sprawl/node/cluster"
 	"sprawl/node/consensus"
 	"sprawl/node/dht"
 	"sprawl/node/metrics"
@@ -31,20 +33,37 @@ func init() {
 	startTime = time.Now()
 }
 
-// AIEngine defines the interface for Sprawl's AI capabilities
+// AIEngine defines the interface for AI capabilities
 type AIEngine interface {
-	// Core methods
+	// Start begins collecting and analyzing metrics
 	Start()
+
+	// Stop halts all AI operations
 	Stop()
+
+	// GetStatus returns the current status of the AI engine
 	GetStatus() map[string]interface{}
+
+	// GetPrediction returns a prediction for the specified resource
 	GetPrediction(resource string) (float64, float64)
+
+	// GetSimpleAnomalies returns a simple list of detected anomalies
 	GetSimpleAnomalies() []map[string]interface{}
 
-	// Metrics methods
+	// RecordMetric records a single metric with the given attributes
 	RecordMetric(metricKind ai.MetricKind, entityID string, value float64, labels map[string]string)
+
+	// GetThresholds returns the current threshold configuration
+	GetThresholds() ai.ThresholdConfig
+
+	// SetThresholds updates the threshold configuration
+	SetThresholds(config ai.ThresholdConfig) error
+
+	// TriggerConfigReload manually triggers a configuration reload
+	TriggerConfigReload()
 }
 
-// Node represents a node in the Sprawl cluster
+// Metrics for the node
 type Node struct {
 	ID            string
 	Gossip        *GossipManager
@@ -55,16 +74,17 @@ type Node struct {
 	Metrics       *metrics.Metrics
 	Consensus     *consensus.RaftNode
 	Replication   *consensus.ReplicationManager
-	AI            AIEngine // Use the AIEngine interface
+	AI            AIEngine
+	HTTPPort      int
 	BindAddress   string
 	AdvertiseAddr string
-	HTTPPort      int
-	semaphore     chan struct{} // Limit concurrent requests
-	server        interface{}   // Added to store the HTTP server
+	semaphore     chan struct{}
+	server        interface{}
+	stopCh        chan struct{}
 	registry      *registry.Registry
 	fsm           *registry.RegistryFSM
-	stopCh        chan struct{} // Add this for graceful shutdown
 	options       *Options
+	cluster       *cluster.ClusterManager
 }
 
 // NewNode creates a new node with the given options
@@ -120,11 +140,36 @@ func NewNode(opts *Options) (*Node, error) {
 	metrics := metrics.NewMetrics()
 
 	// Create the AI Engine with default options and store
-	aiEngine := ai.NewEngine(ai.DefaultEngineOptions(), store)
+	aiOptions := ai.DefaultEngineOptions()
+
+	// Check for config file path in environment
+	aiConfigFile := os.Getenv("SPRAWL_AI_CONFIG_FILE")
+	if aiConfigFile != "" {
+		aiOptions.ConfigFile = aiConfigFile
+		aiOptions.EnableAutoReload = true
+		log.Printf("[Node %s] Using AI config file: %s with auto-reload enabled", nodeID[:8], aiConfigFile)
+	} else {
+		// Load thresholds from environment
+		thresholds := ai.LoadThresholdsFromEnv()
+		aiOptions.ThresholdConfig = &thresholds
+		log.Printf("[Node %s] Using AI thresholds from environment variables", nodeID[:8])
+	}
+
+	// Configure the metrics collector
+	metricsCollector := ai.NewDefaultMetricsCollector(store)
+
+	// Set the metrics collector in AI options
+	aiOptions.MetricsCollector = metricsCollector
+
+	// Create the AI engine with the configured options
+	aiEngine := ai.NewEngine(aiOptions, store)
 
 	// Create registry for subscribers
 	reg := registry.NewRegistry(nodeID)
 	regFSM := registry.NewRegistryFSM(reg)
+
+	// Create the cluster manager
+	clusterMgr := cluster.NewClusterManager(nodeID, dht)
 
 	// Create node with all components
 	n := &Node{
@@ -146,6 +191,7 @@ func NewNode(opts *Options) (*Node, error) {
 		registry:      reg,
 		fsm:           regFSM,
 		options:       opts,
+		cluster:       clusterMgr,
 	}
 
 	// Debug logging for semaphore initialization
@@ -157,6 +203,11 @@ func NewNode(opts *Options) (*Node, error) {
 
 // Start initializes the node and begins serving requests
 func (n *Node) Start() error {
+	// Create a cluster adapter and set it in the store
+	clusterAdapter := cluster.NewClusterProviderAdapter(n.cluster)
+	storeAdapter := &storeClusterAdapter{adapter: clusterAdapter}
+	n.Store.SetClusterProvider(storeAdapter)
+
 	// Start the AI Engine if not already started
 	n.AI.Start()
 
@@ -892,6 +943,8 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("/ai/anomalies", n.handleAIAnomalies)
 	mux.HandleFunc("/ai/predictions", n.handleAIPredictions)
 	mux.HandleFunc("/ai/train", n.handleAITrain)
+	mux.HandleFunc("/ai/thresholds", n.handleAIThresholds)
+	mux.HandleFunc("/ai/thresholds/reload", n.handleAIThresholdsReload)
 
 	// Raft consensus endpoints
 	log.Printf("[Node %s] Registering Raft consensus endpoints", n.ID[:8])
@@ -1510,5 +1563,117 @@ func (n *Node) handleStore(w http.ResponseWriter, r *http.Request) {
 		"id":      msg.ID,
 	}); err != nil {
 		log.Printf("[Node %s] Error encoding success response: %v", n.ID[:8], err)
+	}
+}
+
+// storeClusterAdapter adapts cluster.ClusterProviderAdapter to store.ClusterProvider
+type storeClusterAdapter struct {
+	adapter *cluster.ClusterProviderAdapter
+}
+
+// GetAllNodeIDs implements the store.ClusterProvider interface
+func (s *storeClusterAdapter) GetAllNodeIDs() []string {
+	return s.adapter.GetAllNodeIDs()
+}
+
+// GetNodeClient implements the store.ClusterProvider interface
+func (s *storeClusterAdapter) GetNodeClient(nodeID string) (store.NodeClient, error) {
+	client, err := s.adapter.GetNodeClient(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return &storeNodeClientAdapter{client: client}, nil
+}
+
+// storeNodeClientAdapter adapts cluster.NodeClientAdapter to store.NodeClient
+type storeNodeClientAdapter struct {
+	client cluster.NodeClientAdapter
+}
+
+// GetMetrics implements the store.NodeClient interface
+func (a *storeNodeClientAdapter) GetMetrics() (map[string]float64, error) {
+	return a.client.GetMetrics()
+}
+
+// handleAIThresholds handles retrieving and updating AI threshold configuration
+func (n *Node) handleAIThresholds(w http.ResponseWriter, r *http.Request) {
+	// Handle GET requests - return current thresholds
+	if r.Method == http.MethodGet {
+		thresholds := n.AI.GetThresholds()
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(thresholds); err != nil {
+			log.Printf("[Node %s] Error encoding thresholds: %v", truncateID(n.ID), err)
+			http.Error(w, "Error encoding response", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Handle PUT/POST requests - update thresholds
+	if r.Method == http.MethodPut || r.Method == http.MethodPost {
+		var newThresholds ai.ThresholdConfig
+
+		// Parse request body
+		if err := json.NewDecoder(r.Body).Decode(&newThresholds); err != nil {
+			http.Error(w, fmt.Sprintf("Error parsing request: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// Validate thresholds
+		if err := newThresholds.Validate(); err != nil {
+			http.Error(w, fmt.Sprintf("Invalid threshold values: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// Update thresholds in AI engine
+		if err := n.AI.SetThresholds(newThresholds); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to update thresholds: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Return success response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(map[string]string{
+			"status":  "success",
+			"message": "Thresholds updated successfully",
+		}); err != nil {
+			log.Printf("[Node %s] Error encoding response: %v", truncateID(n.ID), err)
+		}
+		return
+	}
+
+	// Method not allowed for other HTTP methods
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
+// handleAIThresholdsReload handles triggering threshold configuration reload
+func (n *Node) handleAIThresholdsReload(w http.ResponseWriter, r *http.Request) {
+	// Only allow POST requests
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check if the engine supports reload
+	engineWithReload, ok := n.AI.(interface {
+		TriggerConfigReload()
+	})
+
+	if !ok {
+		http.Error(w, "AI engine does not support configuration reload", http.StatusNotImplemented)
+		return
+	}
+
+	// Trigger reload
+	engineWithReload.TriggerConfigReload()
+
+	// Return success
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": "Threshold configuration reload triggered",
+	}); err != nil {
+		log.Printf("[Node %s] Error encoding response: %v", truncateID(n.ID), err)
 	}
 }

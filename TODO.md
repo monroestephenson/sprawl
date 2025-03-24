@@ -113,6 +113,14 @@
     - [x] Caching layer
     - [x] Locality awareness
     - [x] Routing table optimization
+- [x] Implement proper dependency injection
+- [x] Refactor metrics collection to be more extensible
+- [x] Replace hard-coded thresholds with configurable values
+- [x] Implement auto-scaling based on metrics and patterns
+- [x] Add more detailed metrics and telemetry
+- [x] Optimize message routing for large clusters
+- [x] Implement distributed processing capabilities
+- [x] Improve node-to-node communication efficiency
 
 ## Phase 4: Production Readiness 🔄
 - [ ] Security Implementation
@@ -495,21 +503,59 @@ This document catalogs all placeholder implementations and unfinished features t
   - Comment: `// Thresholds would depend on system capacity`
   - Description: Make thresholds configurable based on actual system capacity
 
+- [ ] **Dynamic Network Metrics Fallbacks**
+  - File: `ai/engine.go`
+  - Description: Replace hard-coded network metrics fallback values with dynamic system-aware defaults
+  - Tasks:
+    - Implement system capacity detection for network interfaces
+    - Add configuration options for fallback ratios
+    - Create adaptive fallback mechanism based on historical throughput
+    - Add validation for fallback values
+
+- [ ] **Adaptive Threshold Adjustment System**
+  - File: `ai/engine.go`
+  - Description: Make threshold adjustment factors dynamic and system-aware
+  - Tasks:
+    - Implement ML-based threshold learning
+    - Add historical performance analysis
+    - Create adaptive hysteresis based on system stability
+    - Implement workload-specific threshold profiles
+
+- [ ] **Dynamic Oscillation Detection**
+  - File: `ai/engine.go`
+  - Description: Improve oscillation detection with dynamic thresholds
+  - Tasks:
+    - Add workload pattern analysis
+    - Implement adaptive oscillation windows
+    - Create ML-based pattern detection
+    - Add system stability scoring
+
+- [ ] **System-Specific Calibration**
+  - File: `ai/engine.go`
+  - Description: Implement automatic system-specific threshold calibration
+  - Tasks:
+    - Create initial calibration phase
+    - Add hardware capability detection
+    - Implement environment-aware baseline calculation
+    - Add periodic recalibration based on performance
+
+- [ ] **Workload-Aware Threshold Management**
+  - File: `ai/engine.go`
+  - Description: Add workload-specific threshold adjustments
+  - Tasks:
+    - Implement workload classification
+    - Create workload-specific profiles
+    - Add automatic profile switching
+    - Implement learning from workload patterns
+
 ## Architecture Improvements
 
+- [x] **Refactor message handling for better extensibility**
 - [x] **Implement proper dependency injection**
-  - File: `ai/engine.go:350`
-  - Comment: `// In a real implementation, the metrics would be injected or accessible`
-  - Description: Use proper DI for components like metrics and store
-
-- [ ] **Implement proper error handling**
-  - File: `ai/predictor.go:134`
-  - Comment: `// Global instance for intelligence - would be initialized by the application`
-  - Description: Add proper error handling and initialization checks
-
-- [ ] **Add proper shutdown sequence**
-  - File: Various
-  - Description: Ensure all components have proper shutdown sequences to prevent data loss
+- [x] **Replace hard-coded thresholds with environment-based configuration**
+- [x] **Implement a cluster manager for node discovery and metadata**
+- [ ] **Improve error handling for network failures**
+- [ ] **Streamline the configuration system**
 
 ## Testing Improvements
 
@@ -533,3 +579,9 @@ This document catalogs all placeholder implementations and unfinished features t
    - Improved logging with operation tracking and latency measurements
    - Enhanced persistence mechanism with atomic file operations
    - Added intelligent rate limiting and throttling detection
+
+### Architecture Improvements
+- [x] Replace hard-coded thresholds with environment-based configuration 
+- [x] Implement proper dependency injection
+- [x] Refactor clustering code for better testability
+- [ ] Finalize clean module boundaries and API contracts

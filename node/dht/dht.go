@@ -656,3 +656,29 @@ func (d *DHT) GetTopicMapByName() map[string][]string {
 
 	return topicMapByName
 }
+
+// GetAllNodes returns all nodes in the DHT
+func (d *DHT) GetAllNodes() []NodeInfo {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	nodes := make([]NodeInfo, 0, len(d.nodes))
+	for _, node := range d.nodes {
+		nodes = append(nodes, node)
+	}
+
+	return nodes
+}
+
+// GetNode returns information about a specific node
+func (d *DHT) GetNode(nodeID string) *NodeInfo {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if node, exists := d.nodes[nodeID]; exists {
+		nodeCopy := node // Make a copy to avoid race conditions
+		return &nodeCopy
+	}
+
+	return nil
+}

@@ -26,48 +26,86 @@ type GossipManagerInterface interface {
 	SendBroadcast(msg []byte) error
 }
 
-// TestAIEngine is a simplified AI Engine for testing purposes
+// TestAIEngine is a mock implementation of AIEngine for testing
 type TestAIEngine struct {
+	startCalled        bool
+	stopCalled         bool
+	recordedMetrics    map[string]float64
+	statusResponse     map[string]interface{}
+	predictionResponse float64
+	confidenceResponse float64
+	anomalies          []map[string]interface{}
+	thresholds         ai.ThresholdConfig
 }
 
-// Start starts the test AI engine
-func (e *TestAIEngine) Start() {
-	// Do nothing for tests
+// Start implements AIEngine.Start
+func (t *TestAIEngine) Start() {
+	t.startCalled = true
 }
 
-// Stop stops the test AI engine
-func (e *TestAIEngine) Stop() {
-	// Do nothing for tests
+// Stop implements AIEngine.Stop
+func (t *TestAIEngine) Stop() {
+	t.stopCalled = true
 }
 
-// GetStatus returns the current status of the test AI engine
-func (e *TestAIEngine) GetStatus() map[string]interface{} {
-	return map[string]interface{}{
-		"enabled": true,
-		"models":  []string{"test-model"},
+// RecordMetric implements AIEngine.RecordMetric
+func (t *TestAIEngine) RecordMetric(metricKind ai.MetricKind, entityID string, value float64, labels map[string]string) {
+	if t.recordedMetrics == nil {
+		t.recordedMetrics = make(map[string]float64)
 	}
+	key := string(metricKind) + ":" + entityID
+	t.recordedMetrics[key] = value
 }
 
-// GetPrediction returns a prediction for the specified resource
-func (e *TestAIEngine) GetPrediction(resource string) (float64, float64) {
-	return 5.0, 0.95
-}
-
-// GetSimpleAnomalies returns currently detected anomalies
-func (e *TestAIEngine) GetSimpleAnomalies() []map[string]interface{} {
-	return []map[string]interface{}{
-		{
-			"resource":   "cpu",
-			"timestamp":  "2022-01-01T12:00:00Z",
-			"value":      95.0,
-			"confidence": 0.9,
-		},
+// GetStatus implements AIEngine.GetStatus
+func (t *TestAIEngine) GetStatus() map[string]interface{} {
+	if t.statusResponse == nil {
+		return map[string]interface{}{
+			"status":  "test",
+			"enabled": true,
+		}
 	}
+	return t.statusResponse
 }
 
-// RecordMetric records a metric for the test AI engine
-func (e *TestAIEngine) RecordMetric(metricKind ai.MetricKind, entityID string, value float64, labels map[string]string) {
-	// Do nothing for tests
+// GetPrediction implements AIEngine.GetPrediction
+func (t *TestAIEngine) GetPrediction(resource string) (float64, float64) {
+	return t.predictionResponse, t.confidenceResponse
+}
+
+// GetSimpleAnomalies implements AIEngine.GetSimpleAnomalies
+func (t *TestAIEngine) GetSimpleAnomalies() []map[string]interface{} {
+	if t.anomalies == nil {
+		return []map[string]interface{}{
+			{
+				"timestamp": time.Now().Unix(),
+				"metric":    "test_metric",
+				"value":     42.0,
+				"severity":  "medium",
+			},
+		}
+	}
+	return t.anomalies
+}
+
+// GetThresholds implements AIEngine.GetThresholds
+func (t *TestAIEngine) GetThresholds() ai.ThresholdConfig {
+	if t.thresholds.CPUScaleUpThreshold == 0 {
+		// Return default thresholds if not set
+		return ai.DefaultThresholds()
+	}
+	return t.thresholds
+}
+
+// SetThresholds implements AIEngine.SetThresholds
+func (t *TestAIEngine) SetThresholds(config ai.ThresholdConfig) error {
+	t.thresholds = config
+	return nil
+}
+
+// TriggerConfigReload implements AIEngine.TriggerConfigReload
+func (t *TestAIEngine) TriggerConfigReload() {
+	// No-op for test implementation
 }
 
 // GetRecommendations returns test scaling recommendations

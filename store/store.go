@@ -26,6 +26,7 @@ type Store struct {
 	shutdownChannel chan struct{}
 	deliveryWg      sync.WaitGroup // WaitGroup to track in-flight message deliveries
 	productionMode  bool           // Flag to indicate if running in production mode
+	clusterProvider ClusterProvider
 }
 
 // Message represents a pub/sub message
@@ -232,23 +233,34 @@ func (s *Store) initTieredStorage() error {
 // Publish adds a message to the store
 func (s *Store) Publish(message Message) error {
 	if s.shutdownFlag {
-		log.Println("[Store] Skipping message publish - system is shutting down")
-		return nil
+		return fmt.Errorf("store is shutting down, cannot publish message")
 	}
 
 	// Validate message
 	if message.ID == "" {
-		return errors.New("message ID cannot be empty")
+		return fmt.Errorf("message ID cannot be empty")
 	}
 	if message.Topic == "" {
-		return errors.New("message topic cannot be empty")
+		return fmt.Errorf("message topic cannot be empty")
 	}
 	if message.Timestamp.IsZero() {
 		message.Timestamp = time.Now()
 	}
+	if len(message.Payload) == 0 {
+		return fmt.Errorf("message payload cannot be empty")
+	}
+	if len(message.Payload) > 10*1024*1024 { // 10MB limit
+		return fmt.Errorf("message payload too large (%d bytes), limit is 10MB", len(message.Payload))
+	}
 
 	// Lock for updating messages
 	s.mu.Lock()
+
+	// Check again for shutdown after acquiring lock
+	if s.shutdownFlag {
+		s.mu.Unlock()
+		return fmt.Errorf("store is shutting down, cannot publish message")
+	}
 
 	// Add message to the in-memory store
 	if _, exists := s.messages[message.Topic]; !exists {
@@ -257,7 +269,11 @@ func (s *Store) Publish(message Message) error {
 	s.messages[message.Topic] = append(s.messages[message.Topic], message)
 
 	// Get subscribers while still holding the lock
-	subscribers, exists := s.subscribers[message.Topic]
+	subscribers := make([]SubscriberFunc, 0)
+	if subs, exists := s.subscribers[message.Topic]; exists && len(subs) > 0 {
+		// Make a copy of the subscribers slice to avoid holding the lock during delivery
+		subscribers = append(subscribers, subs...)
+	}
 
 	// Update metrics before unlocking
 	if s.metrics != nil {
@@ -265,7 +281,12 @@ func (s *Store) Publish(message Message) error {
 		s.metrics.RecordMessageReceived(message.Topic)
 	}
 
+	// Unlock after updating memory store and copying subscribers
 	s.mu.Unlock()
+
+	// Log publication details
+	log.Printf("[Store] Publishing message id=%s to topic=%s with %d bytes",
+		message.ID, message.Topic, len(message.Payload))
 
 	// Handle tiered storage if enabled
 	if s.tieredManager != nil {
@@ -276,21 +297,35 @@ func (s *Store) Publish(message Message) error {
 			Timestamp: message.Timestamp,
 			TTL:       message.TTL,
 		}
-		if err := s.tieredManager.Store(tieredMsg); err != nil {
-			log.Printf("[Store] Error storing message in tiered storage: %v", err)
+
+		// Store message in tiered storage with retries
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			err = s.tieredManager.Store(tieredMsg)
+			if err == nil {
+				break
+			}
+			log.Printf("[Store] Error storing message in tiered storage (attempt %d/3): %v",
+				attempt+1, err)
+
+			if attempt < 2 { // Don't sleep on last attempt
+				time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)
+			}
+		}
+
+		if err != nil {
+			log.Printf("[Store] Failed to store message in tiered storage after 3 attempts: %v", err)
+			// Continue with delivery even if tiered storage fails
 		}
 	}
 
 	// If no subscribers, we're done
-	if !exists || len(subscribers) == 0 {
+	if len(subscribers) == 0 {
 		log.Printf("[Store] No subscribers for topic %s", message.Topic)
 		return nil
 	}
 
 	log.Printf("[Store] Publishing message to topic %s with %d subscribers", message.Topic, len(subscribers))
-
-	// List of subscribers that received the message
-	notified := make([]bool, len(subscribers))
 
 	// If we're shutting down, skip delivery
 	if s.shutdownFlag {
@@ -300,9 +335,16 @@ func (s *Store) Publish(message Message) error {
 
 	// Special handling for test mode - deliver synchronously
 	if !s.productionMode {
-		for i, sub := range subscribers {
-			sub(message)
-			notified[i] = true
+		for _, sub := range subscribers {
+			// Handle potential panics from subscribers
+			func(subscriber SubscriberFunc) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[Store] Subscriber panic: %v", r)
+					}
+				}()
+				subscriber(message)
+			}(sub)
 		}
 
 		// For test mode, log success and return immediately
@@ -310,53 +352,79 @@ func (s *Store) Publish(message Message) error {
 		return nil
 	}
 
-	// For production mode, deliver messages asynchronously
-	// Variables for tracking delivery
-	var wg sync.WaitGroup
-	wg.Add(len(subscribers))
+	// For production mode, deliver messages asynchronously with delivery tracking
+	s.deliveryWg.Add(1)
+	go func(msg Message, subs []SubscriberFunc) {
+		defer s.deliveryWg.Done()
 
-	// Collect errors during delivery
-	deliveryErrors := make([]error, len(subscribers))
+		// Variables for tracking delivery
+		deliveryErrors := make([]error, 0)
+		successCount := 0
 
-	// Deliver message to all subscribers in parallel
-	for i, sub := range subscribers {
-		go func(idx int, subscriber SubscriberFunc) {
-			defer wg.Done()
-
-			// Skip if shutting down
+		// Try to deliver to each subscriber
+		for i, subscriber := range subs {
+			// Skip delivery if shutting down
 			if s.shutdownFlag {
-				return
+				log.Printf("[Store] Aborting in-flight delivery to %d remaining subscribers due to shutdown",
+					len(subs)-i)
+				break
 			}
 
-			// Try to deliver the message
-			subscriber(message)
-			notified[idx] = true
-
-		}(i, sub)
-	}
-
-	// Wait for all deliveries to complete or system to shut down
-	deliveryDone := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(deliveryDone)
-	}()
-
-	select {
-	case <-deliveryDone:
-		log.Printf("[Store] All subscribers notified for topic %s", message.Topic)
-	case <-s.shutdownChannel:
-		log.Println("[Store] Message delivery interrupted - system shutting down")
-	}
-
-	// Check for errors
-	for i, err := range deliveryErrors {
-		if err != nil {
-			log.Printf("[Store] Error delivering message to subscriber %d: %v", i, err)
+			// Deliver with panic recovery
+			err := s.deliverToSubscriber(msg, subscriber)
+			if err != nil {
+				deliveryErrors = append(deliveryErrors, err)
+			} else {
+				successCount++
+			}
 		}
-	}
+
+		// Log delivery summary
+		if len(deliveryErrors) > 0 {
+			log.Printf("[Store] Message delivery completed with %d successes and %d failures for topic %s",
+				successCount, len(deliveryErrors), msg.Topic)
+			for i, err := range deliveryErrors {
+				if i < 5 { // Limit number of errors logged
+					log.Printf("[Store] Delivery error %d: %v", i+1, err)
+				} else if i == 5 {
+					log.Printf("[Store] ... and %d more errors", len(deliveryErrors)-5)
+					break
+				}
+			}
+		} else {
+			log.Printf("[Store] Message successfully delivered to all %d subscribers for topic %s",
+				successCount, msg.Topic)
+		}
+	}(message, subscribers)
 
 	return nil
+}
+
+// deliverToSubscriber safely delivers a message to a subscriber with timeout and panic recovery
+func (s *Store) deliverToSubscriber(msg Message, subscriber SubscriberFunc) error {
+	// Create a channel to track completion
+	done := make(chan error, 1)
+
+	// Deliver in a goroutine to enable timeout
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("subscriber panic: %v", r)
+			}
+		}()
+
+		// Call the subscriber
+		subscriber(msg)
+		done <- nil
+	}()
+
+	// Wait for completion with timeout
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("subscriber timed out after 5 seconds")
+	}
 }
 
 // Subscribe adds a subscriber for a topic
@@ -1583,33 +1651,76 @@ func (s *Store) migrateDiskMessagesToCloud(topic string, ageThresholdSeconds int
 	log.Printf("[Store] Background migration: Migrated messages for topic %s from disk to cloud tier", topic)
 }
 
+// ClusterProvider defines an interface for accessing cluster node information
+type ClusterProvider interface {
+	// GetAllNodeIDs returns the IDs of all nodes in the cluster
+	GetAllNodeIDs() []string
+
+	// GetNodeClient returns a client for a specific node
+	GetNodeClient(nodeID string) (NodeClient, error)
+}
+
+// NodeClient defines the interface for communicating with remote nodes
+type NodeClient interface {
+	// GetMetrics retrieves metrics from a node
+	GetMetrics() (map[string]float64, error)
+}
+
+// SetClusterProvider sets the cluster provider for this store
+func (s *Store) SetClusterProvider(provider ClusterProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.clusterProvider = provider
+}
+
 // GetClusterNodeIDs returns the list of node IDs in the cluster
-// This is used by the AI engine to collect metrics from all nodes
 func (s *Store) GetClusterNodeIDs() []string {
-	// In a production implementation, this would get node IDs from the cluster membership
-	// For now, we'll return an empty list if we're in test mode
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// If we have a cluster provider, use it
+	if s.clusterProvider != nil {
+		return s.clusterProvider.GetAllNodeIDs()
+	}
+
+	// Fallback for test mode or when cluster provider not set
 	if !s.productionMode {
 		return []string{}
 	}
 
-	// This would normally be populated from the cluster gossip layer
-	// For now, return a fixed list of known nodes
+	// This is a minimal fallback when no provider is set
 	return []string{"node-1", "node-2", "node-3"}
 }
 
 // GetNodeMetrics returns the metrics for a specific node in the cluster
-// This is used by the AI engine to collect metrics from remote nodes
 func (s *Store) GetNodeMetrics(nodeID string) map[string]float64 {
-	// In a production implementation, this would query the node via HTTP/gRPC
-	// For now, return simulated metrics based on the node ID
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	// In test mode, return nil to indicate no metrics available
+	// If we have a cluster provider, use it to get node metrics
+	if s.clusterProvider != nil {
+		client, err := s.clusterProvider.GetNodeClient(nodeID)
+		if err != nil {
+			log.Printf("[Store] Failed to get client for node %s: %v", nodeID, err)
+			return nil
+		}
+
+		metrics, err := client.GetMetrics()
+		if err != nil {
+			log.Printf("[Store] Failed to get metrics from node %s: %v", nodeID, err)
+			return nil
+		}
+
+		return metrics
+	}
+
+	// In test mode, return nil
 	if !s.productionMode {
 		return nil
 	}
 
-	// Generate realistic metrics based on the node ID
-	// In production, this would be replaced with actual API calls
+	// Generate deterministic metrics based on node ID when no provider exists
 	metrics := make(map[string]float64)
 
 	// Use node ID to generate deterministic but different values per node
