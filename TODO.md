@@ -1,128 +1,235 @@
 # Sprawl Implementation Roadmap
 
-## Phase 1: Core Infrastructure ✅
-- [x] Set up basic project structure
-- [x] Implement basic Node discovery with memberlist
-- [x] Create initial HTTP endpoints for pub/sub
-- [x] Build simple in-memory message store
-- [x] Implement DHT + Gossip Protocol
-  - [x] Node discovery and membership
-  - [x] Topic → node mappings
-  - [x] Basic routing metrics sharing
-- [x] Implement core message routing
-  - [x] Message ID generation
-  - [x] TTL handling
-  - [x] Basic ACK mechanism
-  - [x] Simple retry logic
-- [x] Add basic metrics collection
-  - [x] Message routing stats
-  - [x] Cache hit tracking
-  - [x] Latency monitoring
-- [x] Create testing CLI tool
-  - [x] Basic pub/sub commands
-  - [x] Integration tests
-  - [x] Load testing
-  - [x] Metrics reporting
+## Dependencies and Requirements Overview
 
-## Phase 2: Storage & Distribution ✅
-- [x] Implement tiered storage
-  - [x] Optimize in-memory queue
-    - [x] Ring buffer implementation
-    - [x] Memory pressure monitoring
-    - [x] Configurable size limits
-    - [x] Eviction policies
-  - [x] Add RocksDB/LevelDB integration
-    - [x] Message persistence layer
-    - [x] Index management
-    - [x] Compaction policies
-    - [x] Recovery mechanisms
-  - [x] Implement S3/MinIO cloud storage
-    - [x] Automatic tiering policies
-    - [x] Batch upload optimization
-    - [x] Concurrent access handling
-    - [x] Data lifecycle management
-  - [x] Add message archival logic
-    - [x] Time-based archival
-    - [x] Size-based archival
-    - [x] Custom retention policies
-    - [x] Archive compression
-- [x] Enhance message routing
-  - [x] Cross-node message forwarding
-  - [x] Route caching system
-  - [x] Message replication system
-    - [x] Configurable replication factor
-    - [x] Basic consistency protocols
-    - [x] Advanced replica synchronization
-    - [x] Leader election
-  - [x] Distributed subscriber registry
-    - [x] Subscriber state replication
-    - [x] Consumer group management
-    - [x] Offset tracking
-    - [x] Rebalancing protocols
-- [x] Add backpressure handling
-  - [x] Node-level throttling
-    - [x] Adaptive rate limiting
-    - [x] Priority queues
-    - [x] Fair scheduling
-  - [x] Adaptive rate control
-    - [x] Publisher throttling
-    - [x] Consumer pacing
-    - [x] Network congestion detection
-  - [x] Queue overflow management
-    - [x] Disk spillover
-    - [x] Load shedding policies
-    - [x] Alert mechanisms
+### Critical Dependencies
+- DHT Manager → Gossip Protocol Manager (requires membership data)
+- Message Router → DHT Manager (requires topic routing)
+- ACK Tracker → Message Router (requires message delivery confirmation)
+- Disk Layer → Memory Layer (handles overflow from memory)
+- Cloud Layer → Disk Layer (handles archival from disk)
+- Load Prediction → Metrics Collection (requires historical metrics)
+- Route Optimization → DHT Manager (requires topology information)
 
-## Phase 3: Intelligence & Optimization ✅
-- [x] Implement AI-powered features
-  - [x] Traffic pattern analysis
-    - [x] Historical data collection
-    - [x] Pattern recognition models
-    - [x] Anomaly detection
-    - [x] Trend prediction
-  - [x] Load prediction model
-    - [x] Resource usage forecasting
-    - [x] Capacity planning
-    - [x] Burst prediction
-  - [x] Auto-scaling triggers
-    - [x] Proactive scaling
-    - [x] Resource optimization
-    - [x] Cost-aware scaling
-  - [x] Congestion control
-    - [x] Network topology awareness
-    - [x] Path optimization
-    - [x] Flow control
-- [x] Add advanced routing features
-  - [x] Basic load-based topic balancing
-  - [x] Dynamic partitioning
-    - [x] Automatic partition splitting
-    - [x] Partition merging
-    - [x] Hot partition detection
-  - [x] Predictive message routing
-    - [x] ML-based path selection
-    - [x] Latency optimization
-    - [x] Cost-aware routing
-- [x] Optimize performance
-  - [x] Basic routing cache
-  - [x] Message batching
-  - [x] Advanced cache optimization
-    - [x] Multi-level caching
-    - [x] Cache coherence protocols
-    - [x] Predictive caching
-  - [x] DHT lookup improvements
-    - [x] Caching layer
-    - [x] Locality awareness
-    - [x] Routing table optimization
-- [x] Implement proper dependency injection
-- [x] Refactor metrics collection to be more extensible
-- [x] Replace hard-coded thresholds with configurable values
-- [x] Implement auto-scaling based on metrics and patterns
-- [x] Add more detailed metrics and telemetry
-- [x] Optimize message routing for large clusters
-- [x] Implement distributed processing capabilities
-- [x] Improve node-to-node communication efficiency
+### Performance Requirements
+- Message Processing: < 5ms per message at P99
+- Topic Routing: < 10ms at P99 for routing decisions
+- Storage Write: > 100,000 messages/sec per node
+- Storage Read: > 200,000 messages/sec per node
+- DHT Lookups: < 50ms at P99
+- Maximum Memory Usage: 80% of available RAM
+- CPU Utilization Target: < 70% during normal operations
+- Network Throughput: > 1 GB/s per node
 
-## Phase 4: Production Readiness 🔄
+### Testing Requirements
+- Unit Test Coverage: > 90% for all components
+- Integration Tests: All component interactions must be tested
+- Performance Tests: Must validate all performance requirements
+- Chaos Tests: System must recover from node failures
+- Load Tests: Must handle 2x expected peak load
+
+## Phase 1: Core Infrastructure (Current: ~60% → Target: 100%)
+
+### P2P Overlay Implementation (P0)
+- [x] Gossip Protocol Manager
+  - [x] Complete membership management
+  - [x] Implement metrics sharing
+  - [x] Add health monitoring
+  - [x] Implement failure detection
+  - **Dependencies**: None (foundational component)
+  - **Performance**: < 50ms propagation time for membership changes
+  - **Testing**: Must recover from 33% node failure within 5 seconds
+
+- [ ] DHT Manager
+  - [ ] Complete topic routing
+  - [ ] Implement node mapping
+  - [ ] Add replication management
+  - [ ] Implement consistency protocols
+  - **Dependencies**: Requires Gossip Protocol for membership data
+  - **Performance**: O(log n) lookup time where n = number of nodes
+  - **Testing**: Must maintain consistency during membership churn
+
+### Message Processing Pipeline (P0)
+- [ ] Message Router
+  - [ ] Complete topic-based routing
+  - [ ] Implement load balancing
+  - [ ] Add route optimization
+  - [ ] Implement route caching
+  - **Dependencies**: Requires DHT Manager for topic mapping
+  - **Performance**: Route computation < 5ms at P99
+  - **Testing**: Must validate routing correctness during network partitions
+
+- [ ] ACK Tracker
+  - [ ] Complete delivery confirmation
+  - [ ] Implement persistence
+  - [ ] Add retry management
+  - [ ] Implement cleanup
+  - **Dependencies**: Requires Message Router and Storage Layer
+  - **Performance**: ACK processing < 1ms at P99
+  - **Testing**: Zero message loss during failure scenarios
+
+- [ ] Retry Manager
+  - [ ] Complete failure handling
+  - [ ] Implement backoff strategies
+  - [ ] Add dead letter queues
+  - [ ] Implement retry limits
+  - **Dependencies**: Requires ACK Tracker to identify failed deliveries
+  - **Performance**: Retry decision < 1ms at P99
+  - **Testing**: Must correctly handle various failure scenarios
+
+### Message Flow Implementation (P0)
+- [ ] Publishing Pipeline
+  - [ ] Message receipt and validation
+  - [ ] Topic hash computation
+  - [ ] DHT-based route resolution
+  - [ ] Load-balanced forwarding
+  - [ ] Storage and replication
+  - [ ] Publisher acknowledgment
+  - **Dependencies**: Requires DHT, Router, and Storage components
+  - **Performance**: End-to-end publish latency < 50ms at P99
+  - **Testing**: Must validate at 2x expected throughput
+
+- [ ] Subscription Pipeline
+  - [ ] Subscriber registration
+  - [ ] Health monitoring
+  - [ ] Message delivery
+  - [ ] ACK processing
+  - [ ] Retry handling
+  - [ ] Backpressure management
+  - **Dependencies**: Requires Message Router and ACK Tracker
+  - **Performance**: Subscriber latency < 100ms at P99 
+  - **Testing**: Must handle slow consumers without affecting other subscribers
+
+## Phase 2: Storage Architecture (Current: ~40% → Target: 100%)
+
+### Memory Layer (P0)
+- [ ] Hot Message Queue
+  - [ ] Implement priority queuing
+  - [ ] Add memory pressure management
+  - [ ] Implement eviction policies
+  - **Dependencies**: None (foundational storage component)
+  - **Performance**: Enqueue/dequeue operations < 1μs
+  - **Testing**: Must maintain performance under memory pressure
+
+- [ ] Routing Cache
+  - [ ] Implement LRU cache
+  - [ ] Add cache invalidation
+  - [ ] Implement size limits
+  - **Dependencies**: Requires Message Router for cache entries
+  - **Performance**: Cache hit ratio > 95% for repeated routes
+  - **Testing**: Must properly invalidate stale routing information
+
+- [ ] Metric Buffers
+  - [ ] Implement circular buffers
+  - [ ] Add overflow handling
+  - [ ] Implement aggregation
+  - **Dependencies**: Requires metrics collection from all components
+  - **Performance**: Buffer operations < 1μs
+  - **Testing**: Must handle bursts without dropping metrics
+
+### Disk Layer (P0)
+- [ ] RocksDB Integration
+  - [ ] Complete message persistence
+  - [ ] Implement indexing
+  - [ ] Add compaction policies
+  - **Dependencies**: Requires Memory Layer for overflow
+  - **Performance**: Write throughput > 100,000 msgs/sec
+  - **Testing**: Must recover cleanly after process crash
+
+- [ ] Message Index
+  - [ ] Implement B-tree index
+  - [ ] Add range queries
+  - [ ] Implement cleanup
+  - **Dependencies**: Requires RocksDB integration
+  - **Performance**: Lookup time < 5ms at P99
+  - **Testing**: Must maintain performance as index grows
+
+- [ ] Subscriber State
+  - [ ] Complete state persistence
+  - [ ] Implement recovery
+  - [ ] Add consistency checks
+  - **Dependencies**: Requires RocksDB and Subscription Pipeline
+  - **Performance**: State recovery < 5s after restart
+  - **Testing**: Must maintain consistent state through failures
+
+### Cloud Layer (P0)
+- [ ] Cold Message Archive
+  - [ ] Implement S3/MinIO integration
+  - [ ] Add archival policies
+  - [ ] Implement retrieval
+  - **Dependencies**: Requires Disk Layer for aging data
+  - **Performance**: Archive throughput > 10,000 msgs/sec
+  - **Testing**: Must recover messages after disaster scenarios
+
+- [ ] Backup Storage
+  - [ ] Implement backup strategies
+  - [ ] Add recovery procedures
+  - [ ] Implement verification
+  - **Dependencies**: Requires Cloud integration and scheduling
+  - **Performance**: Backup completion < 1 hour
+  - **Testing**: Must restore to functional state from backups
+
+- [ ] Cross-region Replication
+  - [ ] Implement async replication
+  - [ ] Add conflict resolution
+  - [ ] Implement consistency checks
+  - **Dependencies**: Requires Cloud integration and multi-region setup
+  - **Performance**: Replication lag < 5 minutes
+  - **Testing**: Must maintain consistency across regions
+
+## Phase 3: Intelligence Systems (Current: ~30% → Target: 100%)
+
+### Load Prediction (P0)
+- [ ] Traffic Pattern Analysis
+  - [ ] Implement pattern recognition
+  - [ ] Add trend analysis
+  - [ ] Implement anomaly detection
+  - **Dependencies**: Requires metrics collection with 2+ weeks of history
+  - **Performance**: Analysis computation < 30s
+  - **Testing**: Must detect synthetic traffic patterns with > 90% accuracy
+
+- [ ] Resource Usage Forecasting
+  - [ ] Implement usage prediction
+  - [ ] Add capacity planning
+  - [ ] Implement alert thresholds
+  - **Dependencies**: Requires Traffic Pattern Analysis
+  - **Performance**: Forecast accuracy within 15% at 24h
+  - **Testing**: Must validate forecasts against historical data
+
+- [ ] Scaling Recommendations
+  - [ ] Implement scaling algorithms
+  - [ ] Add cost optimization
+  - [ ] Implement validation
+  - **Dependencies**: Requires Resource Usage Forecasting
+  - **Performance**: Recommendations generation < 1 min
+  - **Testing**: Must recommend appropriate scaling during synthetic load tests
+
+### Route Optimization (P0)
+- [ ] Dynamic Path Selection
+  - [ ] Implement path scoring
+  - [ ] Add latency optimization
+  - [ ] Implement failover
+  - **Dependencies**: Requires DHT Manager and network metrics
+  - **Performance**: Path selection < 10ms at P99
+  - **Testing**: Must select optimal paths during network congestion
+
+- [ ] Congestion Avoidance
+  - [ ] Implement detection
+  - [ ] Add mitigation strategies
+  - [ ] Implement prevention
+  - **Dependencies**: Requires network metrics collection
+  - **Performance**: Detection < 5s after congestion onset
+  - **Testing**: Must reroute traffic during simulated congestion
+
+- [ ] Load Distribution
+  - [ ] Implement balancing algorithms
+  - [ ] Add fairness policies
+  - [ ] Implement validation
+  - **Dependencies**: Requires node metrics collection
+  - **Performance**: Load imbalance < 15% across nodes
+  - **Testing**: Must balance load during synthetic traffic spikes
+
+## Phase 4: Production Readiness 🆕
 - [ ] Security Implementation
   - [ ] TLS support
     - [ ] Certificate management
@@ -136,7 +243,7 @@
     - [ ] Key management
     - [ ] Encryption at rest
     - [ ] Key rotation
-- [x] Observability
+- [ ] Observability
   - [x] Basic metrics endpoints
   - [ ] OpenTelemetry integration
     - [ ] Trace context propagation
@@ -178,57 +285,54 @@
 ## Phase 5: Stream Processing & Enterprise Features 🆕
 - [ ] Stream Processing Framework
   - [ ] Real-time data transformation
-  - [ ] Window operations (tumbling, sliding, session)
-  - [ ] Stateful processing capabilities
-  - [ ] Join operations between topics
-  - [ ] Custom processing operators
+  - [ ] Window operations
+  - [ ] Stateful processing
+  - [ ] Join operations
+  - [ ] Custom operators
 - [ ] Enterprise Integration
-  - [ ] Kafka protocol compatibility layer
-  - [ ] Schema registry integration
-  - [ ] Connect framework for data integration
-  - [ ] Enterprise security features (RBAC, audit logs)
-- [ ] Advanced Operational Features
+  - [ ] Kafka protocol compatibility
+  - [ ] Schema registry
+  - [ ] Connect framework
+  - [ ] Enterprise security
+- [ ] Advanced Operations
   - [ ] Multi-datacenter replication
-  - [ ] Disaster recovery tooling
-  - [ ] Resource quotas and rate limiting
-  - [ ] Message replay and time-travel capabilities
+  - [ ] Disaster recovery
+  - [ ] Resource quotas
+  - [ ] Message replay
 - [ ] Developer Experience
   - [ ] Visual topology manager
   - [ ] Stream processing DSL
-  - [ ] Interactive query capabilities
-  - [ ] Dead letter queue handling
----
+  - [ ] Interactive queries
+  - [ ] Dead letter queues
 
+## Critical Production Requirements 🆕
+- [ ] Data Durability
+  - [ ] Implement proper persistence guarantees
+  - [ ] Add data corruption detection
+  - [ ] Add data recovery mechanisms
+- [ ] Performance
+  - [ ] Add comprehensive benchmarking
+  - [ ] Implement performance monitoring
+  - [ ] Add load testing framework
+- [ ] Security
+  - [ ] Add security audit logging
+  - [ ] Implement access controls
+  - [ ] Add security testing
+- [ ] Documentation
+  - [ ] Add architecture docs
+  - [ ] Add deployment guides
+  - [ ] Add troubleshooting guides
+  - [ ] Add performance tuning docs
 
-Identified Issues
-Concurrency Limitations: The "Server is too busy" error consistently occurred, seemingly related to the semaphore mechanism limiting concurrent requests. This was encountered regardless of the approach used.
-Publish Mechanism Issues: Attempts to publish messages via both direct HTTP and CLI tools failed with either "Server is too busy" or "unexpected status" errors.
-Port Conflicts: Initial setup encountered issues with default ports being in use, requiring custom port configuration.
-Documentation Gaps: Some discrepancies between command syntax in documentation and actual implementation were observed, particularly with message publishing flags.
-Positive Aspects
-Cluster Formation: Multiple nodes successfully connected and formed a cluster with proper node discovery.
-Health Monitoring: Health check endpoints provided useful information about node and system status.
-AI Capabilities: The AI prediction system worked well and provided sensible predictions for system resources.
-Storage Framework: The tiered storage system appeared well-designed, though we couldn't fully test it due to messaging issues.
-Recommendations
-Concurrency Management: The semaphore mechanism needs tuning - it appears to be rejecting most requests with "Server is too busy" errors even in a light-load testing scenario.
-Publishing Workflow: The message publishing pathway requires troubleshooting to identify why both HTTP and CLI-based publishing consistently fail.
-Documentation Improvements: Command syntax in documentation should be updated to match the actual implementation.
-Error Handling: More descriptive error messages would help diagnose issues encountered during publishing.
+## Progress Summary
+- Phase 1: ~60% complete
+- Phase 2: ~40% complete
+- Phase 3: ~30% complete
+- Phase 4: ~5% complete
+- Phase 5: Not started
+- Critical Requirements: ~10% complete
 
-The changes look comprehensive and address the major issues identified in the feedback. However, I notice a few areas that could use additional attention:
-Testing Coverage:
-While there are some tests, we should add more comprehensive tests for the new features
-Need to add load testing for the improved concurrency handling
-Should add tests for the auto port assignment feature
-Monitoring and Observability:
-Consider adding more detailed metrics for the new features
-Add tracing for better debugging
-Implement structured logging
-Documentation:
-Add more examples for the new features
-Include performance tuning guidelines
-Add troubleshooting guides for common issues
+Note: Many features marked as "complete" in the original TODO have been moved to "in progress" status as they currently have simplified or placeholder implementations that need to be replaced with production-ready code.
 
 # Sprawl Implementation TODO List
 
@@ -501,87 +605,261 @@ This document catalogs all placeholder implementations and unfinished features t
 - [x] **Replace hard-coded thresholds**
   - File: `ai/engine.go:608`
   - Comment: `// Thresholds would depend on system capacity`
-  - Description: Make thresholds configurable based on actual system capacity
 
-- [ ] **Dynamic Network Metrics Fallbacks**
-  - File: `ai/engine.go`
-  - Description: Replace hard-coded network metrics fallback values with dynamic system-aware defaults
-  - Tasks:
-    - Implement system capacity detection for network interfaces
-    - Add configuration options for fallback ratios
-    - Create adaptive fallback mechanism based on historical throughput
-    - Add validation for fallback values
+## Enhance RocksDB/LevelDB integration
+- [ ] Optimize index management:
+  ```go
+  // Current simplified implementation:
+  func (s *Store) writeMessage(msg Message) error {
+      key := fmt.Sprintf("%s:%s", msg.Topic, msg.ID)
+      return s.db.Put(key, msg.Payload, nil)
+  }
+  
+  // Required implementation:
+  func (s *Store) writeMessage(msg Message) error {
+      batch := s.db.NewBatch()
+      defer batch.Close()
+      
+      // Write message data
+      key := makeMessageKey(msg.Topic, msg.ID)
+      if err := batch.Put(key, msg.Payload); err != nil {
+          return fmt.Errorf("failed to write message: %w", err)
+      }
+      
+      // Update topic index
+      topicKey := makeTopicIndexKey(msg.Topic, msg.Timestamp)
+      if err := batch.Put(topicKey, []byte(msg.ID)); err != nil {
+          return fmt.Errorf("failed to update topic index: %w", err)
+      }
+      
+      // Update timestamp index
+      timeKey := makeTimeIndexKey(msg.Timestamp, msg.Topic, msg.ID)
+      if err := batch.Put(timeKey, nil); err != nil {
+          return fmt.Errorf("failed to update time index: %w", err)
+      }
+      
+      // Commit transaction
+      if err := batch.Write(); err != nil {
+          return fmt.Errorf("failed to commit batch: %w", err)
+      }
+      
+      return nil
+  }
+  ```
 
-- [ ] **Adaptive Threshold Adjustment System**
-  - File: `ai/engine.go`
-  - Description: Make threshold adjustment factors dynamic and system-aware
-  - Tasks:
-    - Implement ML-based threshold learning
-    - Add historical performance analysis
-    - Create adaptive hysteresis based on system stability
-    - Implement workload-specific threshold profiles
+- [ ] Implement proper compaction policies:
+  - Add size-triggered compaction
+  - Implement time-based compaction
+  - Add proper compaction monitoring
+  - Implement compaction throttling
+  - Add compaction metrics collection
+  ```go
+  func (s *Store) setupCompaction() {
+      s.db.SetOptions(gorocksdb.CompactionOptions{
+          // Set proper compaction style
+          Style: gorocksdb.LevelCompactionStyle,
+          
+          // Configure level-based compaction
+          BaseTableSize: 2 * 1024 * 1024, // 2MB
+          Level0FileNumCompactionTrigger: 4,
+          
+          // Set proper compaction triggers
+          WriteRateLimit: 16 * 1024 * 1024, // 16MB/s
+          
+          // Configure compression
+          CompressionType: gorocksdb.SnappyCompression,
+      })
+      
+      // Add compaction filters
+      s.db.SetCompactionFilter(&compactionFilter{
+          retention: s.config.MessageRetention,
+          logger:    s.logger,
+          metrics:   s.metrics,
+      })
+  }
+  ```
 
-- [ ] **Dynamic Oscillation Detection**
-  - File: `ai/engine.go`
-  - Description: Improve oscillation detection with dynamic thresholds
-  - Tasks:
-    - Add workload pattern analysis
-    - Implement adaptive oscillation windows
-    - Create ML-based pattern detection
-    - Add system stability scoring
+- [ ] Add robust recovery mechanisms:
+  - Implement WAL (Write-Ahead Log)
+  - Add crash recovery procedures
+  - Implement consistency checking
+  - Add data corruption detection
+  - Implement automatic repair procedures
+  ```go
+  func (s *Store) recover() error {
+      // Check WAL consistency
+      if err := s.checkWAL(); err != nil {
+          return fmt.Errorf("WAL check failed: %w", err)
+      }
+      
+      // Verify index consistency
+      if err := s.verifyIndices(); err != nil {
+          return fmt.Errorf("index verification failed: %w", err)
+      }
+      
+      // Repair any corrupted data
+      if err := s.repairCorruption(); err != nil {
+          return fmt.Errorf("repair failed: %w", err)
+      }
+      
+      return nil
+  }
+  ```
 
-- [ ] **System-Specific Calibration**
-  - File: `ai/engine.go`
-  - Description: Implement automatic system-specific threshold calibration
-  - Tasks:
-    - Create initial calibration phase
-    - Add hardware capability detection
-    - Implement environment-aware baseline calculation
-    - Add periodic recalibration based on performance
+## Complete S3/MinIO cloud storage integration
+- [ ] Optimize batch upload system:
+  ```go
+  // Current simplified implementation:
+  func (s *CloudStore) uploadBatch(msgs []Message) error {
+      for _, msg := range msgs {
+          if err := s.upload(msg); err != nil {
+              return err
+          }
+      }
+      return nil
+  }
+  
+  // Required implementation:
+  func (s *CloudStore) uploadBatch(msgs []Message) error {
+      // Group messages by size for optimal multipart upload
+      batches := s.groupMessagesBySize(msgs)
+      
+      // Process batches concurrently
+      var wg sync.WaitGroup
+      errors := make(chan error, len(batches))
+      
+      for _, batch := range batches {
+          wg.Add(1)
+          go func(b []Message) {
+              defer wg.Done()
+              
+              // Create multipart upload
+              uploadID, err := s.initMultipartUpload(b)
+              if err != nil {
+                  errors <- err
+                  return
+              }
+              
+              // Upload parts concurrently
+              parts, err := s.uploadParts(b, uploadID)
+              if err != nil {
+                  s.abortMultipartUpload(uploadID)
+                  errors <- err
+                  return
+              }
+              
+              // Complete multipart upload
+              if err := s.completeMultipartUpload(uploadID, parts); err != nil {
+                  errors <- err
+                  return
+              }
+          }(batch)
+      }
+      
+      // Wait for all uploads and collect errors
+      wg.Wait()
+      close(errors)
+      
+      // Process any errors
+      var errs []error
+      for err := range errors {
+          errs = append(errs, err)
+      }
+      
+      if len(errs) > 0 {
+          return fmt.Errorf("batch upload failed with %d errors: %v", 
+              len(errs), errs)
+      }
+      
+      return nil
+  }
+  ```
 
-- [ ] **Workload-Aware Threshold Management**
-  - File: `ai/engine.go`
-  - Description: Add workload-specific threshold adjustments
-  - Tasks:
-    - Implement workload classification
-    - Create workload-specific profiles
-    - Add automatic profile switching
-    - Implement learning from workload patterns
+- [ ] Implement proper concurrent access:
+  - Add proper locking mechanisms
+  - Implement connection pooling
+  - Add request rate limiting
+  - Implement proper error handling
+  - Add retry mechanisms with backoff
+  ```go
+  func (s *CloudStore) getClient() (*s3.Client, error) {
+      s.poolMu.Lock()
+      defer s.poolMu.Unlock()
+      
+      // Get client from pool or create new one
+      client, err := s.clientPool.Get()
+      if err != nil {
+          // Create new client with proper configuration
+          cfg, err := s.getClientConfig()
+          if err != nil {
+              return nil, err
+          }
+          
+          client = s3.NewFromConfig(cfg,
+              s3.WithRetryMaxAttempts(3),
+              s3.WithRetryMode(aws.RetryModeAdaptive),
+          )
+          
+          // Add to pool for future use
+          s.clientPool.Put(client)
+      }
+      
+      return client, nil
+  }
+  ```
 
-## Architecture Improvements
+- [ ] Add comprehensive lifecycle management:
+  - Implement proper object expiration
+  - Add storage class transitions
+  - Implement object versioning
+  - Add replication configuration
+  - Implement backup procedures
+  ```go
+  func (s *CloudStore) setupLifecycle() error {
+      lifecycle := s3.PutBucketLifecycleConfigurationInput{
+          Bucket: aws.String(s.bucket),
+          LifecycleConfiguration: &types.BucketLifecycleConfiguration{
+              Rules: []types.LifecycleRule{
+                  {
+                      // Configure transitions between storage classes
+                      Transitions: []types.Transition{
+                          {
+                              Days:         aws.Int32(30),
+                              StorageClass: types.StorageClassIntelligentTiering,
+                          },
+                          {
+                              Days:         aws.Int32(90),
+                              StorageClass: types.StorageClassGlacier,
+                          },
+                      },
+                      
+                      // Configure expiration
+                      Expiration: &types.LifecycleExpiration{
+                          Days: aws.Int32(365),
+                      },
+                      
+                      // Configure versioning
+                      NoncurrentVersionExpiration: &types.NoncurrentVersionExpiration{
+                          NoncurrentDays: aws.Int32(30),
+                      },
+                      
+                      Status: types.ExpirationStatusEnabled,
+                  },
+              },
+          },
+      }
+      
+      _, err := s.client.PutBucketLifecycleConfiguration(context.TODO(), &lifecycle)
+      return err
+  }
+  ```
 
-- [x] **Refactor message handling for better extensibility**
-- [x] **Implement proper dependency injection**
-- [x] **Replace hard-coded thresholds with environment-based configuration**
-- [x] **Implement a cluster manager for node discovery and metadata**
-- [ ] **Improve error handling for network failures**
-- [ ] **Streamline the configuration system**
+## Progress Summary
+- Phase 1: ~60% complete
+- Phase 2: ~40% complete
+- Phase 3: ~30% complete
+- Phase 4: ~5% complete
+- Phase 5: Not started
+- Critical Requirements: ~10% complete
 
-## Testing Improvements
-
-- [ ] **Replace test mocks with more realistic implementations**
-  - File: `node/test_util.go:26`
-  - Comment: `// TestAIEngine is a simplified AI Engine for testing purposes`
-  - Description: Create more realistic test doubles that better represent production behavior
-
-## Progress
-- Total items: 31
-- Completed: 23
-- Remaining: 8
-
-## Production Enhancements Completed
-
-1. **Cloud Storage Improvements**
-   - Added comprehensive error handling with retry mechanism and exponential backoff
-   - Implemented cloud provider detection and provider-specific optimizations
-   - Added detailed metrics collection and monitoring capabilities
-   - Created performance benchmarking framework for load testing
-   - Improved logging with operation tracking and latency measurements
-   - Enhanced persistence mechanism with atomic file operations
-   - Added intelligent rate limiting and throttling detection
-
-### Architecture Improvements
-- [x] Replace hard-coded thresholds with environment-based configuration 
-- [x] Implement proper dependency injection
-- [x] Refactor clustering code for better testability
-- [ ] Finalize clean module boundaries and API contracts
+Note: Many features marked as "complete" in the original TODO have been moved to "in progress" status as they currently have simplified or placeholder implementations that need to be replaced with production-ready code.

@@ -1,9 +1,12 @@
 package node
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"runtime"
 	"sync"
 	"time"
@@ -14,6 +17,9 @@ import (
 	"github.com/hashicorp/memberlist"
 	"github.com/shirou/gopsutil/v3/cpu"
 )
+
+// ProbeNodeFunc defines a function signature for probing a node
+type ProbeNodeFunc func(nodeID string)
 
 // GossipManager handles cluster membership and metadata gossip
 type GossipManager struct {
@@ -30,10 +36,68 @@ type GossipManager struct {
 	startTime time.Time
 	isLeader  bool
 	bindAddr  string
+	nodeID    string
 
-	// Add a field to track message counts
+	// Message counting
 	messageCountMu sync.RWMutex
 	messageCount   int64
+
+	// Health monitoring
+	failureDetector *FailureDetector
+	metricsManager  *MetricsManager
+
+	// Membership management
+	membershipMu sync.RWMutex
+	members      map[string]*MemberInfo
+
+	// Node state and leader election
+	stateMu      sync.RWMutex
+	stateHistory []StateChange
+	leaderID     string
+
+	// Probing
+	directProbeMu sync.Mutex
+	probeResults  map[string][]ProbeResult
+	probeTimeout  time.Duration
+
+	// Context for graceful shutdown
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// Function to probe a node (used by failure detector)
+	ProbeNodeFn ProbeNodeFunc
+}
+
+// MemberInfo stores information about a cluster member
+type MemberInfo struct {
+	NodeID          string
+	Address         string
+	Port            int
+	HTTPPort        int
+	State           string
+	LastSeen        time.Time
+	JoinTime        time.Time
+	Tags            map[string]string
+	Version         string
+	ProtocolVersion uint8
+	DelegateVersion uint8
+	Metadata        map[string]interface{}
+}
+
+// StateChange records a node state transition
+type StateChange struct {
+	Timestamp time.Time
+	OldState  string
+	NewState  string
+	Reason    string
+}
+
+// ProbeResult represents the outcome of a direct node probe
+type ProbeResult struct {
+	Success      bool
+	ResponseTime time.Duration
+	Error        string
+	Timestamp    time.Time
 }
 
 // GossipMetadata represents the metadata gossiped between nodes
@@ -57,6 +121,15 @@ type GossipMetadata struct {
 	MsgCount   int                 `json:"msg_count"`
 	LastSeen   int64               `json:"last_seen"`
 	IsLeader   bool                `json:"is_leader"`
+
+	// Added fields for enhanced monitoring
+	ClusterHealth         map[string]interface{} `json:"cluster_health"`
+	SystemMetrics         map[string]interface{} `json:"system_metrics"`
+	NodeState             string                 `json:"node_state"`
+	FailedNodeDetections  []string               `json:"failed_node_detections"`
+	SuspectNodeDetections []string               `json:"suspect_node_detections"`
+	MembershipVersion     int64                  `json:"membership_version"`
+	FeatureFlags          map[string]bool        `json:"feature_flags"`
 }
 
 // LoadStats represents node load metrics
@@ -84,20 +157,33 @@ func NewGossipManager(nodeID, bindAddr string, bindPort int, dhtInstance *dht.DH
 	log.Printf("[Gossip] Creating new GossipManager for node %s with HTTP port %d",
 		logID(nodeID), httpPort)
 
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Create a new manager
 	g := &GossipManager{
-		dht:       dhtInstance,
-		metadata:  make(map[string]interface{}),
-		stopCh:    make(chan struct{}),
-		done:      make(chan struct{}),
-		httpPort:  httpPort,
-		hostname:  bindAddr,
-		port:      bindPort,
-		state:     "active",
-		startTime: time.Now(),
-		isLeader:  false,
-		bindAddr:  bindAddr,
+		dht:          dhtInstance,
+		metadata:     make(map[string]interface{}),
+		stopCh:       make(chan struct{}),
+		done:         make(chan struct{}),
+		httpPort:     httpPort,
+		hostname:     bindAddr,
+		port:         bindPort,
+		state:        "active",
+		startTime:    time.Now(),
+		isLeader:     false,
+		bindAddr:     bindAddr,
+		nodeID:       nodeID,
+		members:      make(map[string]*MemberInfo),
+		probeResults: make(map[string][]ProbeResult),
+		probeTimeout: 5 * time.Second,
+		stateHistory: make([]StateChange, 0, 100),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
+
+	// Initialize ProbeNodeFn to point to our probeNode method
+	g.ProbeNodeFn = g.probeNode
 
 	// Configure memberlist
 	config := memberlist.DefaultLANConfig()
@@ -131,6 +217,7 @@ func NewGossipManager(nodeID, bindAddr string, bindPort int, dhtInstance *dht.DH
 	// Create memberlist
 	list, err := memberlist.Create(config)
 	if err != nil {
+		cancel() // Clean up context
 		return nil, fmt.Errorf("failed to create memberlist: %v", err)
 	}
 
@@ -142,10 +229,75 @@ func NewGossipManager(nodeID, bindAddr string, bindPort int, dhtInstance *dht.DH
 	g.list = list
 	g.config = config
 
+	// Create and configure the failure detector
+	g.failureDetector = NewFailureDetector(dhtInstance)
+	g.failureDetector.SetGossipManager(g)
+
+	// Create and configure the metrics manager
+	g.metricsManager = NewMetricsManager(nodeID)
+
+	// Record initial state
+	g.recordStateChange("", "active", "Initial state")
+
+	// Start subsystems
+	g.failureDetector.Start()
+	g.metricsManager.Start()
+
 	// Start metadata broadcast
 	go g.startMetadataBroadcast()
 
+	// Start periodic health check
+	go g.startHealthCheck()
+
 	return g, nil
+}
+
+// startHealthCheck periodically monitors the health of the cluster
+func (g *GossipManager) startHealthCheck() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-g.stopCh:
+			return
+		case <-ticker.C:
+			g.performHealthCheck()
+		}
+	}
+}
+
+// performHealthCheck evaluates the cluster's health
+func (g *GossipManager) performHealthCheck() {
+	// Get list of all members
+	members := g.list.Members()
+
+	// Log current membership
+	log.Printf("[Gossip] Health check: Cluster has %d members", len(members))
+
+	// Check for isolated nodes (nodes that haven't sent updates recently)
+	g.membershipMu.RLock()
+	now := time.Now()
+	for nodeID, member := range g.members {
+		if now.Sub(member.LastSeen) > 60*time.Second {
+			log.Printf("[Gossip] Health alert: Node %s hasn't been seen for %s",
+				logID(nodeID), now.Sub(member.LastSeen))
+		}
+	}
+	g.membershipMu.RUnlock()
+
+	// Check for leader
+	g.stateMu.RLock()
+	hasLeader := g.leaderID != ""
+	g.stateMu.RUnlock()
+
+	if !hasLeader {
+		log.Printf("[Gossip] Health alert: No leader elected in the cluster")
+	}
+
+	// Update metrics
+	g.metricsManager.AddCustomMetric("cluster_size", len(members))
+	g.metricsManager.AddCustomMetric("has_leader", hasLeader)
 }
 
 // logWriter implements io.Writer for memberlist logging
@@ -180,6 +332,29 @@ func (g *GossipManager) broadcastMetadata() {
 	// Get own node info from DHT
 	nodeInfo := g.dht.GetNodeInfo()
 
+	// Get failure detector health data
+	var suspectNodes, failedNodes []string
+	if g.failureDetector != nil {
+		suspectNodes = g.failureDetector.GetSuspectNodes()
+		failedNodes = g.failureDetector.GetFailedNodes()
+	}
+
+	// Get metrics data
+	var systemMetrics map[string]interface{}
+	if g.metricsManager != nil {
+		systemMetrics = g.metricsManager.GetMetricsAsMap()
+	} else {
+		systemMetrics = make(map[string]interface{})
+	}
+
+	// Get cluster health
+	var clusterHealth map[string]interface{}
+	if g.failureDetector != nil {
+		clusterHealth = g.failureDetector.CheckClusterHealth()
+	} else {
+		clusterHealth = make(map[string]interface{})
+	}
+
 	// Create metadata with our current topic map and node info
 	metadata := GossipMetadata{
 		NodeID:     g.list.LocalNode().Name,
@@ -201,6 +376,15 @@ func (g *GossipManager) broadcastMetadata() {
 		MsgCount:   g.getMessageCount(),
 		LastSeen:   time.Now().UnixNano(),
 		IsLeader:   g.isLeader,
+
+		// Enhanced monitoring fields
+		ClusterHealth:         clusterHealth,
+		SystemMetrics:         systemMetrics,
+		NodeState:             g.state,
+		SuspectNodeDetections: suspectNodes,
+		FailedNodeDetections:  failedNodes,
+		MembershipVersion:     time.Now().UnixNano(), // Simple version counter
+		FeatureFlags:          map[string]bool{"enhanced_metrics": true, "failure_detection": true},
 	}
 
 	log.Printf("[Gossip] Broadcasting metadata with HTTP port %d",
@@ -225,6 +409,16 @@ func (g *GossipManager) broadcastMetadata() {
 		err := g.list.SendReliable(node, data)
 		if err != nil {
 			log.Printf("[Gossip] Failed to send metadata to %s: %v", logID(node.Name), err)
+
+			// Record error for failure detection
+			if g.failureDetector != nil {
+				g.failureDetector.RecordError(node.Name)
+			}
+		} else {
+			// Record heartbeat for failure detection
+			if g.failureDetector != nil {
+				g.failureDetector.RecordHeartbeat(node.Name)
+			}
 		}
 	}
 }
@@ -248,21 +442,14 @@ func (g *GossipManager) getLocalTopics() []string {
 		return []string{}
 	}
 
-	// Get the topic map
+	// Get topic map and extract topics this node handles
 	topicMap := g.dht.GetTopicMap()
-	if topicMap == nil {
-		return []string{}
-	}
+	localTopics := make([]string, 0)
+	localNodeID := g.nodeID
 
-	// Get the local node ID
-	nodeID := g.list.LocalNode().Name
-
-	// Find all topics that this node is responsible for
-	var localTopics []string
 	for topic, nodes := range topicMap {
-		// Check if this node is in the list of nodes for this topic
-		for _, node := range nodes {
-			if node == nodeID {
+		for _, nodeID := range nodes {
+			if nodeID == localNodeID {
 				localTopics = append(localTopics, topic)
 				break
 			}
@@ -272,123 +459,471 @@ func (g *GossipManager) getLocalTopics() []string {
 	return localTopics
 }
 
-// JoinCluster joins a cluster with the given seed nodes
+// JoinCluster joins an existing cluster
 func (g *GossipManager) JoinCluster(seeds []string) error {
 	if len(seeds) == 0 {
-		log.Printf("[Gossip] No seeds provided, not joining any cluster")
+		log.Printf("[Gossip] No seeds provided, starting a new cluster")
 		return nil
 	}
 
-	log.Printf("[Gossip] Joining cluster with seeds: %v", seeds)
+	log.Printf("[Gossip] Joining cluster with %d seed nodes", len(seeds))
 
-	// Convert string addresses to IP addresses
-	addrs := make([]string, 0, len(seeds))
-	addrs = append(addrs, seeds...)
-
-	// Join the cluster
-	n, err := g.list.Join(addrs)
+	// Try to join the cluster
+	n, err := g.list.Join(seeds)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to join cluster: %v", err)
 	}
 
-	log.Printf("[Gossip] Joined %d nodes", n)
+	log.Printf("[Gossip] Successfully joined cluster with %d nodes", n)
+
+	// Record state change
+	g.recordStateChange("active", "joined", "Joined cluster")
+
 	return nil
 }
 
-// GetMembers returns all members in the cluster
+// GetMembers returns a list of member IDs
 func (g *GossipManager) GetMembers() []string {
 	members := g.list.Members()
-	result := make([]string, 0, len(members))
+	result := make([]string, len(members))
 
-	for _, m := range members {
-		result = append(result, m.Name)
+	for i, member := range members {
+		result[i] = member.Name
 	}
 
 	return result
 }
 
-// Shutdown stops the gossip manager
+// GetMemberInfo returns detailed information about a specific member
+func (g *GossipManager) GetMemberInfo(nodeID string) *MemberInfo {
+	g.membershipMu.RLock()
+	defer g.membershipMu.RUnlock()
+
+	if info, exists := g.members[nodeID]; exists {
+		// Return a copy to avoid race conditions
+		infoCopy := *info
+		return &infoCopy
+	}
+
+	return nil
+}
+
+// GetAllMemberInfo returns detailed information about all members
+func (g *GossipManager) GetAllMemberInfo() map[string]*MemberInfo {
+	g.membershipMu.RLock()
+	defer g.membershipMu.RUnlock()
+
+	// Create a copy to avoid race conditions
+	result := make(map[string]*MemberInfo, len(g.members))
+	for nodeID, info := range g.members {
+		infoCopy := *info
+		result[nodeID] = &infoCopy
+	}
+
+	return result
+}
+
+// Shutdown gracefully shuts down the gossip manager
 func (g *GossipManager) Shutdown() {
 	log.Printf("[Gossip] Shutting down gossip manager")
+
+	// Cancel context to signal shutdown
+	g.cancel()
+
+	// Signal broadcast goroutine to stop
 	close(g.stopCh)
+
+	// Wait for broadcast to complete
 	<-g.done
-	if err := g.list.Shutdown(); err != nil {
+
+	// Stop failure detector
+	if g.failureDetector != nil {
+		g.failureDetector.Stop()
+	}
+
+	// Stop metrics manager
+	if g.metricsManager != nil {
+		g.metricsManager.Stop()
+	}
+
+	// Leave the memberlist
+	err := g.list.Leave(time.Second * 5)
+	if err != nil {
+		log.Printf("[Gossip] Error leaving memberlist: %v", err)
+	}
+
+	// Shutdown memberlist
+	err = g.list.Shutdown()
+	if err != nil {
 		log.Printf("[Gossip] Error shutting down memberlist: %v", err)
 	}
+
+	log.Printf("[Gossip] Gossip manager shutdown complete")
 }
 
 // NotifyJoin is called when a node joins the cluster
 func (g *GossipManager) NotifyJoin(node *memberlist.Node) {
-	log.Printf("[Gossip] Node %s joined at %s", logID(node.Name), node.Addr)
+	log.Printf("[Gossip] Node %s joined the cluster", logID(node.Name))
+
+	// Create or update member info
+	g.membershipMu.Lock()
+	g.members[node.Name] = &MemberInfo{
+		NodeID:   node.Name,
+		Address:  node.Addr.String(),
+		Port:     int(node.Port),
+		State:    "active",
+		LastSeen: time.Now(),
+		JoinTime: time.Now(),
+	}
+	g.membershipMu.Unlock()
+
+	// Record heartbeat in failure detector
+	if g.failureDetector != nil {
+		g.failureDetector.RecordHeartbeat(node.Name)
+	}
+
+	// Update metrics
+	if g.metricsManager != nil {
+		g.metricsManager.AddCustomMetric("cluster_size", len(g.list.Members()))
+	}
 }
 
 // NotifyLeave is called when a node leaves the cluster
 func (g *GossipManager) NotifyLeave(node *memberlist.Node) {
-	log.Printf("[Gossip] Node %s left, removing from DHT and notifying all peers", logID(node.Name))
+	log.Printf("[Gossip] Node %s left the cluster", logID(node.Name))
 
-	// Remove the node from the DHT immediately
-	g.dht.RemoveNode(node.Name)
+	// Update member state
+	g.membershipMu.Lock()
+	if member, exists := g.members[node.Name]; exists {
+		member.State = "left"
+		member.LastSeen = time.Now()
+	}
+	g.membershipMu.Unlock()
 
-	// Broadcast updated state to all remaining nodes immediately
-	g.broadcastMetadata()
+	// Check if this was the leader
+	g.stateMu.Lock()
+	if g.leaderID == node.Name {
+		log.Printf("[Gossip] Leader node %s left, triggering re-election", logID(node.Name))
+		g.leaderID = ""
+		go g.electLeader() // Trigger leader election in a goroutine
+	}
+	g.stateMu.Unlock()
 
-	// Force a membership update to all peers to ensure the change propagates
-	go func() {
-		// Broadcast multiple times to ensure delivery
-		for i := 0; i < 3; i++ {
-			g.broadcastMetadata()
-			time.Sleep(500 * time.Millisecond)
-		}
-	}()
+	// This node has left gracefully, so we don't need to mark it as failed
+	// but we should clean up any cached data
+
+	// Remove the node from DHT
+	if g.dht != nil {
+		g.dht.RemoveNode(node.Name)
+	}
+
+	// Update metrics
+	if g.metricsManager != nil {
+		g.metricsManager.AddCustomMetric("cluster_size", len(g.list.Members()))
+	}
 }
 
-// NotifyUpdate is called when a node information is updated
+// NotifyUpdate is called when a node is updated
 func (g *GossipManager) NotifyUpdate(node *memberlist.Node) {
 	log.Printf("[Gossip] Node %s updated", logID(node.Name))
+
+	// Update last seen time
+	g.membershipMu.Lock()
+	if member, exists := g.members[node.Name]; exists {
+		member.LastSeen = time.Now()
+	} else {
+		// We don't have this member yet, create it
+		g.members[node.Name] = &MemberInfo{
+			NodeID:   node.Name,
+			Address:  node.Addr.String(),
+			Port:     int(node.Port),
+			State:    "active",
+			LastSeen: time.Now(),
+			JoinTime: time.Now(),
+		}
+	}
+	g.membershipMu.Unlock()
+
+	// Record heartbeat in failure detector
+	if g.failureDetector != nil {
+		g.failureDetector.RecordHeartbeat(node.Name)
+	}
 }
 
-// getCPUUsage returns the current CPU usage for this node
+// getCPUUsage retrieves the current CPU usage
 func (g *GossipManager) getCPUUsage() float64 {
-	// Get CPU percentages using gopsutil
-	percents, err := cpu.Percent(0, false)
+	percent, err := cpu.Percent(time.Second, false) // Get overall CPU percentage
 	if err != nil {
 		log.Printf("[Gossip] Error getting CPU usage: %v", err)
-		return 0.0
+		return 0
 	}
 
-	if len(percents) > 0 {
-		return percents[0]
+	if len(percent) == 0 {
+		return 0
 	}
 
-	return 0.0
+	return percent[0]
 }
 
-// getMemUsage returns the current memory usage
+// getMemUsage retrieves current memory usage
 func (g *GossipManager) getMemUsage() float64 {
-	// Get memory stats
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-
-	// Calculate memory usage as percentage of total allocated memory
-	memoryUsagePercent := float64(memStats.Alloc) / float64(memStats.Sys) * 100.0
-	return memoryUsagePercent
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return float64(m.Alloc) / float64(m.Sys) * 100
 }
 
-// AddMessageCount increments the message counter by the specified amount
+// AddMessageCount increments the message counter
 func (g *GossipManager) AddMessageCount(count int) {
 	g.messageCountMu.Lock()
 	defer g.messageCountMu.Unlock()
 	g.messageCount += int64(count)
+
+	// Update metrics manager as well
+	if g.metricsManager != nil {
+		g.metricsManager.AddMessageCount(count)
+	}
 }
 
-// getMessageCount returns the total message count processed by this node
+// getMessageCount returns the current message count
 func (g *GossipManager) getMessageCount() int {
-	// If dht is nil, return 0
-	if g.dht == nil {
-		return 0
-	}
-
 	g.messageCountMu.RLock()
 	defer g.messageCountMu.RUnlock()
 	return int(g.messageCount)
+}
+
+// electLeader performs leader election
+func (g *GossipManager) electLeader() {
+	// Simple leader election: the node with the lowest ID becomes leader
+	members := g.list.Members()
+	if len(members) == 0 {
+		log.Printf("[Gossip] No members in cluster for leader election")
+		return
+	}
+
+	lowestID := members[0].Name
+	for _, member := range members {
+		if member.Name < lowestID {
+			lowestID = member.Name
+		}
+	}
+
+	g.stateMu.Lock()
+	defer g.stateMu.Unlock()
+
+	g.leaderID = lowestID
+	g.isLeader = (lowestID == g.nodeID)
+
+	if g.isLeader {
+		log.Printf("[Gossip] This node has been elected as leader")
+		g.recordStateChange(g.state, "leader", "Elected as leader")
+		g.state = "leader"
+	} else {
+		log.Printf("[Gossip] Node %s has been elected as leader", logID(lowestID))
+	}
+}
+
+// recordStateChange adds a state change to history
+func (g *GossipManager) recordStateChange(oldState, newState, reason string) {
+	g.stateMu.Lock()
+	defer g.stateMu.Unlock()
+
+	change := StateChange{
+		Timestamp: time.Now(),
+		OldState:  oldState,
+		NewState:  newState,
+		Reason:    reason,
+	}
+
+	g.stateHistory = append(g.stateHistory, change)
+
+	// Keep history at a reasonable size
+	maxHistorySize := 100
+	if len(g.stateHistory) > maxHistorySize {
+		g.stateHistory = g.stateHistory[len(g.stateHistory)-maxHistorySize:]
+	}
+}
+
+// probeNode performs a direct health check on a specific node
+func (g *GossipManager) probeNode(nodeID string) {
+	g.directProbeMu.Lock()
+	defer g.directProbeMu.Unlock()
+
+	// Get node info
+	nodeInfo := g.dht.GetNodeInfoByID(nodeID)
+	if nodeInfo == nil {
+		log.Printf("[Gossip] Cannot probe node %s: no info available", logID(nodeID))
+		g.recordProbeResult(nodeID, ProbeResult{
+			Success:   false,
+			Error:     "No node info available",
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	// Build URL for health check
+	url := fmt.Sprintf("http://%s:%d/health", nodeInfo.Address, nodeInfo.HTTPPort)
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(g.ctx, g.probeTimeout)
+	defer cancel()
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		log.Printf("[Gossip] Error creating probe request for node %s: %v", logID(nodeID), err)
+		g.recordProbeResult(nodeID, ProbeResult{
+			Success:   false,
+			Error:     fmt.Sprintf("Request creation error: %v", err),
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	// Perform the probe
+	startTime := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	responseTime := time.Since(startTime)
+
+	if err != nil {
+		log.Printf("[Gossip] Probe failed for node %s: %v", logID(nodeID), err)
+		g.recordProbeResult(nodeID, ProbeResult{
+			Success:      false,
+			ResponseTime: responseTime,
+			Error:        fmt.Sprintf("HTTP error: %v", err),
+			Timestamp:    time.Now(),
+		})
+
+		// Record failure in failure detector
+		if g.failureDetector != nil {
+			g.failureDetector.RecordError(nodeID)
+		}
+
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[Gossip] Error reading probe response from node %s: %v", logID(nodeID), err)
+		g.recordProbeResult(nodeID, ProbeResult{
+			Success:      false,
+			ResponseTime: responseTime,
+			Error:        fmt.Sprintf("Response read error: %v", err),
+			Timestamp:    time.Now(),
+		})
+		return
+	}
+
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[Gossip] Unhealthy response from node %s: %d %s",
+			logID(nodeID), resp.StatusCode, string(body))
+		g.recordProbeResult(nodeID, ProbeResult{
+			Success:      false,
+			ResponseTime: responseTime,
+			Error:        fmt.Sprintf("Unhealthy status: %d", resp.StatusCode),
+			Timestamp:    time.Now(),
+		})
+
+		// Record error in failure detector
+		if g.failureDetector != nil {
+			g.failureDetector.RecordError(nodeID)
+		}
+
+		return
+	}
+
+	// Successful probe
+	log.Printf("[Gossip] Successful probe of node %s: %s (took %s)",
+		logID(nodeID), string(body), responseTime)
+	g.recordProbeResult(nodeID, ProbeResult{
+		Success:      true,
+		ResponseTime: responseTime,
+		Timestamp:    time.Now(),
+	})
+
+	// Record heartbeat and response time
+	if g.failureDetector != nil {
+		g.failureDetector.RecordHeartbeat(nodeID)
+		g.failureDetector.RecordResponseTime(nodeID, responseTime)
+	}
+}
+
+// recordProbeResult stores the result of a node probe
+func (g *GossipManager) recordProbeResult(nodeID string, result ProbeResult) {
+	results, ok := g.probeResults[nodeID]
+	if !ok {
+		results = make([]ProbeResult, 0, 10)
+	}
+
+	// Add new result
+	results = append(results, result)
+
+	// Keep only the most recent 10 results
+	if len(results) > 10 {
+		results = results[len(results)-10:]
+	}
+
+	g.probeResults[nodeID] = results
+}
+
+// GetNodeState returns the current state of a node
+func (g *GossipManager) GetNodeState(nodeID string) string {
+	// First check our internal state
+	g.membershipMu.RLock()
+	if member, exists := g.members[nodeID]; exists {
+		state := member.State
+		g.membershipMu.RUnlock()
+		return state
+	}
+	g.membershipMu.RUnlock()
+
+	// If we don't have it in our member list, check failure detector
+	if g.failureDetector != nil {
+		state := g.failureDetector.GetNodeState(nodeID)
+		switch state {
+		case StateHealthy:
+			return "healthy"
+		case StateSuspect:
+			return "suspect"
+		case StateFailed:
+			return "failed"
+		}
+	}
+
+	// Default if we don't know
+	return "unknown"
+}
+
+// ProbeAllNodes triggers health checks for all nodes
+func (g *GossipManager) ProbeAllNodes() map[string]bool {
+	members := g.list.Members()
+	results := make(map[string]bool)
+
+	for _, member := range members {
+		if member.Name == g.nodeID {
+			// Skip self
+			results[member.Name] = true
+			continue
+		}
+
+		// Probe in a separate goroutine to avoid blocking
+		go g.probeNode(member.Name)
+
+		// For immediate return, mark as pending
+		results[member.Name] = true
+	}
+
+	return results
+}
+
+// GetMetricsManager returns the metrics manager
+func (g *GossipManager) GetMetricsManager() *MetricsManager {
+	return g.metricsManager
+}
+
+// GetStartTime returns the time when the gossip manager was started
+func (g *GossipManager) GetStartTime() time.Time {
+	return g.startTime
 }

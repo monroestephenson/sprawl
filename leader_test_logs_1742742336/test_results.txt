@@ -1,5 +1,0 @@
-Sprawl Leader Failure Test Results - Sun Mar 23 16:05:38 CET 2025
-=======================================
-Leader Node Failure Recovery: PASSED
-  Cluster continued functioning after leader failure
-----------------------------------------
