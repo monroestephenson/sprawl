@@ -41,8 +41,8 @@
   - **Testing**: Must recover from 33% node failure within 5 seconds
 
 - [ ] DHT Manager
-  - [ ] Complete topic routing
-  - [ ] Implement node mapping
+  - [x] Complete topic routing
+  - [x] Implement node mapping
   - [ ] Add replication management
   - [ ] Implement consistency protocols
   - **Dependencies**: Requires Gossip Protocol for membership data
@@ -50,11 +50,11 @@
   - **Testing**: Must maintain consistency during membership churn
 
 ### Message Processing Pipeline (P0)
-- [ ] Message Router
-  - [ ] Complete topic-based routing
-  - [ ] Implement load balancing
-  - [ ] Add route optimization
-  - [ ] Implement route caching
+- [x] Message Router
+  - [x] Complete topic-based routing
+  - [x] Implement load balancing
+  - [x] Add route optimization
+  - [x] Implement route caching
   - **Dependencies**: Requires DHT Manager for topic mapping
   - **Performance**: Route computation < 5ms at P99
   - **Testing**: Must validate routing correctness during network partitions
