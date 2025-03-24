@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"log"
 	"sprawl/node/dht"
 )
 
@@ -12,6 +13,7 @@ type LoadBalancer struct {
 	mu         sync.RWMutex
 	nodeLoads  map[string]NodeLoad
 	thresholds Thresholds
+	logger     *log.Logger
 }
 
 type NodeLoad struct {
@@ -28,7 +30,7 @@ type Thresholds struct {
 	MsgHigh    int64
 }
 
-func NewLoadBalancer(dht *dht.DHT) *LoadBalancer {
+func NewLoadBalancer(dht *dht.DHT, logger *log.Logger) *LoadBalancer {
 	return &LoadBalancer{
 		dht:       dht,
 		nodeLoads: make(map[string]NodeLoad),
@@ -37,6 +39,7 @@ func NewLoadBalancer(dht *dht.DHT) *LoadBalancer {
 			MemoryHigh: 0.8,
 			MsgHigh:    10000,
 		},
+		logger: logger,
 	}
 }
 
@@ -81,7 +84,9 @@ func (lb *LoadBalancer) rebalanceTopics(overloadedNode string) {
 			for i := 0; i < moveCount; i++ {
 				topic := load.Topics[i]
 				// Update DHT mappings
-				lb.dht.ReassignTopic(topic, targetNode)
+				if err := lb.dht.ReassignTopic(topic, targetNode); err != nil {
+					lb.logger.Printf("Error reassigning topic %s to node %s: %v", topic, targetNode, err)
+				}
 			}
 		}
 	}

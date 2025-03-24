@@ -361,7 +361,7 @@ func (g *GossipManager) broadcastMetadata() {
 		TopicList:  g.getLocalTopics(),
 		LoadStats:  g.getLoadStats(),
 		DHTPeers:   g.dht.GetTopicMap(),
-		NodeInfo:   nodeInfo, // Use the node info with actual HTTP port
+		NodeInfo:   *nodeInfo, // Use the node info with actual HTTP port
 		Timestamp:  time.Now(),
 		Hostname:   g.hostname,
 		Port:       g.port,

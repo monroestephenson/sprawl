@@ -14,7 +14,7 @@ import (
 func TestNewNode(t *testing.T) {
 	opts := &Options{
 		BindAddress:           "127.0.0.1",
-		BindPort:              0, // ephemeral port for testing
+		BindPort:              7946, // Fixed port for testing instead of ephemeral
 		HTTPPort:              8000,
 		AdvertiseAddr:         "127.0.0.1",
 		MaxConcurrentRequests: 10,

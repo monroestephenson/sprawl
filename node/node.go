@@ -108,10 +108,16 @@ func NewNode(opts *Options) (*Node, error) {
 	log.Printf("Creating new node with ID=%s, HTTPPort=%d", nodeID[:8], opts.HTTPPort)
 
 	// Initialize our own node in DHT with proper HTTP port
-	dht.InitializeOwnNode(opts.AdvertiseAddr, opts.BindPort, opts.HTTPPort)
+	if err := dht.InitializeOwnNode(opts.AdvertiseAddr, opts.BindPort, opts.HTTPPort); err != nil {
+		return nil, fmt.Errorf("failed to initialize DHT node: %w", err)
+	}
 
 	// Verify DHT has the correct HTTP port stored
 	nodeInfo := dht.GetNodeInfo()
+	if nodeInfo == nil {
+		return nil, fmt.Errorf("failed to get node info from DHT after initialization")
+	}
+
 	log.Printf("After initialization, DHT has node info with HTTPPort=%d", nodeInfo.HTTPPort)
 
 	// Double-check HTTP port in DHT matches expected
@@ -121,7 +127,9 @@ func NewNode(opts *Options) (*Node, error) {
 
 		// Update the HTTP port in DHT
 		nodeInfo.HTTPPort = opts.HTTPPort
-		dht.AddNode(nodeInfo)
+		if err := dht.AddNode(nodeInfo); err != nil {
+			log.Printf("WARNING: Failed to update node HTTP port in DHT: %v", err)
+		}
 	}
 
 	// Initialize gossip for cluster membership
@@ -136,7 +144,7 @@ func NewNode(opts *Options) (*Node, error) {
 
 	// Create router with replication manager
 	router := router.NewRouter(nodeID, dht, store, replication)
-	balancer := balancer.NewLoadBalancer(dht)
+	balancer := balancer.NewLoadBalancer(dht, log.Default())
 	metrics := metrics.NewMetrics()
 
 	// Create the AI Engine with default options and store
@@ -335,68 +343,56 @@ func (n *Node) handleGetStore(w http.ResponseWriter, r *http.Request) {
 
 // StartHTTP starts the HTTP server for publish/subscribe endpoints
 func (n *Node) StartHTTP() {
-	// Create a new handler for the server
-	mux := n.Handler()
-
-	// Create the server with the handler
-	server := &http.Server{
-		Addr:    fmt.Sprintf("0.0.0.0:%d", n.HTTPPort),
-		Handler: mux,
+	// Create an HTTP server
+	addr := fmt.Sprintf("0.0.0.0:%d", n.HTTPPort)
+	n.server = &http.Server{
+		Addr:    addr,
+		Handler: n.Handler(),
 	}
-	n.server = server
 
-	// If auto port assignment is enabled, try finding an available port
-	if n.options.AutoPortAssign {
-		port := n.HTTPPort
-		maxAttempts := n.options.PortRangeEnd - n.options.PortRangeStart
+	// Set port from newly created server
+	port := n.HTTPPort
 
-		for attempt := 0; attempt < maxAttempts; attempt++ {
-			listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
-			if err == nil {
-				// Port is available, close the listener and use it
-				listener.Close()
-				n.HTTPPort = port
-				server.Addr = fmt.Sprintf("0.0.0.0:%d", port)
-				log.Printf("[Node %s] Using HTTP port: %d", n.ID[:8], port)
-				break
-			}
-
-			log.Printf("[Node %s] Port %d is in use, trying next port", n.ID[:8], port)
-			port++
-
-			// If we've reached the end of our range, wrap around
-			if port > n.options.PortRangeEnd {
-				port = n.options.PortRangeStart
-			}
-
-			// If we've tried all ports in range, give up
-			if port == n.HTTPPort {
-				log.Printf("[Node %s] Failed to find available port in range %d-%d",
-					n.ID[:8], n.options.PortRangeStart, n.options.PortRangeEnd)
-				break
-			}
+	// If port is 0, get the real port from the listener
+	if port == 0 {
+		// Create a listener
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Printf("[Node %s] Failed to create listener: %v", n.ID[:8], err)
+			return
 		}
+
+		// Get the real port
+		tcpAddr, ok := listener.Addr().(*net.TCPAddr)
+		if !ok {
+			log.Printf("[Node %s] Failed to get TCP address", n.ID[:8])
+			listener.Close()
+			return
+		}
+
+		// Update the HTTP port
+		port = tcpAddr.Port
+		n.HTTPPort = port
+		listener.Close()
 	}
 
-	// Update the DHT with our final HTTP port
+	// Check if port is valid
+	if port == n.HTTPPort {
+		// Start the server in a goroutine
+		go func() {
+			log.Printf("[Node %s] Starting HTTP server on %s", n.ID[:8], addr)
+			if err := n.server.(*http.Server).ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("[Node %s] HTTP server error: %v", n.ID[:8], err)
+			}
+		}()
+	}
+
 	// This is critical for cross-node communication
 	log.Printf("[Node %s] Updating DHT with HTTP port %d", n.ID[:8], n.HTTPPort)
-	// Ensure DHT has the correct HTTP port
-	n.DHT.InitializeOwnNode(n.options.AdvertiseAddr, n.options.BindPort, n.HTTPPort)
 
-	// Create a channel to signal when the server is ready
-	ready := make(chan struct{})
-	go func() {
-		log.Printf("[Node %s] Starting HTTP server on %s", n.ID[:8], server.Addr)
-		close(ready) // Signal that we're about to start the server
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("[Node %s] Error starting HTTP server: %v", n.ID[:8], err)
-		}
-	}()
-
-	// Wait for server to be ready
-	<-ready
-	log.Printf("[Node %s] HTTP server is ready on %s", n.ID[:8], server.Addr)
+	if err := n.DHT.InitializeOwnNode(n.options.AdvertiseAddr, n.options.BindPort, n.HTTPPort); err != nil {
+		log.Printf("[Node %s] Error updating DHT: %v", n.ID[:8], err)
+	}
 }
 
 func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
@@ -556,8 +552,10 @@ func (n *Node) handlePublish(w http.ResponseWriter, r *http.Request) {
 
 	// Register this node for the topic in the DHT
 	// This ensures that the topic has at least one node assigned to it
-	log.Printf("[Node %s] Registering this node for topic: %s", n.ID[:8], msg.Topic)
-	n.DHT.RegisterNode(msg.Topic, n.ID, n.options.HTTPPort)
+	log.Printf("[Node %s] Registering node for topic %s", n.ID[:8], msg.Topic)
+	if err := n.DHT.RegisterNode(msg.Topic, n.ID, n.options.HTTPPort); err != nil {
+		log.Printf("[Node %s] Error registering for topic %s: %v", n.ID[:8], msg.Topic, err)
+	}
 
 	// Check for forwarded message header
 	forwardedBy := r.Header.Get("X-Forwarded-By")
@@ -670,8 +668,21 @@ func (n *Node) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 
 	// Register this node for each topic in the DHT
 	for _, topic := range sub.Topics {
-		log.Printf("[Node %s] Registering this node for topic: %s (via subscribe)", n.ID[:8], topic)
-		n.DHT.RegisterNode(topic, n.ID, n.options.HTTPPort)
+		hash := n.DHT.HashTopic(topic)
+		if err := n.DHT.RegisterNode(topic, n.ID, n.options.HTTPPort); err != nil {
+			log.Printf("[Node %s] Error registering for topic %s: %v", n.ID[:8], topic, err)
+			continue
+		}
+		log.Printf("[Node %s] Registered in DHT for topic: %s (hash: %s)", n.ID[:8], topic, hash[:8])
+
+		// Create subscriber function
+		subscriber := func(msg store.Message) {
+			log.Printf("[Node %s] Received message on topic %s: %s",
+				n.ID[:8], topic, string(msg.Payload))
+		}
+
+		// Subscribe to messages in the store
+		n.Store.Subscribe(topic, subscriber)
 	}
 
 	// Create subscriber state
@@ -695,7 +706,10 @@ func (n *Node) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	// Register this node in the DHT for each topic
 	for _, topic := range sub.Topics {
 		hash := n.DHT.HashTopic(topic)
-		n.DHT.RegisterNode(topic, n.ID, n.options.HTTPPort)
+		if err := n.DHT.RegisterNode(topic, n.ID, n.options.HTTPPort); err != nil {
+			log.Printf("[Node %s] Error registering for topic %s: %v", n.ID[:8], topic, err)
+			continue
+		}
 		log.Printf("[Node %s] Registered in DHT for topic: %s (hash: %s)", n.ID[:8], topic, hash[:8])
 
 		// Create subscriber function
